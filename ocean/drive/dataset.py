@@ -1,17 +1,20 @@
 """Convert Waymo Open Motion Dataset (WOMD) JSON maps to binary format for PufferLib drive env.
 
+Each dataset lives at data/<name>/ with json/ and binaries/.
+config/drive.ini [env] data_dir points at the dataset the trainer loads.
+
 Step 0: Download the preprocessed JSON scenarios from HuggingFace e.g.,
   https://huggingface.co/datasets/daphne-cornelisse/pufferdrive_womd_train_1000
 
   uv pip install huggingface_hub
-  python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='daphne-cornelisse/pufferdrive_womd_train_1000', repo_type='dataset', local_dir='drive_data')"
+  python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='daphne-cornelisse/pufferdrive_womd_train_1000', repo_type='dataset', local_dir='data/womd_train_1000')"
 
-Step 1: Unzip to get folder with .json files
-    mkdir -p drive_data/training
-    tar xzf drive_data/pufferdrive_womd_train_1000.tar.gz --strip-components=1 -C drive_data/training/
+Step 1: Unzip the scenarios into json/
+    mkdir -p data/womd_train_1000/json
+    tar xzf data/womd_train_1000/pufferdrive_womd_train_1000.tar.gz --strip-components=1 -C data/womd_train_1000/json/
 
 Step 2: Process to map binaries
-  python ocean/drive/dataset.py --data_folder drive_data/training --output_dir drive_data/binaries
+  python ocean/drive/dataset.py --data_folder data/womd_train_1000/json --output_dir data/womd_train_1000/binaries
 """
 
 import json

@@ -1657,7 +1657,6 @@ void close_client(Client* client) {
     free(client);
 }
 
-#define MAP_BINARY_DIR "drive_data/binaries"
 #define MAP_RESOURCE_DIR "resources/drive"
 
 static int drive_map_exists(const char* path) {
@@ -1667,10 +1666,15 @@ static int drive_map_exists(const char* path) {
     return 1;
 }
 
-// Train maps live in drive_data/binaries/. The web demo only preloads
-// resources/drive/map_010.bin and map_942.bin.
-static void resolve_map_path(int map_id, char* out, size_t out_sz) {
-    snprintf(out, out_sz, "%s/map_%03d.bin", MAP_BINARY_DIR, map_id);
+// [env] data_dir is the dataset root (json/ and binaries/). Training reads binaries/.
+// The web demo only preloads resources/drive/map_010.bin and map_942.bin.
+static void drive_bin_dir(Dict* kwargs, char* out, size_t out_sz) {
+    const char* data_dir = dict_get_str(kwargs, "data_dir");
+    snprintf(out, out_sz, "%s/binaries", data_dir);
+}
+
+static void resolve_map_path(const char* bin_dir, int map_id, char* out, size_t out_sz) {
+    snprintf(out, out_sz, "%s/map_%03d.bin", bin_dir, map_id);
     if (drive_map_exists(out)) return;
     snprintf(out, out_sz, "%s/map_%03d.bin", MAP_RESOURCE_DIR, map_id);
     if (drive_map_exists(out)) return;
@@ -1707,8 +1711,10 @@ void puf_init(Env* env, Dict* kwargs) {
     env->reward_goal_post_respawn = dict_get(kwargs, "reward_goal_post_respawn");
     env->reward_vehicle_collision_post_respawn = dict_get(kwargs, "reward_vehicle_collision_post_respawn");
     int map_id = dict_get(kwargs, "map_id");
+    char bin_dir[480];
     char map_file[512];
-    resolve_map_path(map_id, map_file, sizeof(map_file));
+    drive_bin_dir(kwargs, bin_dir, sizeof(bin_dir));
+    resolve_map_path(bin_dir, map_id, map_file, sizeof(map_file));
     env->map_name = strdup(map_file);
     env->max_agents = MAX_AGENTS;
     init(env);
@@ -1735,11 +1741,14 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     float reward_vehicle_collision_post_respawn = dict_get(env_kwargs, "reward_vehicle_collision_post_respawn");
     int human_agent_idx = dict_get(env_kwargs, "human_agent_idx");
 
+    char bin_dir[480];
+    drive_bin_dir(env_kwargs, bin_dir, sizeof(bin_dir));
+
     char first_map[512];
-    snprintf(first_map, sizeof(first_map), "%s/map_%03d.bin", MAP_BINARY_DIR, 0);
+    snprintf(first_map, sizeof(first_map), "%s/map_%03d.bin", bin_dir, 0);
     FILE* test_fp = fopen(first_map, "rb");
     if (!test_fp) {
-        fprintf(stderr, "ERROR: Cannot find map files at %s/\n", MAP_BINARY_DIR);
+        fprintf(stderr, "ERROR: Cannot find map files at %s/\n", bin_dir);
         fprintf(stderr, "Download WOMD JSON and run ocean/drive/dataset.py (see dataset.py header).\n");
         exit(1);
     }
@@ -1750,16 +1759,16 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     int num_valid_maps = 0;
     for (int m = 0; m < num_maps; m++) {
         char map_file[512];
-        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, m);
+        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", bin_dir, m);
         agents_per_map[m] = peek_map_agent_count(map_file, MAX_AGENTS);
         if (agents_per_map[m] > 0) {
             valid_map_ids[num_valid_maps++] = m;
         }
     }
-    printf("Scanned %d maps from %s/, %d valid\n", num_maps, MAP_BINARY_DIR, num_valid_maps);
+    printf("Scanned %d maps from %s/, %d valid\n", num_maps, bin_dir, num_valid_maps);
 
     if (num_valid_maps == 0) {
-        fprintf(stderr, "ERROR: No valid maps found in %s/\n", MAP_BINARY_DIR);
+        fprintf(stderr, "ERROR: No valid maps found in %s/\n", bin_dir);
         free(agents_per_map);
         free(valid_map_ids);
         exit(1);
@@ -1803,7 +1812,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     Env* envs = (Env*)calloc(total_envs, sizeof(Env));
     for (int i = 0; i < total_envs; i++) {
         char map_file[512];
-        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, env_map_ids[i]);
+        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", bin_dir, env_map_ids[i]);
         Env* env = &envs[i];
         env->rng = i;
         env->map_name = strdup(map_file);
