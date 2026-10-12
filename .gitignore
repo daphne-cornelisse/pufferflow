@@ -177,8 +177,13 @@ ocean/impulse_wars/include/
 # Generated antibody data
 ocean/antibody/generated/
 
-# Data
+# Data. The bottleneck map is tracked so tests can load it.
 data/*
+!data/bottleneck/
+data/bottleneck/*
+!data/bottleneck/binaries/
+data/bottleneck/binaries/*
+!data/bottleneck/binaries/map_000.bin
 resources/drive/data/*
 resources/drive/binaries/*
 resources/boxoban/levels/
