@@ -1,2 +1,3 @@
-# PufferFlow
-Predicting traffic flow through high-performance simulation and RL
+# pufferflow
+
+- Build on pufferlib (documentation is at [puffer.ai](https://puffer.ai)).
