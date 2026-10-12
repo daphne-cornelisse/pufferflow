@@ -45,6 +45,12 @@ typedef float obs_t;
 // Dynamics models
 #define CLASSIC 0
 
+// Where the initial vehicle poses come from.
+// 0 replays the logged trajectories in the map binary.
+// 1 places vehicles from the SUMO-style flows in the ini (ocean/drive/flow_init.h).
+#define AGENT_INIT_LOGS 0
+#define AGENT_INIT_STRUCTURED 1
+
 // Collision State
 #define NO_COLLISION 0
 #define VEHICLE_COLLISION 1
@@ -253,6 +259,8 @@ struct Env {
     float reward_vehicle_collision_post_respawn;
     float reward_jerk;
     unsigned int rng;
+    int agent_initialization;
+    Dict* cfg;
 };
 
 void add_log(Drive* env) {
@@ -896,6 +904,8 @@ void remove_bad_trajectories(Drive* env) {
     env->timestep = 0;
 }
 
+#include "flow_init.h"
+
 // Initialization / Cleanup
 void init(Drive* env) {
     env->timestep = 0;
@@ -905,6 +915,16 @@ void init(Drive* env) {
                 env->map_name ? env->map_name : "(null)");
         exit(1);
     }
+    if (env->agent_initialization != AGENT_INIT_LOGS &&
+        env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        fprintf(stderr, "env.agent_initialization must be 0 (logs) or 1 (structured)\n");
+        exit(1);
+    }
+    // Structured placement is in network coordinates. set_means then centers
+    // roads and vehicles together. Logged init leaves the binary objects alone.
+    if (env->agent_initialization == AGENT_INIT_STRUCTURED) {
+        spawn_flow_vehicles(env);
+    }
     env->dynamics_model = CLASSIC;
     set_means(env);
     init_grid_map(env);
@@ -913,8 +933,17 @@ void init(Drive* env) {
     env->neighbor_cache_indices = (int*)calloc((env->grid_cols * env->grid_rows) + 1, sizeof(int));
     cache_neighbor_offsets(env);
     set_active_agents(env);
-    remove_bad_trajectories(env);
+    // Logged agents are replayed once so a partner that overlaps the log can be
+    // dropped. Structured vehicles have no future trajectory to replay.
+    if (env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        remove_bad_trajectories(env);
+    }
     set_start_position(env);
+    if (env->agent_initialization == AGENT_INIT_STRUCTURED && env->active_agent_count <= 0) {
+        fprintf(stderr, "structured init produced no agents for %s\n",
+            env->map_name ? env->map_name : "(null)");
+        exit(1);
+    }
     env->logs = (Log*)calloc(env->active_agent_count, sizeof(Log));
 }
 
@@ -1778,12 +1807,18 @@ static void resolve_map_path(const char* bin_dir, int map_id, char* out, size_t 
     }
 }
 
-static int peek_map_agent_count(const char* filename, int max_agents) {
+static int peek_map_agent_count(const char* filename, int max_agents,
+        int agent_initialization, Dict* cfg) {
     Drive temp = {0};
     temp.map_name = (char*)filename;
     temp.max_agents = max_agents > 0 ? max_agents : MAX_AGENTS;
+    temp.agent_initialization = agent_initialization;
+    temp.cfg = cfg;
     temp.entities = load_map_binary(filename, &temp);
     if (!temp.entities) return 0;
+    if (temp.agent_initialization == AGENT_INIT_STRUCTURED) {
+        spawn_flow_vehicles(&temp);
+    }
     set_means(&temp);
     set_active_agents(&temp);
     int n = temp.active_agent_count;
@@ -1799,6 +1834,8 @@ void puf_init(Env* env, Dict* kwargs) {
     env->reward_goal_post_respawn = dict_get(kwargs, "reward_goal_post_respawn");
     env->reward_vehicle_collision_post_respawn = dict_get(kwargs, "reward_vehicle_collision_post_respawn");
     env->reward_jerk = dict_get(kwargs, "reward_jerk");
+    env->agent_initialization = (int)dict_get(kwargs, "agent_initialization");
+    env->cfg = kwargs;
     int map_id = dict_get(kwargs, "map_id");
     char bin_dir[480];
     char map_file[512];
@@ -1830,6 +1867,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     float reward_vehicle_collision_post_respawn = dict_get(env_kwargs, "reward_vehicle_collision_post_respawn");
     float reward_jerk = dict_get(env_kwargs, "reward_jerk");
     int human_agent_idx = dict_get(env_kwargs, "human_agent_idx");
+    int agent_initialization = (int)dict_get(env_kwargs, "agent_initialization");
 
     char bin_dir[480];
     drive_bin_dir(env_kwargs, bin_dir, sizeof(bin_dir));
@@ -1850,7 +1888,8 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     for (int m = 0; m < num_maps; m++) {
         char map_file[512];
         snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", bin_dir, m);
-        agents_per_map[m] = peek_map_agent_count(map_file, MAX_AGENTS);
+        agents_per_map[m] = peek_map_agent_count(map_file, MAX_AGENTS,
+            agent_initialization, env_kwargs);
         if (agents_per_map[m] > 0) {
             valid_map_ids[num_valid_maps++] = m;
         }
@@ -1905,6 +1944,8 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", bin_dir, env_map_ids[i]);
         Env* env = &envs[i];
         env->rng = i;
+        env->agent_initialization = agent_initialization;
+        env->cfg = env_kwargs;
         env->map_name = strdup(map_file);
         env->human_agent_idx = human_agent_idx;
         env->reward_vehicle_collision = reward_vehicle_collision;
