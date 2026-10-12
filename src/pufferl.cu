@@ -2858,6 +2858,10 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
     while (true) {
         if (render) {
             puf_render(p->vec->envs);
+            if (puf_record_done()) {
+                puf_record_finish();
+                return result;
+            }
             if (WindowShouldClose()) {
                 return result;
             }
@@ -3509,7 +3513,7 @@ int main(int argc, char** argv) {
     setbuf(stderr, NULL);
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s train|eval|match|sweep [latest|MODEL.bin] [--headless] [--section.key=value ...]\n",
+            "usage: %s train|eval|match|sweep [latest|MODEL.bin] [--headless] [--record [file.mp4]] [--section.key=value ...]\n",
             argv[0]);
         exit(1);
     }
@@ -3527,11 +3531,25 @@ int main(int argc, char** argv) {
         model = argv[argi++];
     }
     int headless = 0;
+    int record = 0;
+    int record_frames = 91;
+    const char* record_path = NULL;
     char* ini_argv[argc > 0 ? (size_t)argc : 1];
     int ini_argc = 0;
     for (int i = argi; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0) {
             headless = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--record") == 0) {
+            record = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                record_path = argv[++i];
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--record-frames") == 0 && i + 1 < argc) {
+            record_frames = atoi(argv[++i]);
             continue;
         }
         ini_argv[ini_argc++] = argv[i];
@@ -3541,8 +3559,17 @@ int main(int argc, char** argv) {
     if (model) {
         puf_ini_put(&ini, "base.load_model_path", model);
     }
+    if (record) {
+        char default_path[256];
+        const char* env_name = puf_ini_get_str(&ini, "base", "env_name");
+        snprintf(default_path, sizeof(default_path), "logs/%s.mp4",
+            env_name ? env_name : "drive");
+        puf_record_request(record_path ? record_path : default_path, record_frames, 10);
+    }
     TrainContext ctx = {.world_size = 1, .artifact_owner = 1};
-    int render = !headless;
+    // --record renders one episode to an mp4 and does not need a display.
+    // Plain --headless stays a fast eval with no frames.
+    int render = record || !headless;
 
     if (strcmp(mode, "train") == 0) {
         launch_train(&ini);

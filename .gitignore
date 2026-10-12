@@ -156,7 +156,10 @@ dmypy.json
 # ROMs
 *.gb
 
-checkpoints/
+# Run directories stay local. checkpoints/bottleneck.bin is the final
+# policy kept for tests.
+checkpoints/*
+!checkpoints/bottleneck.bin
 experiments/
 wandb/
 .neptune/

@@ -15,6 +15,7 @@ typedef float obs_t;
 #undef float3
 #undef double3
 #include "rlgl.h"
+#include "puf_record.h"
 #include <time.h>
 
 // Entity Types
@@ -178,6 +179,8 @@ struct Entity {
     int collided_before_goal;
     int reached_goal_this_episode;
     int active_agent;
+    float prev_accel;
+    float prev_steer;
 };
 
 void free_entity(Entity* entity) {
@@ -248,6 +251,7 @@ struct Env {
     float world_mean_y;
     float reward_goal_post_respawn;
     float reward_vehicle_collision_post_respawn;
+    float reward_jerk;
     unsigned int rng;
 };
 
@@ -370,6 +374,8 @@ void set_start_position(Drive* env) {
         e->heading = e->traj_heading[0];
         e->heading_x = cosf(e->heading);
         e->heading_y = sinf(e->heading);
+        e->prev_accel = 0.0f;
+        e->prev_steer = 0.0f;
         e->valid = e->traj_valid[0];
         e->collision_state = NO_COLLISION;
         e->respawn_timestep = -1;
@@ -1227,6 +1233,23 @@ void puf_step(Drive* env) {
             env->entities[agent_idx].reached_goal = 1;
             env->entities[agent_idx].reached_goal_this_episode = 1;
         }
+
+        // Squared bin-steps of accel and steer. One adjacent-bin flip costs
+        // reward_jerk. The first step of an episode compares against 0.
+        float* atn = env->agents[i].actions;
+        if (atn) {
+            float accel = ACCELERATION_VALUES[(int)atn[0]];
+            float steer = STEERING_VALUES[(int)atn[1]];
+            float accel_step = ACCELERATION_VALUES[1] - ACCELERATION_VALUES[0];
+            float steer_step = STEERING_VALUES[1] - STEERING_VALUES[0];
+            float da = (accel - env->entities[agent_idx].prev_accel) / accel_step;
+            float ds = (steer - env->entities[agent_idx].prev_steer) / steer_step;
+            float jerk_penalty = env->reward_jerk * (da * da + ds * ds);
+            env->agents[i].rewards[0] += jerk_penalty;
+            env->logs[i].episode_return += jerk_penalty;
+            env->entities[agent_idx].prev_accel = accel;
+            env->entities[agent_idx].prev_steer = steer;
+        }
     }
 
     // Respawn agents that reached goal
@@ -1257,10 +1280,22 @@ Client* make_client(Drive* env) {
     Client* client = (Client*)calloc(1, sizeof(Client));
     client->width = 1280;
     client->height = 704;
-    SetConfigFlags(FLAG_MSAA_4X_HINT);
+    int recording = puf_record_enabled();
+    if (recording) {
+        puf_record_ensure_display();
+    }
+    unsigned int flags = FLAG_MSAA_4X_HINT;
+    if (recording) {
+        flags |= FLAG_WINDOW_HIDDEN;
+    }
+    SetConfigFlags(flags);
     InitWindow(client->width, client->height, "PufferLib Ray GPU Drive");
-    SetTargetFPS(30);
-    client->puffers = LoadTexture("resources/puffers_128.png");
+    if (!recording) {
+        SetTargetFPS(30);
+    } else {
+        rlDisableBackfaceCulling();
+    }
+    client->puffers = LoadTexture("resources/shared/puffers_128.png");
     client->cars[0] = LoadModel("resources/drive/RedCar.glb");
     client->cars[1] = LoadModel("resources/drive/WhiteCar.glb");
     client->cars[2] = LoadModel("resources/drive/BlueCar.glb");
@@ -1470,16 +1505,52 @@ void draw_road_edge(Drive* env, float start_x, float start_y, float end_x, float
     DrawTriangle3D(b4, t4, b1, CURB_SIDE); DrawTriangle3D(t4, t1, b1, CURB_SIDE);
 }
 
+// The overview camera sits ~200 m off the map center, so a moving car is a
+// few pixels and then leaves the frame. While recording, chase one agent
+// (the configured human_agent_idx) from just behind and above.
+static void drive_record_camera(Drive* env, Client* client) {
+    if (env->active_agent_count <= 0 || !env->active_agent_indices || !env->entities) {
+        return;
+    }
+    int slot = env->human_agent_idx;
+    if (slot < 0 || slot >= env->active_agent_count) {
+        slot = 0;
+    }
+    Entity* agent = &env->entities[env->active_agent_indices[slot]];
+    float hx = cosf(agent->heading);
+    float hy = sinf(agent->heading);
+    const float back = 12.0f;
+    const float height = 7.0f;
+    const float ahead = 6.0f;
+    client->camera.up = (Vector3){0.0f, 0.0f, 1.0f};
+    client->camera.fovy = 30.0f;
+    client->camera.position = (Vector3){
+        agent->x - back * hx,
+        agent->y - back * hy,
+        height
+    };
+    client->camera.target = (Vector3){
+        agent->x + ahead * hx,
+        agent->y + ahead * hy,
+        1.0f
+    };
+}
+
 void puf_render(Drive* env) {
     if (env->client == NULL) {
         env->client = make_client(env);
     }
     drive_human_controls(env);
     Client* client = env->client;
+    if (puf_record_enabled()) {
+        drive_record_camera(env, client);
+    }
     BeginDrawing();
     ClearBackground(ROAD_COLOR);
     BeginMode3D(client->camera);
-    handle_camera_controls(client);
+    if (!puf_record_enabled()) {
+        handle_camera_controls(client);
+    }
 
     if (env->map_corners) {
         DrawLine3D((Vector3){env->map_corners[0], env->map_corners[1], 0}, (Vector3){env->map_corners[2], env->map_corners[1], 0}, PUFF_CYAN);
@@ -1508,7 +1579,12 @@ void puf_render(Drive* env) {
                 }
             }
 
-            if ((!is_active_agent && !is_static_agent) || env->entities[i].respawn_timestep != -1) {
+            // Respawned agents are hidden for spawn immunity. The recorded
+            // chase still draws its agent, or the car vanishes after the goal.
+            int followed = puf_record_enabled() && is_active_agent
+                && agent_index == env->human_agent_idx;
+            if ((!is_active_agent && !is_static_agent)
+                || (env->entities[i].respawn_timestep != -1 && !followed)) {
                 continue;
             }
 
@@ -1531,7 +1607,11 @@ void puf_render(Drive* env) {
                 car_model = client->cars[0];
             }
 
-            if (agent_index == env->human_agent_idx && !env->entities[agent_index].reached_goal) {
+            // The marker floats 8 m above the car. Skip it in the chase shot
+            // so it does not fill the zoomed frame.
+            if (!puf_record_enabled()
+                && agent_index == env->human_agent_idx
+                && !env->entities[agent_index].reached_goal) {
                 draw_agent_obs(env, agent_index);
             }
 
@@ -1603,16 +1683,19 @@ void puf_render(Drive* env) {
         }
     }
 
-    // Grid overlay
-    float grid_start_x = env->map_corners ? env->map_corners[0] : 0.0f;
-    float grid_start_y = env->map_corners ? env->map_corners[1] : 0.0f;
-    for (int i = 0; i < env->grid_cols; i++) {
-        for (int j = 0; j < env->grid_rows; j++) {
-            float x = grid_start_x + i * GRID_CELL_SIZE;
-            float y = grid_start_y + j * GRID_CELL_SIZE;
-            DrawCubeWires(
-                (Vector3){x + GRID_CELL_SIZE / 2, y + GRID_CELL_SIZE / 2, 1},
-                GRID_CELL_SIZE, GRID_CELL_SIZE, 0.1f, PUFF_BACKGROUND2);
+    // The 5 m grid is a debug overlay. Skip it while recording so a full map
+    // does not spend the frame drawing thousands of wires into the mp4.
+    if (!puf_record_enabled()) {
+        float grid_start_x = env->map_corners ? env->map_corners[0] : 0.0f;
+        float grid_start_y = env->map_corners ? env->map_corners[1] : 0.0f;
+        for (int i = 0; i < env->grid_cols; i++) {
+            for (int j = 0; j < env->grid_rows; j++) {
+                float x = grid_start_x + i * GRID_CELL_SIZE;
+                float y = grid_start_y + j * GRID_CELL_SIZE;
+                DrawCubeWires(
+                    (Vector3){x + GRID_CELL_SIZE / 2, y + GRID_CELL_SIZE / 2, 1},
+                    GRID_CELL_SIZE, GRID_CELL_SIZE, 0.1f, PUFF_BACKGROUND2);
+            }
         }
     }
     EndMode3D();
@@ -1638,13 +1721,18 @@ void puf_render(Drive* env) {
     }
     DrawText(TextFormat("Controlling Agent: %d", env->human_agent_idx), 10, 70, 20, PUFF_WHITE);
     DrawText(TextFormat("Agent Index: %d", human_idx), 10, 90, 20, PUFF_WHITE);
-    DrawText("Controls: W/S - Accelerate/Brake, A/D - Steer, 1-4 - Switch Agent",
-             10, client->height - 30, 20, PUFF_WHITE);
+    if (!puf_record_enabled()) {
+        DrawText("Controls: W/S - Accelerate/Brake, A/D - Steer, 1-4 - Switch Agent",
+                 10, client->height - 30, 20, PUFF_WHITE);
+    }
     DrawText(TextFormat("Acceleration: %d", accel), 10, 110, 20, PUFF_WHITE);
     DrawText(TextFormat("Steering: %d", steer), 10, 130, 20, PUFF_WHITE);
     DrawText(TextFormat("Grid Rows: %d", env->grid_rows), 10, 150, 20, PUFF_WHITE);
     DrawText(TextFormat("Grid Cols: %d", env->grid_cols), 10, 170, 20, PUFF_WHITE);
     EndDrawing();
+    if (puf_record_enabled()) {
+        puf_record_capture((int)client->width, (int)client->height);
+    }
     puf_web_vsync();
 }
 
@@ -1710,6 +1798,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->reward_offroad_collision = dict_get(kwargs, "reward_offroad_collision");
     env->reward_goal_post_respawn = dict_get(kwargs, "reward_goal_post_respawn");
     env->reward_vehicle_collision_post_respawn = dict_get(kwargs, "reward_vehicle_collision_post_respawn");
+    env->reward_jerk = dict_get(kwargs, "reward_jerk");
     int map_id = dict_get(kwargs, "map_id");
     char bin_dir[480];
     char map_file[512];
@@ -1739,6 +1828,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     float reward_offroad_collision = dict_get(env_kwargs, "reward_offroad_collision");
     float reward_goal_post_respawn = dict_get(env_kwargs, "reward_goal_post_respawn");
     float reward_vehicle_collision_post_respawn = dict_get(env_kwargs, "reward_vehicle_collision_post_respawn");
+    float reward_jerk = dict_get(env_kwargs, "reward_jerk");
     int human_agent_idx = dict_get(env_kwargs, "human_agent_idx");
 
     char bin_dir[480];
@@ -1821,6 +1911,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_offroad_collision = reward_offroad_collision;
         env->reward_goal_post_respawn = reward_goal_post_respawn;
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
+        env->reward_jerk = reward_jerk;
         env->max_agents = env_max_agents[i];
         init(env);
         env->num_agents = env->active_agent_count;

@@ -709,6 +709,9 @@ int main(int argc, char** argv) {
     }
     Ini ini = {0};
     int headless = 0;
+    int record = 0;
+    int record_frames = 91;
+    const char* record_path = NULL;
     const char* cli_path = NULL;
     int cli_latest = 0;
 
@@ -717,6 +720,17 @@ int main(int argc, char** argv) {
     for (int i = argi; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0) {
             headless = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--record") == 0) {
+            record = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                record_path = argv[++i];
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--record-frames") == 0 && i + 1 < argc) {
+            record_frames = atoi(argv[++i]);
             continue;
         }
         if (strcmp(argv[i], "latest") == 0) {
@@ -731,6 +745,11 @@ int main(int argc, char** argv) {
         ini_argv[ini_argc++] = argv[i];
     }
     puf_ini_load_env(&ini, env_name, ini_argc, ini_argv);
+    if (record) {
+        char default_path[256];
+        snprintf(default_path, sizeof(default_path), "logs/%s.mp4", env_name);
+        puf_record_request(record_path ? record_path : default_path, record_frames, 10);
+    }
     // Trainer default.ini eval_episodes is for ./puffer eval, not CPU play.
     // Honor it only when the CLI actually passed --eval_episodes=N.
     int eval_episodes = 0;
@@ -861,22 +880,32 @@ int main(int argc, char** argv) {
     int sim_tick_cap = 5;
     int hold = 0;
     int steps = 0;
+    int recording = puf_record_enabled();
+    if (recording && !have_net) {
+        // Coast at the logged speed. Action 0 is full brake and full steer.
+        for (int i = 0; i < env.num_agents; i++) {
+            actions[i * NUM_ATNS + 0] = 3;
+            actions[i * NUM_ATNS + 1] = 6;
+        }
+    }
 #ifndef PLATFORM_WEB
-    if (!headless) {
+    if (!headless && !recording) {
         SetTargetFPS(60);
     }
 #endif
-    if (!headless) {
+    if (!headless && !recording) {
         puf_render(&env);
     }
     // Web: Raylib 5.5 WindowShouldClose() always emscripten_sleep(16).
     // Pace frames with puf_web_vsync. Native checks WindowShouldClose after render.
-    while (headless
+    while (recording
+            ? !puf_record_done()
+            : (headless
             ? (eval_episodes > 0 ? (env.log.n < eval_episodes)
                                  : (steps < 1024))
-            : IsWindowReady()) {
+            : IsWindowReady())) {
         int ticks = 1;
-        if (!headless) {
+        if (!headless && !recording) {
             double now = GetTime();
             ticks = 0;
             if (sim_prev >= 0.0) {
@@ -939,14 +968,20 @@ int main(int argc, char** argv) {
                 hold = reset_hold ? 0 : (hold + 1) % frameskip;
             }
         }
-        if (!headless) {
+        if (!headless || recording) {
             puf_render(&env);
+            if (recording && puf_record_done()) {
+                break;
+            }
 #ifndef PLATFORM_WEB
-            if (WindowShouldClose()) {
+            if (!recording && WindowShouldClose()) {
                 break;
             }
 #endif
         }
+    }
+    if (recording) {
+        puf_record_finish();
     }
 
     if (headless && eval_episodes > 0) {

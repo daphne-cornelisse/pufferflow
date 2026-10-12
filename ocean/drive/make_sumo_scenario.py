@@ -5,6 +5,9 @@ data/bottleneck/binaries/map_000.bin, and saves a top-down preview.
 
 The trainer loads this from config/drive.ini:
   ./puffer train --headless
+
+Watch one episode on a machine with no display:
+  ./drive --record logs/drive.mp4
 """
 
 import math
