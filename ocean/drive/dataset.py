@@ -26,6 +26,51 @@ from tqdm import tqdm
 
 TRAJECTORY_LENGTH = 91
 
+# Waymo roadgraph_samples/type, stored as roads[].map_element_id.
+# https://waymo.com/open/data/motion/tfexample/
+# The drive env collapses these to the classes in ocean/drive/drive.h:
+#   lane centers 0-3 -> ROAD_LANE, road lines 5-13 -> ROAD_LINE,
+#   road edges 14-16 -> ROAD_EDGE, then stop sign, crosswalk, speed bump, driveway.
+LANE_UNKNOWN = 0
+LANE_FREEWAY = 1
+LANE_SURFACE_STREET = 2
+LANE_BIKE = 3
+ROAD_LINE_UNKNOWN = 5
+ROAD_LINE_BROKEN_SINGLE_WHITE = 6
+ROAD_LINE_SOLID_SINGLE_WHITE = 7
+ROAD_LINE_SOLID_DOUBLE_WHITE = 8
+ROAD_LINE_BROKEN_SINGLE_YELLOW = 9
+ROAD_LINE_BROKEN_DOUBLE_YELLOW = 10
+ROAD_LINE_SOLID_SINGLE_YELLOW = 11
+ROAD_LINE_SOLID_DOUBLE_YELLOW = 12
+ROAD_LINE_PASSING_DOUBLE_YELLOW = 13
+ROAD_EDGE_UNKNOWN = 14
+ROAD_EDGE_BOUNDARY = 15
+ROAD_EDGE_MEDIAN = 16
+STOP_SIGN = 17
+CROSSWALK = 18
+SPEED_BUMP = 19
+DRIVEWAY = 20
+
+
+def drive_road_type(map_element_id):
+    """Collapse a Waymo roadgraph type to the drive env's road class."""
+    if LANE_UNKNOWN <= map_element_id <= LANE_BIKE:
+        return 4
+    if ROAD_LINE_UNKNOWN <= map_element_id <= ROAD_LINE_PASSING_DOUBLE_YELLOW:
+        return 5
+    if ROAD_EDGE_UNKNOWN <= map_element_id <= ROAD_EDGE_MEDIAN:
+        return 6
+    if map_element_id == STOP_SIGN:
+        return 7
+    if map_element_id == CROSSWALK:
+        return 8
+    if map_element_id == SPEED_BUMP:
+        return 9
+    if map_element_id == DRIVEWAY:
+        return 10
+    return map_element_id
+
 
 def calculate_area(p1, p2, p3):
     """Calculate the area of the triangle using the determinant method."""
@@ -157,31 +202,15 @@ def save_map_binary(map_data, output_file, unique_map_id):
         # Write roads
         for road in map_data.get("roads", []):
             geometry = road.get("geometry", [])
-            road_type = road.get("map_element_id", 0)
-            road_type_word = road.get("type", 0)
-            if road_type_word == "lane":
-                road_type = 2
-            elif road_type_word == "road_edge":
-                road_type = 15
+            # Class id is the Waymo roadgraph type. Do not rewrite lanes to
+            # surface-street or edges to boundary; freeway and median must
+            # stay in the same drive class as the other lanes and edges.
+            road_type = int(road.get("map_element_id", 0))
 
-            if len(geometry) > 10 and road_type <= 16:
+            if len(geometry) > 10 and road_type <= ROAD_EDGE_MEDIAN:
                 geometry = simplify_polyline(geometry, 0.1, 250)
             size = len(geometry)
-
-            if 0 <= road_type <= 3:
-                road_type = 4
-            elif 5 <= road_type <= 13:
-                road_type = 5
-            elif 14 <= road_type <= 16:
-                road_type = 6
-            elif road_type == 17:
-                road_type = 7
-            elif road_type == 18:
-                road_type = 8
-            elif road_type == 19:
-                road_type = 9
-            elif road_type == 20:
-                road_type = 10
+            road_type = drive_road_type(road_type)
 
             f.write(struct.pack("i", road_type))
             f.write(struct.pack("i", size))
