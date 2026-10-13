@@ -476,9 +476,12 @@ MAX_ENTITIES_PER_CELL = 10
 VISION_RANGE = 21
 MAX_ROAD_SEGMENT_OBSERVATIONS = 75
 PARTNER_FEATURES = 7
-EGO_FEATURES = 7
+EGO_FEATURES = 8
+# Index 6 stays 0 (old ego block). Index 7 is max_speed / MAX_SPEED.
 ROAD_FEATURES = 7
 MAX_AGENTS = 64
+# Partners in one observation, even when the map has more cars.
+MAX_OBS_AGENTS = 64
 OBS_GOAL_SCALE = 0.005
 OBS_SPEED_SCALE = 0.01
 OBS_POSITION_SCALE = 0.02

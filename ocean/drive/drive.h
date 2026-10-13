@@ -10,6 +10,7 @@
 typedef float obs_t;
 // Window playback. pufferenv.h supplies a no-op for other envs.
 #define PUF_HAS_SIM_CONTROL
+#define PUF_HAS_AGENT_SLIDER
 #include "pufferenv.h"
 #define float3 rl_float3
 #define double3 rl_double3
@@ -70,6 +71,10 @@ typedef float obs_t;
 #ifndef MAX_AGENTS
 #define MAX_AGENTS 64
 #endif
+// Cars one map copy may spawn. The viewer slider runs from 1 to this.
+#define DRIVE_AGENT_MAX 128
+// Partners listed in one observation. Fixed even when more cars exist.
+#define MAX_OBS_AGENTS 64
 
 // Dynamics models
 #define CLASSIC 0
@@ -100,10 +105,13 @@ typedef float obs_t;
 #define MAX_ROAD_SEGMENT_OBSERVATIONS 75
 
 #define PARTNER_FEATURES 7
-#define EGO_FEATURES 7
+// Index 6 stays 0 so an old checkpoint keeps that weight. Index 7
+// is this episode's max speed divided by MAX_SPEED.
+#define EGO_FEATURES 8
 #define ROAD_FEATURES 7
 
-#define OBS_SIZE (EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS)
+#define OBS_SIZE (EGO_FEATURES + PARTNER_FEATURES * MAX_OBS_AGENTS \
+    + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS)
 #define ACT_SIZES {7, 13}
 #define NUM_ATNS 2
 #define MY_VEC_INIT
@@ -226,6 +234,8 @@ struct Entity {
     int active_agent;
     float prev_accel;
     float prev_steer;
+    // Personal max speed in m/s. 0 leaves the bicycle clip alone.
+    float max_speed;
 };
 
 void free_entity(Entity* entity) {
@@ -268,7 +278,7 @@ typedef struct FlowSeg {
 
 struct Env {
     Client* client;
-    Agent agents[MAX_AGENTS];
+    Agent agents[DRIVE_AGENT_MAX];
     Log log;
     Log* logs;
     int num_agents;
@@ -306,6 +316,7 @@ struct Env {
     float reward_goal_post_respawn;
     float reward_vehicle_collision_post_respawn;
     float reward_jerk;
+    float reward_speed;
     unsigned int rng;
     int agent_initialization;
     int control_mode;
@@ -332,12 +343,30 @@ struct Env {
     unsigned char flow_hit_kind[FLOW_HIT_MAX];
     int flow_hit_n;
     int flow_hit_i;
-    unsigned char flow_hit_prev[MAX_AGENTS];
+    unsigned char flow_hit_prev[DRIVE_AGENT_MAX];
     // Set from the window. Headless eval and recording never read these.
     int sim_paused;
     int sim_infinite;
     // One frame after Reset, so that click draws timestep 0.
     int sim_hold_step;
+    // Agents per map. The slider writes req. Play copies it to on.
+    int sim_agents_req;
+    int sim_agents_on;
+    int sim_agents_apply;
+    int sim_agents_drag;
+    // Population max speed in m/s. 0 until the first structured load.
+    // Mean and std are staged in req. Play copies them to on.
+    // max is the ini vtype. Each reset draws one normal per car.
+    // std 0 writes the mean and does not consume rng.
+    float sim_speed_req;
+    float sim_speed_on;
+    float sim_speed_max;
+    float sim_std_req;
+    float sim_std_on;
+    int sim_speed_apply;
+    int sim_speed_drag;
+    int sim_std_apply;
+    int sim_std_drag;
     Dict* cfg;
 };
 
@@ -430,6 +459,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
         fread(&entities[i].goal_position_y, sizeof(float), 1, file);
         fread(&entities[i].goal_position_z, sizeof(float), 1, file);
         fread(&entities[i].mark_as_expert, sizeof(int), 1, file);
+        entities[i].max_speed = 0;
     }
     fclose(file);
     return entities;
@@ -504,6 +534,12 @@ void add_entity_to_grid(Drive* env, int grid_index, int entity_idx, int geometry
 }
 
 void init_grid_map(Drive* env) {
+    free(env->map_corners);
+    free(env->grid_cells);
+    env->map_corners = NULL;
+    env->grid_cells = NULL;
+    env->grid_cols = 0;
+    env->grid_rows = 0;
     float top_left_x = 0, top_left_y = 0, bottom_right_x = 0, bottom_right_y = 0;
     int first_valid_point = 0;
 
@@ -560,6 +596,7 @@ void init_grid_map(Drive* env) {
 
 void init_neighbor_offsets(Drive* env) {
     int vr = env->vision_range;
+    free(env->neighbor_offsets);
     env->neighbor_offsets = (int*)calloc(vr * vr * 2, sizeof(int));
 
     int dx[] = {1, 0, -1, 0};
@@ -595,6 +632,8 @@ void init_neighbor_offsets(Drive* env) {
 void cache_neighbor_offsets(Drive* env) {
     int vr = env->vision_range;
     int count = 0;
+    free(env->neighbor_cache_entities);
+    env->neighbor_cache_entities = NULL;
     int cell_count = env->grid_cols * env->grid_rows;
 
     for (int i = 0; i < cell_count; i++) {
@@ -829,11 +868,13 @@ int collision_check(Drive* env, int agent_idx) {
     }
 
     // Check vehicle-vehicle collisions
-    for (int i = 0; i < MAX_AGENTS; i++) {
+    int nscan = env->active_agent_count + env->static_agent_count;
+    if (nscan > DRIVE_AGENT_MAX) nscan = DRIVE_AGENT_MAX;
+    for (int i = 0; i < nscan; i++) {
         int index = -1;
         if (i < env->active_agent_count) {
             index = env->active_agent_indices[i];
-        } else if (i < env->num_actors) {
+        } else if (i - env->active_agent_count < env->static_agent_count) {
             index = env->static_agent_indices[i - env->active_agent_count];
         }
         if (index == -1 || index == agent_idx) continue;
@@ -892,14 +933,20 @@ int valid_active_agent(Drive* env, int agent_idx) {
 }
 
 void set_active_agents(Drive* env) {
+    free(env->active_agent_indices);
+    free(env->static_agent_indices);
+    free(env->expert_static_agent_indices);
+    env->active_agent_indices = NULL;
+    env->static_agent_indices = NULL;
+    env->expert_static_agent_indices = NULL;
     env->active_agent_count = 0;
     env->static_agent_count = 0;
     env->num_actors = 1;
     env->expert_static_agent_count = 0;
 
-    int active_agent_indices[MAX_AGENTS];
-    int static_agent_indices[MAX_AGENTS];
-    int expert_static_agent_indices[MAX_AGENTS];
+    int active_agent_indices[DRIVE_AGENT_MAX];
+    int static_agent_indices[DRIVE_AGENT_MAX];
+    int expert_static_agent_indices[DRIVE_AGENT_MAX];
 
     if (env->max_agents == 0) {
         env->max_agents = MAX_AGENTS;
@@ -918,7 +965,7 @@ void set_active_agents(Drive* env) {
         env->num_actors = 0;
     }
 
-    for (int i = 0; i < env->num_objects - 1 && env->num_actors < MAX_AGENTS; i++) {
+    for (int i = 0; i < env->num_objects - 1 && env->num_actors < DRIVE_AGENT_MAX; i++) {
         if (env->entities[i].type != VEHICLE) continue;
         if (env->entities[i].traj_valid[0] != 1) continue;
         env->num_actors++;
@@ -989,6 +1036,10 @@ void remove_bad_trajectories(Drive* env) {
     env->timestep = 0;
 }
 
+// Lowest vtype maxSpeed the viewer slider can stage, in m/s.
+#define SIM_SPEED_MIN 1.0f
+// Highest standard deviation the viewer slider can stage, in m/s.
+#define SIM_STD_MAX 20.0f
 #include "flow_init.h"
 
 static void flow_diagram_clear(Drive* env) {
@@ -1094,6 +1145,9 @@ static void flow_number_lanes(Drive* env) {
 // Group ROAD_LANE pieces into lanes. Do not stitch by endpoint: the ramp
 // meets the accel lane, and a heading test joins them.
 static void flow_diagram_alloc(Drive* env) {
+    free(env->flow_speed);
+    free(env->flow_bin_count);
+    free(env->flow_segs);
     env->flow_speed = NULL;
     env->flow_bin_count = NULL;
     env->flow_segs = NULL;
@@ -1341,10 +1395,10 @@ static void flow_diagram_record(Drive* env) {
         count[lane] = 0;
     }
     int nact = env->active_agent_count;
-    if (nact > MAX_AGENTS) {
-        nact = MAX_AGENTS;
+    if (nact > DRIVE_AGENT_MAX) {
+        nact = DRIVE_AGENT_MAX;
     }
-    unsigned char rising[MAX_AGENTS];
+    unsigned char rising[DRIVE_AGENT_MAX];
     for (int i = 0; i < nact; i++) {
         Entity* e = &env->entities[env->active_agent_indices[i]];
         int hidden = e->x == INVALID_POSITION;
@@ -1401,6 +1455,110 @@ static void flow_diagram_record(Drive* env) {
 }
 
 // Initialization / Cleanup
+static void drive_release_world(Drive* env) {
+    idm_free(env);
+    free(env->flow_speed);
+    free(env->flow_bin_count);
+    free(env->flow_segs);
+    env->flow_speed = NULL;
+    env->flow_bin_count = NULL;
+    env->flow_segs = NULL;
+    env->flow_nseg = 0;
+    env->flow_rows = 0;
+    env->flow_nlanes = 0;
+    env->flow_hit_n = 0;
+    env->flow_hit_i = 0;
+    memset(env->flow_hit_prev, 0, sizeof(env->flow_hit_prev));
+    if (env->entities) {
+        for (int i = 0; i < env->num_entities; i++) {
+            free_entity(&env->entities[i]);
+        }
+        free(env->entities);
+        env->entities = NULL;
+    }
+    env->num_entities = 0;
+    env->num_objects = 0;
+    env->num_roads = 0;
+    free(env->active_agent_indices);
+    free(env->static_agent_indices);
+    free(env->expert_static_agent_indices);
+    env->active_agent_indices = NULL;
+    env->static_agent_indices = NULL;
+    env->expert_static_agent_indices = NULL;
+    env->active_agent_count = 0;
+    env->static_agent_count = 0;
+    env->expert_static_agent_count = 0;
+    env->num_actors = 0;
+    free(env->logs);
+    env->logs = NULL;
+    free(env->map_corners);
+    env->map_corners = NULL;
+    free(env->grid_cells);
+    env->grid_cells = NULL;
+    env->grid_cols = 0;
+    env->grid_rows = 0;
+    free(env->neighbor_offsets);
+    env->neighbor_offsets = NULL;
+    free(env->neighbor_cache_entities);
+    env->neighbor_cache_entities = NULL;
+    free(env->neighbor_cache_indices);
+    env->neighbor_cache_indices = NULL;
+}
+
+static void drive_load_world(Drive* env) {
+    env->entities = load_map_binary(env->map_name, env);
+    if (!env->entities) {
+        fprintf(stderr, "ERROR: Cannot load map %s\n",
+            env->map_name ? env->map_name : "(null)");
+        exit(1);
+    }
+    if (env->agent_initialization != AGENT_INIT_LOGS &&
+        env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        fprintf(stderr,
+            "env.agent_initialization must be 0 (logs) or 1 (structured)\n");
+        exit(1);
+    }
+    // Structured placement is in network coordinates. set_means then centers
+    // roads and vehicles together. Logged init leaves the binary objects alone.
+    if (env->agent_initialization == AGENT_INIT_STRUCTURED) {
+        spawn_flow_vehicles(env);
+    }
+    env->dynamics_model = CLASSIC;
+    set_means(env);
+    idm_shift_paths(env);
+    init_grid_map(env);
+    env->vision_range = VISION_RANGE;
+    init_neighbor_offsets(env);
+    free(env->neighbor_cache_indices);
+    env->neighbor_cache_indices = (int*)calloc(
+        (size_t)(env->grid_cols * env->grid_rows) + 1, sizeof(int));
+    cache_neighbor_offsets(env);
+    set_active_agents(env);
+    // Logged agents are replayed once so a partner that overlaps the log can be
+    // dropped. Structured vehicles have no future trajectory to replay.
+    if (env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        remove_bad_trajectories(env);
+    }
+    set_start_position(env);
+    if (env->agent_initialization == AGENT_INIT_STRUCTURED
+        && env->active_agent_count <= 0) {
+        fprintf(stderr, "structured init produced no agents for %s\n",
+            env->map_name ? env->map_name : "(null)");
+        exit(1);
+    }
+    free(env->logs);
+    env->logs = (Log*)calloc((size_t)env->active_agent_count, sizeof(Log));
+    flow_diagram_alloc(env);
+    flow_diagram_record(env);
+    if (env->sim_agents_on == 0) {
+        int n = env->active_agent_count;
+        if (n < 1) n = 1;
+        if (n > DRIVE_AGENT_MAX) n = DRIVE_AGENT_MAX;
+        env->sim_agents_req = n;
+        env->sim_agents_on = n;
+    }
+}
+
 void init(Drive* env) {
     env->timestep = 0;
     env->episode_length = TRAJECTORY_LENGTH;
@@ -1417,74 +1575,15 @@ void init(Drive* env) {
     env->control_mode = read_control_mode(env);
     if (env->control_mode == CONTROL_PRECAL_IDM &&
             env->agent_initialization != AGENT_INIT_STRUCTURED) {
-        fprintf(stderr, "control_mode precal_idm requires agent_initialization = 1\n");
+        fprintf(stderr,
+            "control_mode precal_idm requires agent_initialization = 1\n");
         exit(1);
     }
-    env->entities = load_map_binary(env->map_name, env);
-    if (!env->entities) {
-        fprintf(stderr, "ERROR: Cannot load map %s\n",
-                env->map_name ? env->map_name : "(null)");
-        exit(1);
-    }
-    if (env->agent_initialization != AGENT_INIT_LOGS &&
-        env->agent_initialization != AGENT_INIT_STRUCTURED) {
-        fprintf(stderr, "env.agent_initialization must be 0 (logs) or 1 (structured)\n");
-        exit(1);
-    }
-    // Structured placement is in network coordinates. set_means then centers
-    // roads and vehicles together. Logged init leaves the binary objects alone.
-    if (env->agent_initialization == AGENT_INIT_STRUCTURED) {
-        spawn_flow_vehicles(env);
-    }
-    env->dynamics_model = CLASSIC;
-    set_means(env);
-    idm_shift_paths(env);
-    init_grid_map(env);
-    env->vision_range = VISION_RANGE;
-    init_neighbor_offsets(env);
-    env->neighbor_cache_indices = (int*)calloc((env->grid_cols * env->grid_rows) + 1, sizeof(int));
-    cache_neighbor_offsets(env);
-    set_active_agents(env);
-    // Logged agents are replayed once so a partner that overlaps the log can be
-    // dropped. Structured vehicles have no future trajectory to replay.
-    if (env->agent_initialization != AGENT_INIT_STRUCTURED) {
-        remove_bad_trajectories(env);
-    }
-    set_start_position(env);
-    if (env->agent_initialization == AGENT_INIT_STRUCTURED && env->active_agent_count <= 0) {
-        fprintf(stderr, "structured init produced no agents for %s\n",
-            env->map_name ? env->map_name : "(null)");
-        exit(1);
-    }
-    env->logs = (Log*)calloc(env->active_agent_count, sizeof(Log));
-    flow_diagram_alloc(env);
-    flow_diagram_record(env);
+    drive_load_world(env);
 }
 
 void puf_close(Drive* env) {
-    idm_free(env);
-    free(env->flow_speed);
-    free(env->flow_bin_count);
-    free(env->flow_segs);
-    env->flow_speed = NULL;
-    env->flow_bin_count = NULL;
-    env->flow_segs = NULL;
-    if (env->entities) {
-        for (int i = 0; i < env->num_entities; i++) {
-            free_entity(&env->entities[i]);
-        }
-        free(env->entities);
-        env->entities = NULL;
-    }
-    free(env->active_agent_indices);
-    free(env->logs);
-    free(env->map_corners);
-    free(env->grid_cells);
-    free(env->neighbor_offsets);
-    free(env->neighbor_cache_entities);
-    free(env->neighbor_cache_indices);
-    free(env->static_agent_indices);
-    free(env->expert_static_agent_indices);
+    drive_release_world(env);
 }
 
 // Dynamics
@@ -1505,6 +1604,14 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx) {
 
     speed = speed + 0.5f * acceleration * SIM_DT;
     speed = clipSpeed(speed);
+    // The shared ini cap keeps the 100 m/s clip. Any other max holds.
+    float cap = agent->max_speed;
+    int spread = env->sim_std_on > 0.005f;
+    int below = env->sim_speed_max >= SIM_SPEED_MIN
+        && cap < env->sim_speed_max - 0.005f;
+    if (cap >= SIM_SPEED_MIN && speed > cap && (spread || below)) {
+        speed = cap;
+    }
 
     float beta = tanh(0.5 * tanf(steering));
     float yaw_rate = (speed * cosf(beta) * tanf(steering)) / agent->length;
@@ -1528,7 +1635,8 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx) {
 void compute_observations(Drive* env) {
     for (int i = 0; i < env->active_agent_count; i++) {
         float* obs = env->agents[i].observations;
-        if (obs) memset(obs, 0, OBS_SIZE * sizeof(float));
+        if (!obs) continue;
+        memset(obs, 0, OBS_SIZE * sizeof(float));
         Entity* ego = &env->entities[env->active_agent_indices[i]];
         if (ego->type > CYCLIST) break;
 
@@ -1549,16 +1657,21 @@ void compute_observations(Drive* env) {
         obs[3] = ego->width / MAX_VEH_WIDTH;
         obs[4] = ego->length / MAX_VEH_LEN;
         obs[5] = (ego->collision_state > NO_COLLISION) ? 1 : 0;
+        // Index 6 stays 0. Index 7 is the episode max speed / 100.
+        obs[EGO_FEATURES - 1] = ego->max_speed / MAX_SPEED;
 
-        // Partner observations
+        // First MAX_OBS_AGENTS partners in index order, inside range.
         int obs_idx = EGO_FEATURES;
         int cars_seen = 0;
-        for (int j = 0; j < MAX_AGENTS; j++) {
+        int nscan = env->active_agent_count + env->static_agent_count;
+        if (nscan > DRIVE_AGENT_MAX) nscan = DRIVE_AGENT_MAX;
+        for (int j = 0; j < nscan && cars_seen < MAX_OBS_AGENTS; j++) {
             int index = -1;
             if (j < env->active_agent_count) {
                 index = env->active_agent_indices[j];
-            } else if (j < env->num_actors) {
-                index = env->static_agent_indices[j - env->active_agent_count];
+            } else if (j - env->active_agent_count < env->static_agent_count) {
+                index = env->static_agent_indices[
+                    j - env->active_agent_count];
             }
             if (index == -1) continue;
             if (env->entities[index].type > CYCLIST) break;
@@ -1584,7 +1697,8 @@ void compute_observations(Drive* env) {
             cars_seen++;
             obs_idx += PARTNER_FEATURES;
         }
-        int remaining_partner_obs = (MAX_AGENTS - 1 - cars_seen) * PARTNER_FEATURES;
+        int remaining_partner_obs =
+            (MAX_OBS_AGENTS - cars_seen) * PARTNER_FEATURES;
         memset(&obs[obs_idx], 0, remaining_partner_obs * sizeof(float));
         obs_idx += remaining_partner_obs;
 
@@ -1639,6 +1753,7 @@ void puf_reset(Drive* env) {
     set_start_position(env);
     idm_rewind(env);
     assign_episode_goals(env);
+    assign_episode_speeds(env);
     for (int x = 0; x < env->active_agent_count; x++) {
         env->logs[x] = (Log){0};
         int agent_idx = env->active_agent_indices[x];
@@ -1654,7 +1769,34 @@ void puf_reset(Drive* env) {
     flow_diagram_record(env);
 }
 
-// Back to this car's own spawn. The episode goal stays where it is.
+// Rebuild one map at n cars and reset. Observations must already be bound.
+// control_mode, pause, sim_infinite, and the speed mean and std stay.
+void puf_set_population(Drive* env, int n) {
+    if (n < 1) n = 1;
+    if (n > DRIVE_AGENT_MAX) n = DRIVE_AGENT_MAX;
+    env->max_agents = n;
+    env->timestep = 0;
+    drive_release_world(env);
+    drive_load_world(env);
+    env->sim_agents_on = n;
+    env->sim_agents_apply = 0;
+    env->num_agents = env->active_agent_count;
+    if (env->num_agents > DRIVE_AGENT_MAX) {
+        env->num_agents = DRIVE_AGENT_MAX;
+    }
+    if (env->human_agent_idx < 0
+        || env->human_agent_idx >= env->num_agents) {
+        env->human_agent_idx = 0;
+    }
+    if (env->agent_initialization == AGENT_INIT_STRUCTURED
+        && env->active_agent_count != n) {
+        fprintf(stderr, "agents per map: requested %d, placed %d\n",
+            n, env->active_agent_count);
+    }
+    puf_reset(env);
+}
+
+// Back to this car's own spawn. The episode goal and max speed stay.
 void respawn_agent(Drive* env, int agent_idx) {
     Entity* e = &env->entities[agent_idx];
     e->x = e->traj_x[0];
@@ -1834,6 +1976,20 @@ void puf_step(Drive* env) {
             env->entities[agent_idx].prev_accel = accel;
             env->entities[agent_idx].prev_steer = steer;
         }
+
+        // 1 at the episode max speed, 0 at a stop or at twice that
+        // speed. Logged maps leave max_speed at 0 and skip this.
+        float vmax = env->entities[agent_idx].max_speed;
+        if (vmax >= SIM_SPEED_MIN && env->reward_speed != 0.0f) {
+            float vx = env->entities[agent_idx].vx;
+            float vy = env->entities[agent_idx].vy;
+            float v = sqrtf(vx * vx + vy * vy);
+            float closeness = 1.0f - fabsf(v - vmax) / vmax;
+            if (closeness < 0.0f) closeness = 0.0f;
+            float bonus = env->reward_speed * closeness;
+            env->agents[i].rewards[0] += bonus;
+            env->logs[i].episode_return += bonus;
+        }
     }
 
     // Record the arrival, then send the car back to its own start. It
@@ -1940,8 +2096,10 @@ Client* make_client(Drive* env) {
     return client;
 }
 
-// Right-hand column: playback, controller, and episode length.
+// Right-hand column: playback, controller, episode length, agents, speed.
 #define SIM_COL_W 132.0f
+#define SIM_AGENT_H 46.0f
+#define SIM_DIST_H 78.0f
 
 enum {
     SIM_PLAY = 0,
@@ -1977,11 +2135,122 @@ static void sim_rects(float width, Rectangle r[SIM_NBTN]) {
     r[SIM_INFINITE] = (Rectangle){x, y, bw, bh};
 }
 
-static Rectangle sim_col_rect(float width) {
+static Rectangle sim_agents_rect(float width) {
     Rectangle r[SIM_NBTN];
     sim_rects(width, r);
+    float y = r[SIM_INFINITE].y + r[SIM_INFINITE].height + 18.0f;
+    return (Rectangle){
+        r[SIM_INFINITE].x, y, r[SIM_INFINITE].width, SIM_AGENT_H
+    };
+}
+
+static int sim_speed_shown(Drive* env) {
+    return env->agent_initialization == AGENT_INIT_STRUCTURED
+        && env->sim_speed_max >= SIM_SPEED_MIN;
+}
+
+static Rectangle sim_speed_rect(float width) {
+    Rectangle agents = sim_agents_rect(width);
+    float y = agents.y + agents.height + 18.0f;
+    return (Rectangle){agents.x, y, agents.width, SIM_AGENT_H};
+}
+
+static Rectangle sim_std_rect(float width) {
+    Rectangle mean = sim_speed_rect(width);
+    float y = mean.y + mean.height + 18.0f;
+    return (Rectangle){mean.x, y, mean.width, SIM_AGENT_H};
+}
+
+static Rectangle sim_dist_rect(float width) {
+    Rectangle sd = sim_std_rect(width);
+    float y = sd.y + sd.height + 2.0f;
+    return (Rectangle){sd.x, y, sd.width, SIM_DIST_H};
+}
+
+static void sim_agents_set(Drive* env, int n) {
+    if (n < 1) n = 1;
+    if (n > DRIVE_AGENT_MAX) n = DRIVE_AGENT_MAX;
+    env->sim_agents_req = n;
+}
+
+static int sim_agents_from_x(float mouse_x, Rectangle zone) {
+    float t = 0.0f;
+    if (zone.width > 1.0f) {
+        t = (mouse_x - zone.x) / zone.width;
+    }
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    int span = DRIVE_AGENT_MAX - 1;
+    int n = 1 + (int)(t * (float)span + 0.5f);
+    if (n < 1) n = 1;
+    if (n > DRIVE_AGENT_MAX) n = DRIVE_AGENT_MAX;
+    return n;
+}
+
+static float sim_speed_clamp(Drive* env, float s) {
+    float hi = env->sim_speed_max;
+    if (hi < SIM_SPEED_MIN) hi = SIM_SPEED_MIN;
+    if (s < SIM_SPEED_MIN) s = SIM_SPEED_MIN;
+    if (s > hi) s = hi;
+    return s;
+}
+
+static void sim_speed_set(Drive* env, float s) {
+    env->sim_speed_req = sim_speed_clamp(env, s);
+}
+
+static float sim_speed_from_x(Drive* env, float mouse_x, Rectangle zone) {
+    float t = 0.0f;
+    if (zone.width > 1.0f) {
+        t = (mouse_x - zone.x) / zone.width;
+    }
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float hi = env->sim_speed_max;
+    if (hi < SIM_SPEED_MIN) hi = SIM_SPEED_MIN;
+    float s = SIM_SPEED_MIN + t * (hi - SIM_SPEED_MIN);
+    s = roundf(s * 100.0f) / 100.0f;
+    return sim_speed_clamp(env, s);
+}
+
+static int sim_speed_pending(Drive* env) {
+    return fabsf(env->sim_speed_req - env->sim_speed_on) > 0.005f;
+}
+
+static float sim_std_clamp(float s) {
+    if (s < 0.0f) s = 0.0f;
+    if (s > SIM_STD_MAX) s = SIM_STD_MAX;
+    return s;
+}
+
+static void sim_std_set(Drive* env, float s) {
+    env->sim_std_req = sim_std_clamp(s);
+}
+
+static float sim_std_from_x(float mouse_x, Rectangle zone) {
+    float t = 0.0f;
+    if (zone.width > 1.0f) {
+        t = (mouse_x - zone.x) / zone.width;
+    }
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float s = t * SIM_STD_MAX;
+    s = roundf(s * 100.0f) / 100.0f;
+    return sim_std_clamp(s);
+}
+
+static int sim_std_pending(Drive* env) {
+    return fabsf(env->sim_std_req - env->sim_std_on) > 0.005f;
+}
+
+static Rectangle sim_col_rect(Drive* env) {
+    float width = env->client->width;
+    Rectangle zone = sim_agents_rect(width);
+    if (sim_speed_shown(env)) {
+        zone = sim_dist_rect(width);
+    }
     float x = width - 8.0f - SIM_COL_W;
-    float bot = r[SIM_INFINITE].y + r[SIM_INFINITE].height + 8.0f;
+    float bot = zone.y + zone.height + 8.0f;
     return (Rectangle){x, 8.0f, SIM_COL_W, bot - 8.0f};
 }
 
@@ -2029,7 +2298,7 @@ static int sim_ui_hot(Drive* env) {
         return 0;
     }
     Vector2 mouse = GetMousePosition();
-    if (CheckCollisionPointRec(mouse, sim_col_rect(client->width))) {
+    if (CheckCollisionPointRec(mouse, sim_col_rect(env))) {
         return 1;
     }
     if (puf_record_enabled()) {
@@ -2063,6 +2332,134 @@ static void sim_draw_button(Rectangle r, const char* label, Color fill, Color ed
     int tw = MeasureText(label, 16);
     int tx = (int)(r.x + (r.width - (float)tw) * 0.5f);
     DrawText(label, tx, (int)r.y + 5, 16, (Color){241, 241, 241, 255});
+}
+
+static void sim_slider_row(Rectangle zone, const char* label,
+        const char* num, float t, int pending) {
+    Color num_c = pending
+        ? (Color){240, 196, 120, 255}
+        : (Color){241, 241, 241, 255};
+    DrawText(label, (int)zone.x, (int)zone.y, 16, PUFF_WHITE);
+    int nw = MeasureText(num, 16);
+    DrawText(num, (int)(zone.x + zone.width) - nw, (int)zone.y, 16, num_c);
+    Rectangle track = {zone.x, zone.y + 22.0f, zone.width, 8.0f};
+    DrawRectangleRec(track, (Color){28, 32, 42, 255});
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float knob_w = 10.0f;
+    float kx = zone.x + t * zone.width - knob_w * 0.5f;
+    if (kx < zone.x) kx = zone.x;
+    if (kx > zone.x + zone.width - knob_w) kx = zone.x + zone.width - knob_w;
+    Color knob = pending
+        ? (Color){240, 196, 120, 255}
+        : (Color){36, 110, 72, 255};
+    DrawRectangle((int)kx, (int)track.y - 4, (int)knob_w, 16, knob);
+}
+
+// Staged normal of max speed. Std 0 is a spike. Ticks are the cars now.
+static void sim_dist_fill(Vector2 a, Vector2 b, Vector2 c, Color color) {
+    DrawTriangle(a, b, c, color);
+    DrawTriangle(a, c, b, color);
+}
+
+static void sim_dist_draw(Drive* env, Rectangle zone, int pending) {
+    DrawRectangle((int)(zone.x - 8.0f), (int)zone.y, (int)SIM_COL_W,
+        (int)zone.height, (Color){12, 14, 20, 255});
+    Rectangle plot = {zone.x, zone.y + 2.0f, zone.width, zone.height - 18.0f};
+    float base = plot.y + plot.height - 1.0f;
+    float top = plot.y + 2.0f;
+    float usable = base - top;
+    if (usable < 4.0f) {
+        return;
+    }
+    Color fill = pending
+        ? (Color){240, 196, 120, 150}
+        : (Color){36, 110, 72, 210};
+    Color edge = pending
+        ? (Color){240, 196, 120, 255}
+        : (Color){150, 210, 160, 255};
+    Color dim = {150, 156, 168, 255};
+    float inner_x = plot.x + 3.0f;
+    float inner_w = plot.width - 6.0f;
+    if (inner_w < 8.0f) {
+        inner_w = plot.width;
+        inner_x = plot.x;
+    }
+    float mean = env->sim_speed_req;
+    float std = env->sim_std_req;
+    if (std < 0.0f) {
+        std = 0.0f;
+    }
+    float span = MAX_SPEED - SIM_SPEED_MIN;
+    if (span < 1.0f) {
+        span = 1.0f;
+    }
+    DrawLine((int)inner_x, (int)base,
+        (int)(inner_x + inner_w), (int)base, (Color){70, 76, 88, 255});
+    if (std <= 0.005f) {
+        float t = (mean - SIM_SPEED_MIN) / span;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        float x = inner_x + t * inner_w;
+        Vector2 tip = {x, top};
+        Vector2 bl = {x - 5.0f, base};
+        Vector2 br = {x + 5.0f, base};
+        sim_dist_fill(tip, br, bl, fill);
+        DrawLineEx(tip, bl, 1.25f, edge);
+        DrawLineEx(tip, br, 1.25f, edge);
+    } else {
+        int n = (int)inner_w;
+        if (n < 8) n = 8;
+        if (n > 128) n = 128;
+        float step = inner_w / (float)n;
+        float bin = span / (float)n;
+        float prev_x = inner_x;
+        float prev_y = base;
+        float prev_g = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float s0 = SIM_SPEED_MIN + (float)i * bin;
+            float speed = mean;
+            if (speed < s0) speed = s0;
+            if (speed > s0 + bin) speed = s0 + bin;
+            float z = (speed - mean) / std;
+            if (z > 8.0f) z = 8.0f;
+            if (z < -8.0f) z = -8.0f;
+            float g = expf(-0.5f * z * z);
+            float x = inner_x + ((float)i + 0.5f) * step;
+            float y = base - g * usable;
+            if (i > 0 && (g > 0.015f || prev_g > 0.015f)) {
+                Vector2 p0 = {prev_x, prev_y};
+                Vector2 p1 = {x, y};
+                Vector2 b0 = {prev_x, base};
+                Vector2 b1 = {x, base};
+                sim_dist_fill(b0, b1, p1, fill);
+                sim_dist_fill(b0, p1, p0, fill);
+                DrawLineEx(p0, p1, 1.25f, edge);
+            }
+            prev_x = x;
+            prev_y = y;
+            prev_g = g;
+        }
+    }
+    int nagt = env->active_agent_count;
+    if (nagt > DRIVE_AGENT_MAX) nagt = DRIVE_AGENT_MAX;
+    if (env->active_agent_indices && env->entities) {
+        Color rug = {241, 241, 241, 200};
+        for (int i = 0; i < nagt; i++) {
+            int idx = env->active_agent_indices[i];
+            if (idx < 0 || idx >= env->num_entities) continue;
+            float m = env->entities[idx].max_speed;
+            if (m < SIM_SPEED_MIN) continue;
+            float rt = (m - SIM_SPEED_MIN) / span;
+            if (rt < 0.0f) rt = 0.0f;
+            if (rt > 1.0f) rt = 1.0f;
+            int rx = (int)(inner_x + rt * inner_w);
+            DrawLine(rx, (int)base + 2, rx, (int)base + 5, rug);
+        }
+    }
+    DrawText("1", (int)inner_x, (int)base + 3, 10, dim);
+    int tw = MeasureText("100", 10);
+    DrawText("100", (int)(inner_x + inner_w) - tw, (int)base + 3, 10, dim);
 }
 
 static void sim_choice(Rectangle r, const char* label, int on, int hot, int amber) {
@@ -2128,8 +2525,7 @@ static void sim_transport_draw(Drive* env) {
         !env->sim_infinite,
         env->sim_infinite
     };
-    DrawRectangleRec(sim_col_rect(env->client->width),
-        (Color){12, 14, 20, 230});
+    DrawRectangleRec(sim_col_rect(env), (Color){12, 14, 20, 230});
     Vector2 mouse = GetMousePosition();
     Color sep = (Color){70, 76, 88, 255};
     int y1 = (int)(r[SIM_RESET].y + r[SIM_RESET].height + r[SIM_ODE].y) / 2;
@@ -2143,11 +2539,47 @@ static void sim_transport_draw(Drive* env) {
         int hot = CheckCollisionPointRec(mouse, r[i]);
         sim_choice(r[i], labels[i], on[i], hot, i == SIM_PAUSE);
     }
+    Rectangle zone = sim_agents_rect(env->client->width);
+    int y3 = (int)(r[SIM_INFINITE].y + r[SIM_INFINITE].height + zone.y) / 2;
+    DrawLine(x0, y3, x1, y3, sep);
+    char num[8];
+    snprintf(num, sizeof(num), "%d", env->sim_agents_req);
+    float t = (float)(env->sim_agents_req - 1) / (float)(DRIVE_AGENT_MAX - 1);
+    sim_slider_row(zone, "Agents", num, t,
+        env->sim_agents_req != env->sim_agents_on);
+    if (sim_speed_shown(env)) {
+        Rectangle spd = sim_speed_rect(env->client->width);
+        int y4 = (int)(zone.y + zone.height + spd.y) / 2;
+        DrawLine(x0, y4, x1, y4, sep);
+        char sn[16];
+        snprintf(sn, sizeof(sn), "%.2f", env->sim_speed_req);
+        float span = env->sim_speed_max - SIM_SPEED_MIN;
+        float st = 0.0f;
+        if (span > 1e-3f) {
+            st = (env->sim_speed_req - SIM_SPEED_MIN) / span;
+        }
+        sim_slider_row(spd, "Mean", sn, st, sim_speed_pending(env));
+        Rectangle sd = sim_std_rect(env->client->width);
+        int y5 = (int)(spd.y + spd.height + sd.y) / 2;
+        DrawLine(x0, y5, x1, y5, sep);
+        char dn[16];
+        snprintf(dn, sizeof(dn), "%.2f", env->sim_std_req);
+        float dt = 0.0f;
+        if (SIM_STD_MAX > 1e-3f) {
+            dt = env->sim_std_req / SIM_STD_MAX;
+        }
+        sim_slider_row(sd, "Std", dn, dt, sim_std_pending(env));
+        int dist_pending = sim_speed_pending(env) || sim_std_pending(env);
+        sim_dist_draw(env, sim_dist_rect(env->client->width), dist_pending);
+    }
 }
 
 // Read once per frame, before the step, so a click applies on this tick.
 static inline void puf_sim_poll(Drive* env) {
     if (!env->client || !IsWindowReady() || puf_record_enabled()) {
+        env->sim_agents_drag = 0;
+        env->sim_speed_drag = 0;
+        env->sim_std_drag = 0;
         return;
     }
     // Drop the one-frame hold before reading this frame's click.
@@ -2155,13 +2587,72 @@ static inline void puf_sim_poll(Drive* env) {
     if (IsKeyPressed(KEY_P)) {
         env->sim_paused = !env->sim_paused;
     }
+    Rectangle zone = sim_agents_rect(env->client->width);
+    Rectangle spd = sim_speed_rect(env->client->width);
+    Rectangle sd = sim_std_rect(env->client->width);
+    int speed_on = sim_speed_shown(env);
+    Vector2 mouse = GetMousePosition();
+    int over = CheckCollisionPointRec(mouse, zone);
+    int over_spd = speed_on && CheckCollisionPointRec(mouse, spd);
+    int over_std = speed_on && CheckCollisionPointRec(mouse, sd);
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && over) {
+        env->sim_agents_drag = 1;
+    }
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && over_spd) {
+        env->sim_speed_drag = 1;
+    }
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && over_std) {
+        env->sim_std_drag = 1;
+    }
+    if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        env->sim_agents_drag = 0;
+        env->sim_speed_drag = 0;
+        env->sim_std_drag = 0;
+    }
+    if (env->sim_agents_drag) {
+        sim_agents_set(env, sim_agents_from_x(mouse.x, zone));
+    }
+    if (env->sim_speed_drag) {
+        sim_speed_set(env, sim_speed_from_x(env, mouse.x, spd));
+    }
+    if (env->sim_std_drag) {
+        sim_std_set(env, sim_std_from_x(mouse.x, sd));
+    }
+    float wheel = GetMouseWheelMove();
+    int dragging = env->sim_agents_drag || env->sim_speed_drag
+        || env->sim_std_drag;
+    if (wheel != 0.0f && !dragging) {
+        int step = 1;
+        if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
+            step = 10;
+        }
+        int dir = wheel > 0.0f ? 1 : -1;
+        if (over) {
+            sim_agents_set(env, env->sim_agents_req + dir * step);
+        } else if (over_spd) {
+            sim_speed_set(env, env->sim_speed_req + (float)(dir * step));
+        } else if (over_std) {
+            sim_std_set(env, env->sim_std_req + (float)(dir * step));
+        }
+    }
     if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        return;
+    }
+    if (over || over_spd || over_std || dragging) {
         return;
     }
     Rectangle r[SIM_NBTN];
     sim_rects(env->client->width, r);
-    Vector2 mouse = GetMousePosition();
     if (CheckCollisionPointRec(mouse, r[SIM_PLAY])) {
+        if (env->sim_agents_req != env->sim_agents_on) {
+            env->sim_agents_apply = 1;
+        }
+        if (sim_speed_pending(env)) {
+            env->sim_speed_apply = 1;
+        }
+        if (sim_std_pending(env)) {
+            env->sim_std_apply = 1;
+        }
         env->sim_paused = 0;
     } else if (CheckCollisionPointRec(mouse, r[SIM_PAUSE])) {
         env->sim_paused = 1;
@@ -2275,7 +2766,7 @@ void draw_agent_obs(Drive* env, int agent_index) {
 
     // Draw partner observations
     int obs_idx = EGO_FEATURES;
-    for (int j = 0; j < MAX_AGENTS - 1; j++) {
+    for (int j = 0; j < MAX_OBS_AGENTS; j++) {
         if (agent_obs[obs_idx] == 0 || agent_obs[obs_idx + 1] == 0) {
             obs_idx += PARTNER_FEATURES;
             continue;
@@ -2307,7 +2798,7 @@ void draw_agent_obs(Drive* env, int agent_index) {
     }
 
     // Draw road edge observations
-    int map_start_idx = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
+    int map_start_idx = EGO_FEATURES + PARTNER_FEATURES * MAX_OBS_AGENTS;
     for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
         int idx = map_start_idx + k * ROAD_FEATURES;
         if (agent_obs[idx] == 0 && agent_obs[idx + 1] == 0) continue;
@@ -2877,7 +3368,7 @@ static void flow_draw_lanes(Drive* env, Client* client) {
         return;
     }
     Rectangle diagram = flow_panel_rect(client->width, client->height, n);
-    Rectangle col = sim_col_rect(client->width);
+    Rectangle col = sim_col_rect(env);
     float view_x = client->width * 0.40f;
     float view_y = diagram.y - 80.0f;
     if (view_y < 190.0f) {
@@ -3250,7 +3741,7 @@ static int peek_map_agent_count(const char* filename, int max_agents,
     set_means(&temp);
     set_active_agents(&temp);
     int n = temp.active_agent_count;
-    if (n > MAX_AGENTS) n = MAX_AGENTS;
+    if (n > DRIVE_AGENT_MAX) n = DRIVE_AGENT_MAX;
     puf_close(&temp);
     return n;
 }
@@ -3262,6 +3753,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->reward_goal_post_respawn = dict_get(kwargs, "reward_goal_post_respawn");
     env->reward_vehicle_collision_post_respawn = dict_get(kwargs, "reward_vehicle_collision_post_respawn");
     env->reward_jerk = dict_get(kwargs, "reward_jerk");
+    env->reward_speed = dict_get(kwargs, "reward_speed");
     env->agent_initialization = (int)dict_get(kwargs, "agent_initialization");
     env->cfg = kwargs;
     int map_id = dict_get(kwargs, "map_id");
@@ -3273,7 +3765,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->max_agents = MAX_AGENTS;
     init(env);
     env->num_agents = env->active_agent_count;
-    if (env->num_agents > MAX_AGENTS) env->num_agents = MAX_AGENTS;
+    if (env->num_agents > DRIVE_AGENT_MAX) env->num_agents = DRIVE_AGENT_MAX;
     for (int i = 0; i < env->num_agents; i++) {
         env->agents[i].policy = 0;
         env->agents[i].action_mask = NULL;
@@ -3294,6 +3786,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     float reward_goal_post_respawn = dict_get(env_kwargs, "reward_goal_post_respawn");
     float reward_vehicle_collision_post_respawn = dict_get(env_kwargs, "reward_vehicle_collision_post_respawn");
     float reward_jerk = dict_get(env_kwargs, "reward_jerk");
+    float reward_speed = dict_get(env_kwargs, "reward_speed");
     int human_agent_idx = dict_get(env_kwargs, "human_agent_idx");
     int agent_initialization = (int)dict_get(env_kwargs, "agent_initialization");
 
@@ -3381,11 +3874,12 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_goal_post_respawn = reward_goal_post_respawn;
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
         env->reward_jerk = reward_jerk;
+        env->reward_speed = reward_speed;
         env->max_agents = env_max_agents[i];
         init(env);
         env->num_agents = env->active_agent_count;
         if (env->num_agents > env->max_agents) env->num_agents = env->max_agents;
-        if (env->num_agents > MAX_AGENTS) env->num_agents = MAX_AGENTS;
+        if (env->num_agents > DRIVE_AGENT_MAX) env->num_agents = DRIVE_AGENT_MAX;
         for (int a = 0; a < env->num_agents; a++) {
             env->agents[a].policy = 0;
             env->agents[a].action_mask = NULL;

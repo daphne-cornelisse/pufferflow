@@ -145,7 +145,7 @@ static float draw_observation(Drive* env, int agent_slot, int* edges_out, int* p
     float hy = ego->heading_y;
     float reach = 0.0f;
 
-    int map_start = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
+    int map_start = EGO_FEATURES + PARTNER_FEATURES * MAX_OBS_AGENTS;
     int edges = 0;
     for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
         int idx = map_start + k * ROAD_FEATURES;
@@ -178,7 +178,7 @@ static float draw_observation(Drive* env, int agent_slot, int* edges_out, int* p
 
     int partners = 0;
     int obs_idx = EGO_FEATURES;
-    for (int j = 0; j < MAX_AGENTS - 1; j++) {
+    for (int j = 0; j < MAX_OBS_AGENTS; j++) {
         if (obs[obs_idx] == 0.0f || obs[obs_idx + 1] == 0.0f) {
             obs_idx += PARTNER_FEATURES;
             continue;
@@ -243,7 +243,7 @@ static float draw_observation(Drive* env, int agent_slot, int* edges_out, int* p
 
 static void count_road_slots(const float* obs, int* lane, int* line, int* edge, int* other, int* empty) {
     *lane = *line = *edge = *other = *empty = 0;
-    int map_start = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
+    int map_start = EGO_FEATURES + PARTNER_FEATURES * MAX_OBS_AGENTS;
     for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
         int idx = map_start + k * ROAD_FEATURES;
         if (obs[idx] == 0.0f && obs[idx + 1] == 0.0f && obs[idx + 6] == 0.0f) {

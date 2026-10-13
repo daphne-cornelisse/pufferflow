@@ -131,7 +131,7 @@ typedef struct {
 } FlowPlan;
 
 typedef struct {
-    float x, y, heading, speed;
+    float x, y, heading, speed, max_speed;
     float goal_x, goal_y;
     int flow;
     int path;
@@ -633,7 +633,17 @@ static double path_horizon(const FlowPath* path, float center0) {
     return path_time_to(path, s_max) - path_time_to(path, center0);
 }
 
-static int path_move(const FlowPath* path, float s0, double time, float* s_out) {
+// A personal max cannot outrun the piece. 0 keeps the piece speed.
+static float piece_travel(const FlowPiece* pc, float vmax) {
+    float v = pc->speed;
+    if (vmax > 0.0f && vmax < v) {
+        v = vmax;
+    }
+    return v;
+}
+
+static int path_move(const FlowPath* path, float s0, double time,
+        float vmax, float* s_out) {
     double left = time;
     double walked = 0;
     double s = s0 < 0 ? 0 : s0;
@@ -646,9 +656,10 @@ static int path_move(const FlowPath* path, float s0, double time, float* s_out) 
         }
         double s_in = s > walked ? s : walked;
         double room = piece_end - s_in;
-        double dt = room / (double)pc->speed;
+        double spd = (double)piece_travel(pc, vmax);
+        double dt = room / spd;
         if (left <= dt + 1e-7) {
-            *s_out = (float)(s_in + left * (double)pc->speed);
+            *s_out = (float)(s_in + left * spd);
             return 1;
         }
         left -= dt;
@@ -693,11 +704,11 @@ static int path_sample(const FlowPath* path, float dist, float* ox, float* oy, f
     return 0;
 }
 
-static float path_speed_at(const FlowPath* path, float s) {
+static float path_speed_at(const FlowPath* path, float s, float vmax) {
     double walked = 0;
-    float spd = path->pieces[0].speed;
+    float spd = piece_travel(&path->pieces[0], vmax);
     for (int i = 0; i < path->n; i++) {
-        spd = path->pieces[i].speed;
+        spd = piece_travel(&path->pieces[i], vmax);
         walked += path->pieces[i].len;
         if (s <= (float)walked + 1e-3f) return spd;
     }
@@ -904,6 +915,7 @@ static void fill_vehicle(Entity* e, const SpawnVeh* s) {
     e->goal_position_z = 0;
     e->mark_as_expert = 0;
     e->respawn_timestep = -1;
+    e->max_speed = s->max_speed;
 }
 
 static float flow_goal_distance(Drive* env) {
@@ -1309,7 +1321,7 @@ static float idm_next_speed(Drive* env, IdmLanes* lanes, int ego_i, float ego_v)
     int epi = lanes->path_of[ego_i];
     FlowPath* path = &lanes->paths[epi];
     float es = lanes->s[ego_i];
-    float des = path_speed_at(path, es);
+    float des = path_speed_at(path, es, ego->max_speed);
     float best = 1e6f;
     float pred_v = des;
     int found = 0;
@@ -1364,10 +1376,10 @@ static void idm_step(Drive* env) {
     IdmLanes* lanes = (IdmLanes*)env->lane_state;
     if (!lanes) return;
     int nm = env->active_agent_count;
-    if (nm > MAX_AGENTS) nm = MAX_AGENTS;
-    int idx[MAX_AGENTS];
-    float v_now[MAX_AGENTS];
-    float v_next[MAX_AGENTS];
+    if (nm > DRIVE_AGENT_MAX) nm = DRIVE_AGENT_MAX;
+    int idx[DRIVE_AGENT_MAX];
+    float v_now[DRIVE_AGENT_MAX];
+    float v_next[DRIVE_AGENT_MAX];
     for (int i = 0; i < nm; i++) {
         idx[i] = env->active_agent_indices[i];
         Entity* e = &env->entities[idx[i]];
@@ -1399,6 +1411,86 @@ static void idm_step(Drive* env) {
     }
 }
 
+static int plan_demand(const SumoNet* net, FlowSpec* flows, int nf,
+        const RouteSpec* routes, int nr, const VTypeSpec* vtypes, int nv,
+        FlowPlan* plans, int* natural) {
+    int demand = 0;
+    for (int f = 0; f < nf; f++) {
+        const RouteSpec* route = find_route(routes, nr, flows[f].route_id);
+        const VTypeSpec* vt = find_vtype(vtypes, nv, flows[f].type_id);
+        plan_flow(net, &flows[f], route, vt, &plans[f]);
+        natural[f] = plans[f].i1 - plans[f].i0;
+        if (natural[f] < 0) natural[f] = 0;
+        demand += natural[f];
+    }
+    return demand;
+}
+
+// Natural demand is the t=end snapshot. A larger request tightens headway
+// on the same routes and replans, then allocate_slots trims to cap.
+static void scale_flows_to_cap(const SumoNet* net, FlowSpec* flows, int nf,
+        const RouteSpec* routes, int nr, const VTypeSpec* vtypes, int nv,
+        FlowPlan* plans, int* natural, int* demand, int cap) {
+    if (*demand <= 0 || *demand >= cap) return;
+    FlowSpec base[FLOW_MAX];
+    memcpy(base, flows, (size_t)nf * sizeof(FlowSpec));
+    double scale = (double)cap / (double)(*demand);
+    for (int attempt = 0; attempt < 6 && *demand < cap; attempt++) {
+        for (int f = 0; f < nf; f++) {
+            plan_free(&plans[f]);
+            flows[f] = base[f];
+            flows[f].vehs_per_hour = base[f].vehs_per_hour * scale;
+        }
+        *demand = plan_demand(net, flows, nf, routes, nr, vtypes, nv,
+            plans, natural);
+        if (*demand <= 0) break;
+        if (*demand < cap) {
+            double next = scale * (double)cap / (double)(*demand);
+            if (next < scale * 1.01) next = scale * 1.05;
+            scale = next;
+        }
+    }
+}
+
+// Normal draw on rand_r. Clamped so a piece speed stays positive.
+static float sample_max_speed(Drive* env, float mean, float std) {
+    unsigned int* rng = &env->rng;
+    int r1 = (int)(rand_r(rng) % 100000);
+    float u1 = ((float)r1 + 1.0f) / 100001.0f;
+    float u2 = (float)(rand_r(rng) % 100000) / 99999.0f;
+    float z = sqrtf(-2.0f * logf(u1));
+    z *= cosf(2.0f * (float)M_PI * u2);
+    float v = mean + std * z;
+    if (v < SIM_SPEED_MIN) v = SIM_SPEED_MIN;
+    if (v > MAX_SPEED) v = MAX_SPEED;
+    return v;
+}
+
+// One max speed for the episode, from the committed mean and std.
+// Std 0 writes the mean and leaves the rng alone, so goal draws stay
+// on the same sequence. A respawn keeps this value.
+static void assign_episode_speeds(Drive* env) {
+    IdmLanes* lanes = (IdmLanes*)env->lane_state;
+    if (!lanes || env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        return;
+    }
+    float mean = env->sim_speed_on;
+    if (mean < SIM_SPEED_MIN) mean = SIM_SPEED_MIN;
+    if (mean > MAX_SPEED) mean = MAX_SPEED;
+    int spread = env->sim_std_on > 0.005f;
+    int n = env->active_agent_count;
+    if (n > lanes->nveh) n = lanes->nveh;
+    for (int i = 0; i < n; i++) {
+        int agent = env->active_agent_indices[i];
+        if (agent < 0 || agent >= lanes->nveh) continue;
+        float v = mean;
+        if (spread) {
+            v = sample_max_speed(env, mean, env->sim_std_on);
+        }
+        env->entities[agent].max_speed = v;
+    }
+}
+
 static void spawn_flow_vehicles(Drive* env) {
     if (!env->cfg) flow_die("missing env config");
     char net_path[512];
@@ -1418,6 +1510,41 @@ static void spawn_flow_vehicles(Drive* env) {
     FlowSpec flows[FLOW_MAX];
     int nv = 0, nr = 0, nf = 0;
     read_demand(env->cfg, vtypes, &nv, routes, &nr, flows, &nf);
+    // First load records the ini cap. Later loads honor the slider.
+    // Optional speed_mean and speed_std set the training distribution.
+    if (env->sim_speed_max <= 0.0f && nv > 0) {
+        float hi = vtypes[0].max_speed;
+        if (hi < SIM_SPEED_MIN) hi = SIM_SPEED_MIN;
+        if (hi > MAX_SPEED) hi = MAX_SPEED;
+        env->sim_speed_max = hi;
+        float mean = hi;
+        if (env->cfg) {
+            DictItem* mean_item = dict_find(env->cfg, "speed_mean");
+            if (mean_item) {
+                mean = (float)mean_item->value;
+                if (mean < SIM_SPEED_MIN) mean = SIM_SPEED_MIN;
+                if (mean > hi) mean = hi;
+            }
+            DictItem* std_item = dict_find(env->cfg, "speed_std");
+            if (std_item) {
+                float s = (float)std_item->value;
+                if (s < 0.0f) s = 0.0f;
+                if (s > SIM_STD_MAX) s = SIM_STD_MAX;
+                env->sim_std_req = s;
+                env->sim_std_on = s;
+            }
+        }
+        env->sim_speed_req = mean;
+        env->sim_speed_on = mean;
+    }
+    // Std 0 shares the mean. A spread draws one max per car below.
+    if (env->sim_std_on <= 0.005f && env->sim_speed_on > 0.0f) {
+        for (int i = 0; i < nv; i++) {
+            if (vtypes[i].max_speed > env->sim_speed_on) {
+                vtypes[i].max_speed = env->sim_speed_on;
+            }
+        }
+    }
     for (int r = 0; r < nr; r++) {
         for (int e = 0; e < routes[r].nedges; e++) {
             if (!edge_exists(&net, routes[r].edges[e])) {
@@ -1429,22 +1556,19 @@ static void spawn_flow_vehicles(Drive* env) {
     }
 
     FlowPlan plans[FLOW_MAX];
+    memset(plans, 0, sizeof(plans));
     int natural[FLOW_MAX];
-    int demand = 0;
-    for (int f = 0; f < nf; f++) {
-        const RouteSpec* route = find_route(routes, nr, flows[f].route_id);
-        const VTypeSpec* vt = find_vtype(vtypes, nv, flows[f].type_id);
-        plan_flow(&net, &flows[f], route, vt, &plans[f]);
-        natural[f] = plans[f].i1 - plans[f].i0;
-        if (natural[f] < 0) natural[f] = 0;
-        demand += natural[f];
-    }
+    int demand = plan_demand(&net, flows, nf, routes, nr, vtypes, nv,
+        plans, natural);
     if (demand <= 0) {
         flow_die("flows place no vehicles on the network");
     }
 
     int cap = env->max_agents > 0 ? env->max_agents : MAX_AGENTS;
-    if (cap > MAX_AGENTS) cap = MAX_AGENTS;
+    if (cap < 1) cap = 1;
+    if (cap > DRIVE_AGENT_MAX) cap = DRIVE_AGENT_MAX;
+    scale_flows_to_cap(&net, flows, nf, routes, nr, vtypes, nv,
+        plans, natural, &demand, cap);
     int alloc[FLOW_MAX];
     allocate_slots(natural, nf, cap, alloc);
 
@@ -1477,33 +1601,32 @@ static void spawn_flow_vehicles(Drive* env) {
             double age = flows[f].end - (flows[f].begin + (double)i * period);
             int lane_i = (flows[f].lane_mode == LANE_SPLIT) ? (i + offset) % plan->npaths : 0;
             FlowPath* path = &plan->paths[lane_i];
-            float center_s = 0;
-            if (!path_move(path, center0, age, &center_s)) {
-                fprintf(stderr, "structured init: flow %s vehicle %d fell off the route\n",
-                    flows[f].id, i);
-                exit(1);
+            float vmax = env->sim_speed_on;
+            if (vmax < SIM_SPEED_MIN) vmax = SIM_SPEED_MIN;
+            // This draw only places the car. Reset samples the episode max.
+            if (env->sim_std_on > 0.005f) {
+                vmax = sample_max_speed(env, env->sim_speed_on,
+                    env->sim_std_on);
             }
+            float center_s = 0;
+            if (!path_move(path, center0, age, vmax, &center_s)) continue;
             float goal_s = center_s + goal_dist;
             if (goal_s > path->len) goal_s = path->len;
             float x, y, heading, gx, gy, goal_heading;
             if (!path_sample(path, center_s, &x, &y, &heading) ||
                 !path_sample(path, goal_s, &gx, &gy, &goal_heading)) {
-                fprintf(stderr, "structured init: flow %s could not sample the route\n", flows[f].id);
-                exit(1);
+                continue;
             }
             (void)goal_heading;
             float dx = gx - x;
             float dy = gy - y;
-            if (sqrtf(dx * dx + dy * dy) < MIN_DISTANCE_TO_GOAL) {
-                fprintf(stderr, "structured init: flow %s goal is under %.1f m\n",
-                    flows[f].id, MIN_DISTANCE_TO_GOAL);
-                exit(1);
-            }
+            if (sqrtf(dx * dx + dy * dy) < MIN_DISTANCE_TO_GOAL) continue;
             SpawnVeh* s = &spawns[written++];
             s->x = x;
             s->y = y;
             s->heading = heading;
-            s->speed = path_speed_at(path, center_s);
+            s->speed = path_speed_at(path, center_s, vmax);
+            s->max_speed = vmax;
             s->goal_x = gx;
             s->goal_y = gy;
             s->flow = f;
@@ -1513,8 +1636,11 @@ static void spawn_flow_vehicles(Drive* env) {
             s->vtype = vt;
         }
     }
+    if (written <= 0) flow_die("agent cap left no vehicles");
     if (written != nspawn) {
-        flow_die("internal placement count mismatch");
+        fprintf(stderr, "structured init: placed %d of %d vehicles\n",
+            written, nspawn);
+        nspawn = written;
     }
 
     static int flow_init_logged = 0;
