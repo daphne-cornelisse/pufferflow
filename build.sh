@@ -205,7 +205,9 @@ else
 fi
 
 # src/ocean.cu is the custom-net hook. Drive has none; the flag is still set.
-EXTRA_CFLAGS+=(-DPUFFER_${ENV^^})
+# tr, not ${ENV^^}: macOS /bin/bash is 3.2 and rejects that substitution.
+ENV_UPPER=$(printf '%s' "$ENV" | tr '[:lower:]' '[:upper:]')
+EXTRA_CFLAGS+=(-DPUFFER_${ENV_UPPER})
 
 case "$ENV" in
     osrs_*)

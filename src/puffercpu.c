@@ -906,9 +906,13 @@ int main(int argc, char** argv) {
             : IsWindowReady())) {
         int ticks = 1;
         if (!headless && !recording) {
+            puf_sim_poll(&env);
             double now = GetTime();
             ticks = 0;
-            if (sim_prev >= 0.0) {
+            if (puf_sim_paused(&env)) {
+                // A held accumulator would burst several steps on resume.
+                sim_accum = 0.0;
+            } else if (sim_prev >= 0.0) {
                 double dt = now - sim_prev;
                 if (dt < 0.0) dt = 0.0;
                 if (dt > 0.25) dt = 0.25;

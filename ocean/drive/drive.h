@@ -8,6 +8,8 @@
 #include <string.h>
 #include "raylib.h"
 typedef float obs_t;
+// Window playback. pufferenv.h supplies a no-op for other envs.
+#define PUF_HAS_SIM_CONTROL
 #include "pufferenv.h"
 #define float3 rl_float3
 #define double3 rl_double3
@@ -36,6 +38,33 @@ typedef float obs_t;
 // Simulation constants
 #define TRAJECTORY_LENGTH 91 // Discretized Waymo scenarios
 #define SIM_DT 0.1f
+// Interactive playback only. 20 steps/s is 2x real time so the window is
+// easier to follow. Headless eval still runs as fast as it can.
+#define PUF_STEPS_PER_SEC 20
+
+// Velocity diagram for structured flows. One heatmap. Each segment is one
+// lane, listed on y. A cell is the mean speed of the cars on that lane.
+// Time is on x. Colors match CIRCLES Fig. 7, 10 mph through 80 mph.
+// The panel beside it marks a new crash in red and an off-road event in yellow.
+#define FLOW_MPS_TO_MPH 2.2369363f
+#define FLOW_MPH_LO 10.0f
+#define FLOW_MPH_HI 80.0f
+#define FLOW_CMAP_N 16
+#define FLOW_LANE_MAX 8
+#define FLOW_PANEL_HEAD 40.0f
+#define FLOW_PANEL_FOOT 36.0f
+#define FLOW_PANEL_ROW 40.0f
+#define FLOW_PANEL_W 480.0f
+#define FLOW_PANEL_GAP 8.0f
+#define FLOW_HIT_MAX 1024
+// Half the 3.2 m lane spacing. A vehicle is counted on the closest centerline.
+#define FLOW_LATERAL 1.6f
+// A collision just off the paint still belongs to the nearest lane.
+#define FLOW_HIT_REACH 8.0f
+// Split a new lane when centerline y jumps by more than this.
+#define FLOW_LANE_GAP 1.2f
+// |dy| below this is a horizontal lane. The ramp is steeper.
+#define FLOW_FLAT_DY 1.0f
 
 // Agent limits
 #ifndef MAX_AGENTS
@@ -50,6 +79,11 @@ typedef float obs_t;
 // 1 places vehicles from the SUMO-style flows in the ini (ocean/drive/flow_init.h).
 #define AGENT_INIT_LOGS 0
 #define AGENT_INIT_STRUCTURED 1
+
+// How active agents move. policy uses the discrete accel/steer bicycle model.
+// precal_idm integrates SUMO's calibrated IDM along each vehicle's route.
+#define CONTROL_POLICY 0
+#define CONTROL_PRECAL_IDM 1
 
 // Collision State
 #define NO_COLLISION 0
@@ -91,6 +125,11 @@ typedef Env Drive;
 
 // Distance thresholds
 #define MIN_DISTANCE_TO_GOAL 5.0f
+// Steps of collision immunity after a respawn, so the car can overlap
+// traffic already sitting on its spawn. Off-road is still penalized.
+#define RESPAWN_GRACE 10
+// Infinite: farther than the trip by this much also ends the lap.
+#define RESPAWN_OVERRUN 40.0f
 #define COLLISION_DIST_SQ 225.0f
 #define OBS_DIST_SQ 2500.0f
 #define COLLISION_BOX_SCALE 0.7f
@@ -219,6 +258,14 @@ float normalize_heading(float heading) {
     return heading;
 }
 
+// Centerline piece for the velocity diagram. Endpoints are centered map
+// coordinates. pos is the network-x midpoint, shared by every lane strip.
+typedef struct FlowSeg {
+    float ax, ay, bx, by;
+    float pos;
+    int lane;
+} FlowSeg;
+
 struct Env {
     Client* client;
     Agent agents[MAX_AGENTS];
@@ -241,6 +288,7 @@ struct Env {
     int expert_static_agent_count;
     int* expert_static_agent_indices;
     int timestep;
+    int episode_length;
     int dynamics_model;
     float* map_corners;
     int* grid_cells;
@@ -260,8 +308,45 @@ struct Env {
     float reward_jerk;
     unsigned int rng;
     int agent_initialization;
+    int control_mode;
+    // Route polylines and arc lengths for CONTROL_PRECAL_IDM. Owned by flow_init.h.
+    void* lane_state;
+    // Mean speed (m/s) of every vehicle on a lane, per step. -1 is empty.
+    // Index is time * flow_nlanes + lane. The lane is the road area.
+    FlowSeg* flow_segs;
+    int flow_nlanes;
+    int flow_lane_beg[FLOW_LANE_MAX];
+    int flow_lane_n[FLOW_LANE_MAX];
+    float flow_lane_lo[FLOW_LANE_MAX];
+    float flow_lane_hi[FLOW_LANE_MAX];
+    float flow_pos_lo;
+    float flow_pos_hi;
+    char flow_lane_name[FLOW_LANE_MAX][16];
+    float* flow_speed;
+    int* flow_bin_count;
+    int flow_nseg;
+    int flow_rows;
+    // Onset of each collision: absolute step, lane, and kind. A ring.
+    int flow_hit_t[FLOW_HIT_MAX];
+    int flow_hit_lane[FLOW_HIT_MAX];
+    unsigned char flow_hit_kind[FLOW_HIT_MAX];
+    int flow_hit_n;
+    int flow_hit_i;
+    unsigned char flow_hit_prev[MAX_AGENTS];
+    // Set from the window. Headless eval and recording never read these.
+    int sim_paused;
+    int sim_infinite;
+    // One frame after Reset, so that click draws timestep 0.
+    int sim_hold_step;
     Dict* cfg;
 };
+
+static inline int puf_sim_paused(Drive* env) {
+    if (puf_record_enabled()) {
+        return 0;
+    }
+    return env->sim_paused || env->sim_hold_step;
+}
 
 void add_log(Drive* env) {
     for (int i = 0; i < env->active_agent_count; i++) {
@@ -906,9 +991,435 @@ void remove_bad_trajectories(Drive* env) {
 
 #include "flow_init.h"
 
+static void flow_diagram_clear(Drive* env) {
+    env->flow_hit_n = 0;
+    env->flow_hit_i = 0;
+    memset(env->flow_hit_prev, 0, sizeof(env->flow_hit_prev));
+    if (!env->flow_speed) {
+        return;
+    }
+    int n = env->flow_rows * env->flow_nlanes;
+    for (int i = 0; i < n; i++) {
+        env->flow_speed[i] = -1.0f;
+    }
+}
+
+static int flow_seg_flat(const FlowSeg* s) {
+    float dy = s->by - s->ay;
+    if (dy < 0.0f) {
+        dy = -dy;
+    }
+    return dy < FLOW_FLAT_DY;
+}
+
+static float flow_seg_ymid(const FlowSeg* s) {
+    return 0.5f * (s->ay + s->by);
+}
+
+// Larger network x first, so texture row 0 of a lane is downstream.
+static void flow_sort_pos(FlowSeg* s, int lo, int hi) {
+    for (int i = lo + 1; i < hi; i++) {
+        FlowSeg key = s[i];
+        int j = i - 1;
+        while (j >= lo && s[j].pos < key.pos) {
+            s[j + 1] = s[j];
+            j--;
+        }
+        s[j + 1] = key;
+    }
+}
+
+static void flow_sort_ymid(FlowSeg* s, int n) {
+    for (int i = 1; i < n; i++) {
+        FlowSeg key = s[i];
+        float ky = flow_seg_ymid(&key);
+        int j = i - 1;
+        while (j >= 0 && flow_seg_ymid(&s[j]) < ky) {
+            s[j + 1] = s[j];
+            j--;
+        }
+        s[j + 1] = key;
+    }
+}
+
+// Horizontal centerlines move to the front. Returns how many.
+static int flow_partition_flat(FlowSeg* s, int n) {
+    int h = 0;
+    int d = n - 1;
+    while (h <= d) {
+        if (flow_seg_flat(&s[h])) {
+            h++;
+        } else {
+            FlowSeg tmp = s[h];
+            s[h] = s[d];
+            s[d] = tmp;
+            d--;
+        }
+    }
+    return h;
+}
+
+static int flow_take_lane(Drive* env, int lane, int beg, int n) {
+    if (lane < 0 || lane >= FLOW_LANE_MAX || n <= 0) {
+        return -1;
+    }
+    flow_sort_pos(env->flow_segs, beg, beg + n);
+    env->flow_lane_beg[lane] = beg;
+    env->flow_lane_n[lane] = n;
+    float lo = 1.0e30f;
+    float hi = -1.0e30f;
+    for (int i = 0; i < n; i++) {
+        FlowSeg* g = &env->flow_segs[beg + i];
+        g->lane = lane;
+        float a = g->ax + env->world_mean_x;
+        float b = g->bx + env->world_mean_x;
+        if (a < lo) lo = a;
+        if (b < lo) lo = b;
+        if (a > hi) hi = a;
+        if (b > hi) hi = b;
+    }
+    env->flow_lane_lo[lane] = lo;
+    env->flow_lane_hi[lane] = hi;
+    env->flow_lane_name[lane][0] = '\0';
+    return 0;
+}
+
+// Display order is already top to bottom. Labels are 1..n in that order.
+static void flow_number_lanes(Drive* env) {
+    for (int i = 0; i < env->flow_nlanes; i++) {
+        snprintf(env->flow_lane_name[i], 16, "%d", i + 1);
+    }
+}
+
+// Group ROAD_LANE pieces into lanes. Do not stitch by endpoint: the ramp
+// meets the accel lane, and a heading test joins them.
+static void flow_diagram_alloc(Drive* env) {
+    env->flow_speed = NULL;
+    env->flow_bin_count = NULL;
+    env->flow_segs = NULL;
+    env->flow_nseg = 0;
+    env->flow_rows = 0;
+    env->flow_nlanes = 0;
+    env->flow_pos_lo = 0.0f;
+    env->flow_pos_hi = 0.0f;
+    if (env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        return;
+    }
+    if (!env->entities || env->episode_length < 1) {
+        return;
+    }
+    int nseg = 0;
+    for (int i = 0; i < env->num_entities; i++) {
+        Entity* e = &env->entities[i];
+        if (e->type != ROAD_LANE || e->array_size < 2) {
+            continue;
+        }
+        nseg += e->array_size - 1;
+    }
+    if (nseg <= 0) {
+        return;
+    }
+    FlowSeg* segs = (FlowSeg*)malloc((size_t)nseg * sizeof(FlowSeg));
+    if (!segs) {
+        fprintf(stderr, "velocity diagram alloc failed\n");
+        exit(1);
+    }
+    int w = 0;
+    for (int i = 0; i < env->num_entities; i++) {
+        Entity* e = &env->entities[i];
+        if (e->type != ROAD_LANE || e->array_size < 2) {
+            continue;
+        }
+        for (int j = 0; j < e->array_size - 1; j++) {
+            float ax = e->traj_x[j];
+            float ay = e->traj_y[j];
+            float bx = e->traj_x[j + 1];
+            float by = e->traj_y[j + 1];
+            if (ax == INVALID_POSITION || bx == INVALID_POSITION) {
+                continue;
+            }
+            segs[w].ax = ax;
+            segs[w].ay = ay;
+            segs[w].bx = bx;
+            segs[w].by = by;
+            segs[w].pos = 0.5f * (ax + bx) + env->world_mean_x;
+            segs[w].lane = -1;
+            w++;
+        }
+    }
+    nseg = w;
+    env->flow_segs = segs;
+    env->flow_nseg = nseg;
+    if (nseg <= 0) {
+        free(segs);
+        env->flow_segs = NULL;
+        return;
+    }
+    int nflat_seg = flow_partition_flat(segs, nseg);
+    if (nflat_seg > 1) {
+        flow_sort_ymid(segs, nflat_seg);
+    }
+    int lane = 0;
+    int start = 0;
+    for (int i = 1; i <= nflat_seg; i++) {
+        int split = (i == nflat_seg);
+        if (!split) {
+            float prev = flow_seg_ymid(&segs[i - 1]);
+            float cur = flow_seg_ymid(&segs[i]);
+            if (prev - cur > FLOW_LANE_GAP) {
+                split = 1;
+            }
+        }
+        if (!split) {
+            continue;
+        }
+        if (flow_take_lane(env, lane, start, i - start) < 0) {
+            fprintf(stderr, "velocity diagram has more than %d lanes\n",
+                FLOW_LANE_MAX);
+            exit(1);
+        }
+        lane++;
+        start = i;
+    }
+    if (nseg > nflat_seg) {
+        if (flow_take_lane(env, lane, nflat_seg, nseg - nflat_seg) < 0) {
+            fprintf(stderr, "velocity diagram has more than %d lanes\n",
+                FLOW_LANE_MAX);
+            exit(1);
+        }
+        lane++;
+    }
+    if (lane <= 0) {
+        return;
+    }
+    env->flow_nlanes = lane;
+    flow_number_lanes(env);
+    float plo = env->flow_lane_lo[0];
+    float phi = env->flow_lane_hi[0];
+    for (int i = 1; i < lane; i++) {
+        if (env->flow_lane_lo[i] < plo) {
+            plo = env->flow_lane_lo[i];
+        }
+        if (env->flow_lane_hi[i] > phi) {
+            phi = env->flow_lane_hi[i];
+        }
+    }
+    env->flow_pos_lo = plo;
+    env->flow_pos_hi = phi;
+    int rows = env->episode_length;
+    env->flow_rows = rows;
+    env->flow_speed = (float*)malloc(
+        (size_t)rows * (size_t)lane * sizeof(float));
+    env->flow_bin_count = (int*)malloc((size_t)lane * sizeof(int));
+    if (!env->flow_speed || !env->flow_bin_count) {
+        fprintf(stderr, "velocity diagram alloc failed\n");
+        exit(1);
+    }
+    flow_diagram_clear(env);
+}
+
+// Closest centerline within reach meters. -1 if the car is farther out.
+static int flow_agent_lane(Drive* env, float x, float y, float reach) {
+    int nseg = env->flow_nseg;
+    int nlanes = env->flow_nlanes;
+    float limit = reach * reach;
+    int best = -1;
+    float best_lat = limit;
+    float best_mid = 2.0f;
+    for (int s = 0; s < nseg; s++) {
+        FlowSeg* g = &env->flow_segs[s];
+        float dx = g->bx - g->ax;
+        float dy = g->by - g->ay;
+        float len2 = dx * dx + dy * dy;
+        if (len2 < 1.0e-8f) {
+            continue;
+        }
+        float t = ((x - g->ax) * dx + (y - g->ay) * dy) / len2;
+        if (t < 0.0f || t > 1.0f) {
+            continue;
+        }
+        float px = g->ax + t * dx;
+        float py = g->ay + t * dy;
+        float lat = (x - px) * (x - px) + (y - py) * (y - py);
+        if (lat > limit) {
+            continue;
+        }
+        float mid = t - 0.5f;
+        if (mid < 0.0f) {
+            mid = -mid;
+        }
+        if (lat < best_lat || (lat == best_lat && mid < best_mid)) {
+            best_lat = lat;
+            best_mid = mid;
+            best = s;
+        }
+    }
+    if (best < 0) {
+        return -1;
+    }
+    int lane = env->flow_segs[best].lane;
+    if (lane < 0 || lane >= nlanes) {
+        return -1;
+    }
+    return lane;
+}
+
+static int flow_place_lane(Drive* env, const Entity* e) {
+    int lane = flow_agent_lane(env, e->x, e->y, FLOW_LATERAL);
+    if (lane >= 0) {
+        return lane;
+    }
+    return flow_agent_lane(env, e->x, e->y, FLOW_HIT_REACH);
+}
+
+// Other active car in this contact, or -1. The lower index owns the mark.
+static int flow_hit_partner(Drive* env, int agent_idx) {
+    Entity* a = &env->entities[agent_idx];
+    int best = -1;
+    for (int j = 0; j < env->active_agent_count; j++) {
+        int idx = env->active_agent_indices[j];
+        if (idx == agent_idx) {
+            continue;
+        }
+        Entity* b = &env->entities[idx];
+        if (b->collision_state != VEHICLE_COLLISION) {
+            continue;
+        }
+        float dx = b->x - a->x;
+        float dy = b->y - a->y;
+        if (dx * dx + dy * dy > COLLISION_DIST_SQ) {
+            continue;
+        }
+        if (!check_aabb_collision(a, b)) {
+            continue;
+        }
+        if (best < 0 || idx < best) {
+            best = idx;
+        }
+    }
+    return best;
+}
+
+static void flow_hit_push(Drive* env, int lane, int kind) {
+    int i = env->flow_hit_i;
+    env->flow_hit_t[i] = env->timestep;
+    env->flow_hit_lane[i] = lane;
+    env->flow_hit_kind[i] = (unsigned char)kind;
+    i++;
+    if (i >= FLOW_HIT_MAX) {
+        i = 0;
+    }
+    env->flow_hit_i = i;
+    if (env->flow_hit_n < FLOW_HIT_MAX) {
+        env->flow_hit_n++;
+    }
+}
+
+// Mean speed of the vehicles on each lane. A lane is one road area.
+// A new collision on that lane is stored for the chart beside the heatmap.
+static void flow_diagram_record(Drive* env) {
+    if (!env->flow_speed || !env->flow_segs) {
+        return;
+    }
+    if (env->flow_rows <= 0 || env->flow_nlanes <= 0) {
+        return;
+    }
+    int row = env->timestep;
+    if (row < 0) {
+        return;
+    }
+    if (env->sim_infinite) {
+        row %= env->flow_rows;
+    } else if (row >= env->flow_rows) {
+        return;
+    }
+    int nlanes = env->flow_nlanes;
+    float* sum = env->flow_speed + (size_t)row * (size_t)nlanes;
+    int* count = env->flow_bin_count;
+    for (int lane = 0; lane < nlanes; lane++) {
+        sum[lane] = 0.0f;
+        count[lane] = 0;
+    }
+    int nact = env->active_agent_count;
+    if (nact > MAX_AGENTS) {
+        nact = MAX_AGENTS;
+    }
+    unsigned char rising[MAX_AGENTS];
+    for (int i = 0; i < nact; i++) {
+        Entity* e = &env->entities[env->active_agent_indices[i]];
+        int hidden = e->x == INVALID_POSITION;
+        if (!hidden) {
+            int lane = flow_agent_lane(env, e->x, e->y, FLOW_LATERAL);
+            if (lane >= 0) {
+                float speed = sqrtf(e->vx * e->vx + e->vy * e->vy);
+                sum[lane] += speed;
+                count[lane] += 1;
+            }
+        }
+        int hit = !hidden && e->collision_state > NO_COLLISION;
+        rising[i] = (unsigned char)(hit && !env->flow_hit_prev[i]);
+        env->flow_hit_prev[i] = (unsigned char)hit;
+    }
+    for (int lane = 0; lane < nlanes; lane++) {
+        if (count[lane] == 0) {
+            sum[lane] = -1.0f;
+        } else {
+            sum[lane] /= (float)count[lane];
+        }
+    }
+    for (int i = 0; i < nact; i++) {
+        if (!rising[i]) {
+            continue;
+        }
+        int self = env->active_agent_indices[i];
+        Entity* e = &env->entities[self];
+        int other = -1;
+        if (e->collision_state == VEHICLE_COLLISION) {
+            other = flow_hit_partner(env, self);
+            int slot = -1;
+            if (other >= 0) {
+                for (int j = 0; j < nact; j++) {
+                    if (env->active_agent_indices[j] == other) {
+                        slot = j;
+                        break;
+                    }
+                }
+            }
+            if (other >= 0 && other < self && slot >= 0 && rising[slot]) {
+                continue;
+            }
+        }
+        int lane = flow_place_lane(env, e);
+        if (lane < 0 && other >= 0) {
+            lane = flow_place_lane(env, &env->entities[other]);
+        }
+        if (lane < 0) {
+            continue;
+        }
+        flow_hit_push(env, lane, e->collision_state);
+    }
+}
+
 // Initialization / Cleanup
 void init(Drive* env) {
     env->timestep = 0;
+    env->episode_length = TRAJECTORY_LENGTH;
+    if (env->cfg) {
+        DictItem* item = dict_find(env->cfg, "episode_length");
+        if (item) {
+            if (item->value < 1) {
+                fprintf(stderr, "env.episode_length must be >= 1\n");
+                exit(1);
+            }
+            env->episode_length = (int)item->value;
+        }
+    }
+    env->control_mode = read_control_mode(env);
+    if (env->control_mode == CONTROL_PRECAL_IDM &&
+            env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        fprintf(stderr, "control_mode precal_idm requires agent_initialization = 1\n");
+        exit(1);
+    }
     env->entities = load_map_binary(env->map_name, env);
     if (!env->entities) {
         fprintf(stderr, "ERROR: Cannot load map %s\n",
@@ -927,6 +1438,7 @@ void init(Drive* env) {
     }
     env->dynamics_model = CLASSIC;
     set_means(env);
+    idm_shift_paths(env);
     init_grid_map(env);
     env->vision_range = VISION_RANGE;
     init_neighbor_offsets(env);
@@ -945,9 +1457,18 @@ void init(Drive* env) {
         exit(1);
     }
     env->logs = (Log*)calloc(env->active_agent_count, sizeof(Log));
+    flow_diagram_alloc(env);
+    flow_diagram_record(env);
 }
 
 void puf_close(Drive* env) {
+    idm_free(env);
+    free(env->flow_speed);
+    free(env->flow_bin_count);
+    free(env->flow_segs);
+    env->flow_speed = NULL;
+    env->flow_bin_count = NULL;
+    env->flow_segs = NULL;
     if (env->entities) {
         for (int i = 0; i < env->num_entities; i++) {
             free_entity(&env->entities[i]);
@@ -1011,10 +1532,6 @@ void compute_observations(Drive* env) {
         Entity* ego = &env->entities[env->active_agent_indices[i]];
         if (ego->type > CYCLIST) break;
 
-        if (ego->respawn_timestep != -1) {
-            obs[6] = 1;
-        }
-
         float cos_h = ego->heading_x;
         float sin_h = ego->heading_y;
         float ego_speed = sqrtf(ego->vx * ego->vx + ego->vy * ego->vy);
@@ -1048,8 +1565,6 @@ void compute_observations(Drive* env) {
             if (index == env->active_agent_indices[i]) continue;
 
             Entity* other = &env->entities[index];
-            if (ego->respawn_timestep != -1) continue;
-            if (other->respawn_timestep != -1) continue;
 
             float dx = other->x - ego->x;
             float dy = other->y - ego->y;
@@ -1122,6 +1637,8 @@ void puf_reset(Drive* env) {
     env->timestep = 0;
     if (!env->entities || env->active_agent_count <= 0) return;
     set_start_position(env);
+    idm_rewind(env);
+    assign_episode_goals(env);
     for (int x = 0; x < env->active_agent_count; x++) {
         env->logs[x] = (Log){0};
         int agent_idx = env->active_agent_indices[x];
@@ -1133,8 +1650,11 @@ void puf_reset(Drive* env) {
         collision_check(env, agent_idx);
     }
     compute_observations(env);
+    flow_diagram_clear(env);
+    flow_diagram_record(env);
 }
 
+// Back to this car's own spawn. The episode goal stays where it is.
 void respawn_agent(Drive* env, int agent_idx) {
     Entity* e = &env->entities[agent_idx];
     e->x = e->traj_x[0];
@@ -1146,6 +1666,7 @@ void respawn_agent(Drive* env, int agent_idx) {
     e->vy = e->traj_vy[0];
     e->reached_goal = 0;
     e->respawn_timestep = env->timestep;
+    idm_rewind_one(env, agent_idx);
 }
 
 // Hold Left Shift + WASD/arrows. Tab cycles the human vehicle.
@@ -1192,6 +1713,25 @@ static void drive_human_controls(Drive *env) {
     }
 }
 
+// The 5 m disk is easy to miss. Past the goal plane, or well beyond the
+// trip, is the end of this lap. Finite scoring keeps the disk only.
+static int infinite_passed_goal(const Entity* e) {
+    float sx = e->traj_x[0];
+    float sy = e->traj_y[0];
+    float gx = e->goal_position_x - sx;
+    float gy = e->goal_position_y - sy;
+    float px = e->x - e->goal_position_x;
+    float py = e->y - e->goal_position_y;
+    if (px * gx + py * gy > 0.0f) {
+        return 1;
+    }
+    float trip = sqrtf(gx * gx + gy * gy);
+    float hx = e->x - sx;
+    float hy = e->y - sy;
+    float limit = trip + RESPAWN_OVERRUN;
+    return (hx * hx + hy * hy) > (limit * limit);
+}
+
 void puf_step(Drive* env) {
     drive_human_controls(env);
     if (!env->entities || env->active_agent_count <= 0) return;
@@ -1202,7 +1742,8 @@ void puf_step(Drive* env) {
     }
     env->timestep++;
 
-    if (env->timestep == TRAJECTORY_LENGTH) {
+    // Infinite keeps driving past the configured length. Headless stays finite.
+    if (!env->sim_infinite && env->timestep == env->episode_length) {
         add_log(env);
         puf_reset(env);
         return;
@@ -1215,13 +1756,25 @@ void puf_step(Drive* env) {
         move_expert(env, NULL, expert_idx);
     }
 
-    // Apply dynamics for active agents
+    // precal_idm integrates every agent from the same pre-step state.
+    // policy applies the discrete bicycle model one agent at a time.
+    if (env->control_mode == CONTROL_PRECAL_IDM) {
+        idm_step(env);
+    }
     for (int i = 0; i < env->active_agent_count; i++) {
         env->logs[i].score = 0.0f;
         env->logs[i].episode_length += 1;
         int agent_idx = env->active_agent_indices[i];
-        env->entities[agent_idx].collision_state = NO_COLLISION;
-        move_dynamics(env, i, agent_idx);
+        Entity* agent = &env->entities[agent_idx];
+        // Immunity expires so a respawned car can be penalized again.
+        if (agent->respawn_timestep >= 0
+            && env->timestep - agent->respawn_timestep >= RESPAWN_GRACE) {
+            agent->respawn_timestep = -1;
+        }
+        agent->collision_state = NO_COLLISION;
+        if (env->control_mode != CONTROL_PRECAL_IDM) {
+            move_dynamics(env, i, agent_idx);
+        }
     }
 
     // Collision detection and rewards
@@ -1251,22 +1804,24 @@ void puf_step(Drive* env) {
             env->entities[agent_idx].x, env->entities[agent_idx].y,
             env->entities[agent_idx].goal_position_x, env->entities[agent_idx].goal_position_y);
 
-        if (distance_to_goal < MIN_DISTANCE_TO_GOAL) {
-            if (env->entities[agent_idx].respawn_timestep != -1) {
-                env->agents[i].rewards[0] += env->reward_goal_post_respawn;
-                env->logs[i].episode_return += env->reward_goal_post_respawn;
-            } else {
-                env->agents[i].rewards[0] += 1.0f;
-                env->logs[i].episode_return += 1.0f;
-            }
+        int at_goal = distance_to_goal < MIN_DISTANCE_TO_GOAL;
+        if (!at_goal && env->sim_infinite) {
+            at_goal = infinite_passed_goal(&env->entities[agent_idx]);
+        }
+        // Every arrival pays +1, including a later lap of the same goal.
+        // reward_goal_post_respawn stays in the ini and is not applied.
+        if (at_goal) {
+            env->agents[i].rewards[0] += 1.0f;
+            env->logs[i].episode_return += 1.0f;
             env->entities[agent_idx].reached_goal = 1;
             env->entities[agent_idx].reached_goal_this_episode = 1;
         }
 
         // Squared bin-steps of accel and steer. One adjacent-bin flip costs
         // reward_jerk. The first step of an episode compares against 0.
+        // Jerk prices the commanded bins. precal_idm does not apply them.
         float* atn = env->agents[i].actions;
-        if (atn) {
+        if (atn && env->control_mode != CONTROL_PRECAL_IDM) {
             float accel = ACCELERATION_VALUES[(int)atn[0]];
             float steer = STEERING_VALUES[(int)atn[1]];
             float accel_step = ACCELERATION_VALUES[1] - ACCELERATION_VALUES[0];
@@ -1280,6 +1835,10 @@ void puf_step(Drive* env) {
             env->entities[agent_idx].prev_steer = steer;
         }
     }
+
+    // Record the arrival, then send the car back to its own start. It
+    // stays in the episode until the step limit and can score again.
+    flow_diagram_record(env);
 
     // Respawn agents that reached goal
     for (int i = 0; i < env->active_agent_count; i++) {
@@ -1303,6 +1862,10 @@ struct Client {
     int car_assignments[MAX_AGENTS];
     Vector3 default_camera_position;
     Vector3 default_camera_target;
+    Texture2D flow_tex;
+    Color* flow_pix;
+    int flow_tex_w;
+    int flow_tex_h;
 };
 
 Client* make_client(Drive* env) {
@@ -1318,8 +1881,28 @@ Client* make_client(Drive* env) {
         flags |= FLAG_WINDOW_HIDDEN;
     }
     SetConfigFlags(flags);
-    InitWindow(client->width, client->height, "PufferLib Ray GPU Drive");
+    InitWindow(client->width, client->height, "Pufferflow");
     if (!recording) {
+        int mw = GetMonitorWidth(GetCurrentMonitor());
+        int mh = GetMonitorHeight(GetCurrentMonitor());
+        if (mw >= 1400 && mh >= 900) {
+            int w = mw - 40;
+            int h = mh - 160;
+            if (w > mw - 16) {
+                w = mw - 16;
+            }
+            if (h > mh - 96) {
+                h = mh - 96;
+            }
+            SetWindowSize(w, h);
+            SetWindowPosition((mw - w) / 2, 32);
+            client->width = (float)GetScreenWidth();
+            client->height = (float)GetScreenHeight();
+            if (client->width < 100.0f || client->height < 100.0f) {
+                client->width = (float)w;
+                client->height = (float)h;
+            }
+        }
         SetTargetFPS(30);
     } else {
         rlDisableBackfaceCulling();
@@ -1357,16 +1940,262 @@ Client* make_client(Drive* env) {
     return client;
 }
 
+// Right-hand column: playback, controller, and episode length.
+#define SIM_COL_W 132.0f
+
+enum {
+    SIM_PLAY = 0,
+    SIM_PAUSE = 1,
+    SIM_RESET = 2,
+    SIM_ODE = 3,
+    SIM_POLICY = 4,
+    SIM_FINITE = 5,
+    SIM_INFINITE = 6,
+    SIM_NBTN = 7
+};
+
+static void sim_rects(float width, Rectangle r[SIM_NBTN]) {
+    float col_x = width - 8.0f - SIM_COL_W;
+    float x = col_x + 8.0f;
+    float bw = SIM_COL_W - 16.0f;
+    float bh = 26.0f;
+    float y = 16.0f;
+    float gap = 6.0f;
+    float grp = 18.0f;
+    r[SIM_PLAY] = (Rectangle){x, y, bw, bh};
+    y += bh + gap;
+    r[SIM_PAUSE] = (Rectangle){x, y, bw, bh};
+    y += bh + gap;
+    r[SIM_RESET] = (Rectangle){x, y, bw, bh};
+    y += bh + grp;
+    r[SIM_ODE] = (Rectangle){x, y, bw, bh};
+    y += bh + gap;
+    r[SIM_POLICY] = (Rectangle){x, y, bw, bh};
+    y += bh + grp;
+    r[SIM_FINITE] = (Rectangle){x, y, bw, bh};
+    y += bh + gap;
+    r[SIM_INFINITE] = (Rectangle){x, y, bw, bh};
+}
+
+static Rectangle sim_col_rect(float width) {
+    Rectangle r[SIM_NBTN];
+    sim_rects(width, r);
+    float x = width - 8.0f - SIM_COL_W;
+    float bot = r[SIM_INFINITE].y + r[SIM_INFINITE].height + 8.0f;
+    return (Rectangle){x, 8.0f, SIM_COL_W, bot - 8.0f};
+}
+
+// Bottom-left heatmap. More lanes make a taller panel, up to the window.
+static Rectangle flow_panel_rect(float width, float height, int lanes) {
+    if (lanes < 1) {
+        lanes = 1;
+    }
+    float panel_h = FLOW_PANEL_HEAD + FLOW_PANEL_FOOT
+        + FLOW_PANEL_ROW * (float)lanes;
+    float max_h = height - 208.0f;
+    if (panel_h > max_h) {
+        panel_h = max_h;
+    }
+    float panel_w = FLOW_PANEL_W;
+    float max_w = width - SIM_COL_W - 24.0f;
+    if (panel_w > max_w) {
+        panel_w = max_w;
+    }
+    float y = height - 8.0f - panel_h;
+    if (y < 8.0f) {
+        y = 8.0f;
+    }
+    return (Rectangle){8.0f, y, panel_w, panel_h};
+}
+
+// Beside the speed panel. Narrower by the colorbar so the time axes match.
+static Rectangle flow_hit_panel(float width, float height, int lanes) {
+    Rectangle speed = flow_panel_rect(width, height, lanes);
+    float x = speed.x + speed.width + FLOW_PANEL_GAP;
+    float max_r = width - SIM_COL_W - 16.0f;
+    float w = speed.width - 40.0f;
+    if (x + w > max_r) {
+        w = max_r - x;
+    }
+    if (w < 0.0f) {
+        w = 0.0f;
+    }
+    return (Rectangle){x, speed.y, w, speed.height};
+}
+
+static int sim_ui_hot(Drive* env) {
+    Client* client = env->client;
+    if (!client) {
+        return 0;
+    }
+    Vector2 mouse = GetMousePosition();
+    if (CheckCollisionPointRec(mouse, sim_col_rect(client->width))) {
+        return 1;
+    }
+    if (puf_record_enabled()) {
+        return 0;
+    }
+    if (env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        return 0;
+    }
+    if (!env->flow_speed || env->flow_rows <= 0 || env->flow_nlanes <= 0) {
+        return 0;
+    }
+    Rectangle panel = flow_panel_rect(client->width, client->height,
+        env->flow_nlanes);
+    float min_h = FLOW_PANEL_HEAD + FLOW_PANEL_FOOT + 8.0f;
+    if (panel.width >= 200.0f && panel.height >= min_h
+        && CheckCollisionPointRec(mouse, panel)) {
+        return 1;
+    }
+    Rectangle hits = flow_hit_panel(client->width, client->height,
+        env->flow_nlanes);
+    if (hits.width >= 180.0f && hits.height >= min_h
+        && CheckCollisionPointRec(mouse, hits)) {
+        return 1;
+    }
+    return 0;
+}
+
+static void sim_draw_button(Rectangle r, const char* label, Color fill, Color edge) {
+    DrawRectangleRec(r, fill);
+    DrawRectangleLinesEx(r, 1.0f, edge);
+    int tw = MeasureText(label, 16);
+    int tx = (int)(r.x + (r.width - (float)tw) * 0.5f);
+    DrawText(label, tx, (int)r.y + 5, 16, (Color){241, 241, 241, 255});
+}
+
+static void sim_choice(Rectangle r, const char* label, int on, int hot, int amber) {
+    Color fill = (Color){28, 32, 42, 255};
+    Color edge = (Color){70, 76, 88, 255};
+    if (on && amber) {
+        fill = (Color){140, 78, 42, 255};
+        edge = (Color){240, 196, 120, 255};
+    } else if (on) {
+        fill = (Color){36, 110, 72, 255};
+        edge = (Color){150, 210, 160, 255};
+    } else if (hot) {
+        fill = (Color){46, 52, 66, 255};
+    }
+    if (hot) {
+        edge = (Color){241, 241, 241, 255};
+    }
+    sim_draw_button(r, label, fill, edge);
+}
+
+static void sim_use_ode(Drive* env) {
+    if (!env->lane_state || env->control_mode == CONTROL_PRECAL_IDM) {
+        return;
+    }
+    idm_sync_arc(env);
+    env->control_mode = CONTROL_PRECAL_IDM;
+}
+
+static void sim_use_finite(Drive* env) {
+    int was_infinite = env->sim_infinite;
+    env->sim_infinite = 0;
+    if (was_infinite && env->timestep >= env->episode_length) {
+        puf_reset(env);
+    }
+}
+
+static void sim_finite_label(Drive* env, char* dst, int n) {
+    float sec = (float)env->episode_length * SIM_DT;
+    if (fabsf(sec - roundf(sec)) < 0.05f) {
+        snprintf(dst, (size_t)n, "%.0f s", roundf(sec));
+    } else {
+        snprintf(dst, (size_t)n, "%.1f s", sec);
+    }
+}
+
+static void sim_transport_draw(Drive* env) {
+    if (!env->client) {
+        return;
+    }
+    Rectangle r[SIM_NBTN];
+    sim_rects(env->client->width, r);
+    char finite[16];
+    sim_finite_label(env, finite, (int)sizeof(finite));
+    const char* labels[SIM_NBTN] = {
+        "Play", "Pause", "Reset", "ODE", "Policy", finite, "Infinite"
+    };
+    int on[SIM_NBTN] = {
+        !env->sim_paused,
+        env->sim_paused,
+        0,
+        env->control_mode == CONTROL_PRECAL_IDM,
+        env->control_mode != CONTROL_PRECAL_IDM,
+        !env->sim_infinite,
+        env->sim_infinite
+    };
+    DrawRectangleRec(sim_col_rect(env->client->width),
+        (Color){12, 14, 20, 230});
+    Vector2 mouse = GetMousePosition();
+    Color sep = (Color){70, 76, 88, 255};
+    int y1 = (int)(r[SIM_RESET].y + r[SIM_RESET].height + r[SIM_ODE].y) / 2;
+    int y2 = (int)(r[SIM_POLICY].y + r[SIM_POLICY].height
+        + r[SIM_FINITE].y) / 2;
+    int x0 = (int)r[SIM_PLAY].x;
+    int x1 = (int)(r[SIM_PLAY].x + r[SIM_PLAY].width);
+    DrawLine(x0, y1, x1, y1, sep);
+    DrawLine(x0, y2, x1, y2, sep);
+    for (int i = 0; i < SIM_NBTN; i++) {
+        int hot = CheckCollisionPointRec(mouse, r[i]);
+        sim_choice(r[i], labels[i], on[i], hot, i == SIM_PAUSE);
+    }
+}
+
+// Read once per frame, before the step, so a click applies on this tick.
+static inline void puf_sim_poll(Drive* env) {
+    if (!env->client || !IsWindowReady() || puf_record_enabled()) {
+        return;
+    }
+    // Drop the one-frame hold before reading this frame's click.
+    env->sim_hold_step = 0;
+    if (IsKeyPressed(KEY_P)) {
+        env->sim_paused = !env->sim_paused;
+    }
+    if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        return;
+    }
+    Rectangle r[SIM_NBTN];
+    sim_rects(env->client->width, r);
+    Vector2 mouse = GetMousePosition();
+    if (CheckCollisionPointRec(mouse, r[SIM_PLAY])) {
+        env->sim_paused = 0;
+    } else if (CheckCollisionPointRec(mouse, r[SIM_PAUSE])) {
+        env->sim_paused = 1;
+    } else if (CheckCollisionPointRec(mouse, r[SIM_RESET])) {
+        // Manual reset is not a logged episode. Keep mode and pause.
+        puf_reset(env);
+        env->sim_hold_step = 1;
+    } else if (CheckCollisionPointRec(mouse, r[SIM_ODE])) {
+        sim_use_ode(env);
+    } else if (CheckCollisionPointRec(mouse, r[SIM_POLICY])) {
+        env->control_mode = CONTROL_POLICY;
+    } else if (CheckCollisionPointRec(mouse, r[SIM_FINITE])) {
+        sim_use_finite(env);
+    } else if (CheckCollisionPointRec(mouse, r[SIM_INFINITE])) {
+        env->sim_infinite = 1;
+    }
+}
+
 // Camera control functions
-void handle_camera_controls(Client* client) {
+void handle_camera_controls(Drive* env) {
     static Vector2 prev_mouse_pos = {0};
     static bool is_dragging = false;
+    Client* client = env->client;
+    if (!client) {
+        return;
+    }
     float camera_move_speed = 0.5f;
-    
-    // Handle mouse drag for camera movement
+
+    // A click on the controls or the diagram must not pan the map.
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-        prev_mouse_pos = GetMousePosition();
-        is_dragging = true;
+        if (!sim_ui_hot(env)) {
+            prev_mouse_pos = GetMousePosition();
+            is_dragging = true;
+        }
     }
     
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
@@ -1393,7 +2222,7 @@ void handle_camera_controls(Client* client) {
 
     // Handle mouse wheel for zoom
     float wheel = GetMouseWheelMove();
-    if (wheel != 0) {
+    if (wheel != 0 && !sim_ui_hot(env)) {
         float zoom_factor = 1.0f - (wheel * 0.1f);
         // Calculate the current direction vector from target to position
         Vector3 direction = {
@@ -1565,6 +2394,598 @@ static void drive_record_camera(Drive* env, Client* client) {
     };
 }
 
+// CIRCLES Fig. 7 bar. The first stop is 10 mph, the last is 80 mph.
+static Color flow_mph_color(float mph) {
+    static const unsigned char stop[FLOW_CMAP_N][3] = {
+        {151, 27, 41}, {173, 44, 45}, {195, 60, 49}, {222, 107, 74},
+        {235, 147, 94}, {244, 197, 126}, {251, 235, 165}, {255, 255, 197},
+        {232, 244, 166}, {205, 230, 140}, {186, 220, 126}, {150, 202, 115},
+        {114, 181, 105}, {78, 157, 91}, {57, 125, 73}, {44, 104, 61},
+    };
+    if (mph < FLOW_MPH_LO) {
+        mph = FLOW_MPH_LO;
+    }
+    if (mph > FLOW_MPH_HI) {
+        mph = FLOW_MPH_HI;
+    }
+    float x = (mph - FLOW_MPH_LO) / (FLOW_MPH_HI - FLOW_MPH_LO);
+    x *= (FLOW_CMAP_N - 1);
+    int i = (int)x;
+    if (i >= FLOW_CMAP_N - 1) {
+        i = FLOW_CMAP_N - 2;
+        x = (float)(FLOW_CMAP_N - 1);
+    }
+    float f = x - (float)i;
+    float r = stop[i][0] + f * ((int)stop[i + 1][0] - (int)stop[i][0]);
+    float g = stop[i][1] + f * ((int)stop[i + 1][1] - (int)stop[i][1]);
+    float b = stop[i][2] + f * ((int)stop[i + 1][2] - (int)stop[i][2]);
+    return (Color){
+        (unsigned char)(r + 0.5f),
+        (unsigned char)(g + 0.5f),
+        (unsigned char)(b + 0.5f),
+        255
+    };
+}
+
+static void flow_diagram_tex(Client* client, int w, int h) {
+    if (client->flow_tex.id != 0 &&
+            client->flow_tex_w == w && client->flow_tex_h == h) {
+        return;
+    }
+    if (client->flow_tex.id != 0) {
+        UnloadTexture(client->flow_tex);
+        client->flow_tex.id = 0;
+    }
+    free(client->flow_pix);
+    client->flow_pix = NULL;
+    size_t n = (size_t)w * (size_t)h;
+    client->flow_pix = (Color*)calloc(n, sizeof(Color));
+    if (!client->flow_pix) {
+        fprintf(stderr, "velocity diagram texture alloc failed\n");
+        exit(1);
+    }
+    Image img = GenImageColor(w, h, (Color){20, 24, 32, 255});
+    client->flow_tex = LoadTextureFromImage(img);
+    UnloadImage(img);
+    SetTextureFilter(client->flow_tex, TEXTURE_FILTER_POINT);
+    client->flow_tex_w = w;
+    client->flow_tex_h = h;
+}
+
+// One texture row per lane. Empty lane is the dark cell, not a slow speed.
+static void flow_diagram_splat(Drive* env, Client* client) {
+    int times = env->flow_rows;
+    int lanes = env->flow_nlanes;
+    int origin = 0;
+    if (env->sim_infinite && env->timestep >= times) {
+        origin = (env->timestep - times + 1) % times;
+    }
+    Color empty = {20, 24, 32, 255};
+    for (int lane = 0; lane < lanes; lane++) {
+        for (int t = 0; t < times; t++) {
+            int src = origin + t;
+            if (src >= times) {
+                src -= times;
+            }
+            size_t si = (size_t)src * (size_t)lanes + (size_t)lane;
+            size_t p = (size_t)lane * (size_t)times + (size_t)t;
+            float spd = env->flow_speed[si];
+            if (spd < 0.0f) {
+                client->flow_pix[p] = empty;
+            } else {
+                client->flow_pix[p] = flow_mph_color(spd * FLOW_MPS_TO_MPH);
+            }
+        }
+    }
+}
+
+// Lane index, top to bottom, same order as the numbered segments.
+static Color flow_lane_color(int lane) {
+    static const Color palette[4] = {
+        {130, 180, 255, 255},
+        {90, 210, 190, 255},
+        {230, 190, 80, 255},
+        {200, 140, 255, 255},
+    };
+    if (lane < 0) {
+        lane = 0;
+    }
+    return palette[lane & 3];
+}
+
+// Same hue as the diagram chip, only a hint above the asphalt.
+static Color flow_lane_road_color(int lane) {
+    Color c = flow_lane_color(lane);
+    float k = 0.12f;
+    float r = ROAD_COLOR.r + (c.r - ROAD_COLOR.r) * k;
+    float g = ROAD_COLOR.g + (c.g - ROAD_COLOR.g) * k;
+    float b = ROAD_COLOR.b + (c.b - ROAD_COLOR.b) * k;
+    return (Color){
+        (unsigned char)r, (unsigned char)g, (unsigned char)b, 255
+    };
+}
+
+static void flow_time_window(Drive* env, float* now, float* axis0, float* axis1) {
+    int times = env->flow_rows;
+    float duration = (float)times * SIM_DT;
+    if (duration < SIM_DT) {
+        duration = SIM_DT;
+    }
+    float tnow = env->timestep * SIM_DT;
+    if (tnow < 0.0f) {
+        tnow = 0.0f;
+    }
+    float a0 = 0.0f;
+    float a1 = duration;
+    if (env->sim_infinite && env->timestep >= times) {
+        a0 = (float)(env->timestep - times + 1) * SIM_DT;
+        a1 = tnow;
+    } else if (tnow > duration) {
+        tnow = duration;
+    }
+    *now = tnow;
+    *axis0 = a0;
+    *axis1 = a1;
+}
+
+static int flow_name_w(Drive* env, int lanes) {
+    int name_w = MeasureText("Segment", 14);
+    for (int lane = 0; lane < lanes; lane++) {
+        int w = 14 + MeasureText(env->flow_lane_name[lane], 15);
+        if (w > name_w) {
+            name_w = w;
+        }
+    }
+    return name_w;
+}
+
+static void flow_draw_time_axis(float plot_x, float plot_w, float bot,
+    float axis0, float axis1) {
+    float axis_span = axis1 - axis0;
+    if (axis_span < SIM_DT) {
+        axis_span = SIM_DT;
+    }
+    float tick = 5.0f;
+    if (axis_span <= 12.0f) {
+        tick = 2.0f;
+    }
+    if (axis_span <= 3.0f) {
+        tick = 0.5f;
+    }
+    float t = ceilf((axis0 - 0.001f) / tick) * tick;
+    if (t < axis0) {
+        t = axis0;
+    }
+    for (; t <= axis1 + 0.001f; t += tick) {
+        float draw_t = t;
+        if (draw_t > axis1) {
+            draw_t = axis1;
+        }
+        if (fabsf(draw_t) < 0.05f) {
+            draw_t = 0.0f;
+        }
+        float x = plot_x + ((draw_t - axis0) / axis_span) * plot_w;
+        const char* label;
+        if (fabsf(draw_t - roundf(draw_t)) < 0.05f) {
+            label = TextFormat("%.0fs", roundf(draw_t));
+        } else {
+            label = TextFormat("%.1fs", draw_t);
+        }
+        int tw = MeasureText(label, 14);
+        int lx = (int)x - tw / 2;
+        if (draw_t <= axis0 + 0.001f) {
+            lx = (int)plot_x;
+        }
+        if (draw_t >= axis1 - 0.001f) {
+            lx = (int)(plot_x + plot_w) - tw;
+        }
+        DrawText(label, lx, (int)bot + 4, 14, PUFF_WHITE);
+        DrawLine((int)x, (int)bot, (int)x, (int)bot + 4, PUFF_WHITE);
+        if (draw_t >= axis1 - 0.001f) {
+            break;
+        }
+    }
+    const char* axis = "Time";
+    int axis_w = MeasureText(axis, 14);
+    DrawText(axis, (int)(plot_x + plot_w * 0.5f) - axis_w / 2,
+        (int)bot + 18, 14, PUFF_WHITE);
+}
+
+static void flow_draw_lane_keys(Drive* env, float panel_x, float top,
+    float row_h, int lanes) {
+    for (int lane = 0; lane < lanes; lane++) {
+        float y = top + (float)lane * row_h;
+        int ty = (int)(y + row_h * 0.5f) - 7;
+        int chip = (int)panel_x + 8;
+        DrawRectangle(chip, ty + 3, 10, 10, flow_lane_color(lane));
+        DrawText(env->flow_lane_name[lane], chip + 14, ty, 15, PUFF_WHITE);
+    }
+}
+
+// One heatmap. The y-axis segments are the lanes.
+static void flow_diagram_draw(Drive* env, Client* client) {
+    if (puf_record_enabled()) {
+        return;
+    }
+    if (env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        return;
+    }
+    if (!env->flow_speed || env->flow_rows <= 0 || env->flow_nlanes <= 0) {
+        return;
+    }
+    int times = env->flow_rows;
+    int lanes = env->flow_nlanes;
+    float now = 0.0f;
+    float axis0 = 0.0f;
+    float axis1 = 0.0f;
+    flow_time_window(env, &now, &axis0, &axis1);
+    float axis_span = axis1 - axis0;
+    if (axis_span < SIM_DT) {
+        axis_span = SIM_DT;
+    }
+
+    Rectangle panel = flow_panel_rect(client->width, client->height, lanes);
+    float panel_x = panel.x;
+    float panel_y = panel.y;
+    float panel_w = panel.width;
+    float panel_h = panel.height;
+    float head = FLOW_PANEL_HEAD;
+    float foot = FLOW_PANEL_FOOT;
+    if (panel_w < 200.0f || panel_h < head + foot + 8.0f) {
+        return;
+    }
+    DrawRectangle((int)panel_x, (int)panel_y, (int)panel_w, (int)panel_h,
+        (Color){12, 14, 20, 255});
+
+    // Wide enough for the "Segment" header. Numbers sit under that word.
+    int name_w = flow_name_w(env, lanes);
+    float bar_w = 12.0f;
+    float plot_x = panel_x + 8.0f + (float)name_w + 14.0f;
+    float plot_r = panel_x + panel_w - 8.0f - bar_w - 28.0f;
+    float plot_w = plot_r - plot_x;
+    if (plot_w < 40.0f) {
+        return;
+    }
+    float top = panel_y + head;
+    float bot = panel_y + panel_h - foot;
+    float plot_h = bot - top;
+    float row_h = plot_h / (float)lanes;
+
+    flow_diagram_tex(client, times, lanes);
+    if (client->flow_tex.id == 0 || !client->flow_pix) {
+        return;
+    }
+    flow_diagram_splat(env, client);
+    UpdateTexture(client->flow_tex, client->flow_pix);
+
+    DrawText("Speed (mph)", (int)plot_x, (int)panel_y + 4, 18, PUFF_WHITE);
+    DrawText("Segment", (int)panel_x + 8, (int)panel_y + 24, 14,
+        (Color){210, 214, 220, 255});
+    DrawText("Time step: 0.1 s", (int)plot_x, (int)panel_y + 24,
+        14, PUFF_WHITE);
+    const char* clock = TextFormat("%.1f s", now);
+    int clock_w = MeasureText(clock, 18);
+    DrawText(clock, (int)plot_r - clock_w, (int)panel_y + 4, 18, PUFF_WHITE);
+
+    Rectangle src = {0.0f, 0.0f, (float)times, (float)lanes};
+    Rectangle dst = {plot_x, top, plot_w, plot_h};
+    DrawTexturePro(client->flow_tex, src, dst, (Vector2){0, 0}, 0, WHITE);
+    Color frame = {70, 76, 88, 255};
+    DrawRectangleLinesEx(dst, 1.0f, frame);
+    float play_x = plot_x + ((now - axis0) / axis_span) * plot_w;
+    for (int lane = 0; lane < lanes; lane++) {
+        float y = top + (float)lane * row_h;
+        if (lane > 0) {
+            DrawLine((int)plot_x, (int)y, (int)(plot_x + plot_w), (int)y,
+                frame);
+        }
+    }
+    flow_draw_lane_keys(env, panel_x, top, row_h, lanes);
+    DrawLine((int)play_x, (int)top, (int)play_x, (int)bot, WHITE);
+    float first_top = top;
+    float last_bot = bot;
+    flow_draw_time_axis(plot_x, plot_w, last_bot, axis0, axis1);
+
+    float bar_x = plot_r + 8.0f;
+    int bars = (int)(last_bot - first_top);
+    if (bars < 1) {
+        bars = 1;
+    }
+    for (int i = 0; i < bars; i++) {
+        float u = ((float)i + 0.5f) / (float)bars;
+        float mph = FLOW_MPH_HI + (FLOW_MPH_LO - FLOW_MPH_HI) * u;
+        DrawRectangle((int)bar_x, (int)first_top + i, (int)bar_w, 1,
+            flow_mph_color(mph));
+    }
+    for (int mph = 80; mph >= 10; mph -= 10) {
+        float u = ((float)mph - FLOW_MPH_HI) / (FLOW_MPH_LO - FLOW_MPH_HI);
+        int ly = (int)(first_top + u * (last_bot - first_top)) - 6;
+        if (ly < (int)first_top) {
+            ly = (int)first_top;
+        }
+        if (ly > (int)last_bot - 12) {
+            ly = (int)last_bot - 12;
+        }
+        const char* label = TextFormat("%d", mph);
+        DrawText(label, (int)bar_x + (int)bar_w + 3, ly, 12, PUFF_WHITE);
+    }
+}
+
+// Bars beside the speed graph. Red is a crash, yellow is off-road.
+static void flow_hit_draw(Drive* env, Client* client) {
+    if (puf_record_enabled()) {
+        return;
+    }
+    if (env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        return;
+    }
+    if (!env->flow_speed || env->flow_rows <= 0 || env->flow_nlanes <= 0) {
+        return;
+    }
+    int times = env->flow_rows;
+    int lanes = env->flow_nlanes;
+    float now = 0.0f;
+    float axis0 = 0.0f;
+    float axis1 = 0.0f;
+    flow_time_window(env, &now, &axis0, &axis1);
+    float axis_span = axis1 - axis0;
+    if (axis_span < SIM_DT) {
+        axis_span = SIM_DT;
+    }
+    Rectangle panel = flow_hit_panel(client->width, client->height, lanes);
+    float panel_x = panel.x;
+    float panel_y = panel.y;
+    float panel_w = panel.width;
+    float panel_h = panel.height;
+    float head = FLOW_PANEL_HEAD;
+    float foot = FLOW_PANEL_FOOT;
+    if (panel_w < 180.0f || panel_h < head + foot + 8.0f) {
+        return;
+    }
+    int name_w = flow_name_w(env, lanes);
+    float plot_x = panel_x + 8.0f + (float)name_w + 14.0f;
+    float plot_r = panel_x + panel_w - 8.0f;
+    float plot_w = plot_r - plot_x;
+    if (plot_w < 40.0f) {
+        return;
+    }
+    float top = panel_y + head;
+    float bot = panel_y + panel_h - foot;
+    float plot_h = bot - top;
+    float row_h = plot_h / (float)lanes;
+    DrawRectangle((int)panel_x, (int)panel_y, (int)panel_w, (int)panel_h,
+        (Color){12, 14, 20, 255});
+    DrawText("Collisions", (int)plot_x, (int)panel_y + 4, 18, PUFF_WHITE);
+    DrawText("Segment", (int)panel_x + 8, (int)panel_y + 24, 14,
+        (Color){210, 214, 220, 255});
+    const char* clock = TextFormat("%.1f s", now);
+    int clock_w = MeasureText(clock, 18);
+    int title_w = MeasureText("Collisions", 18);
+    if (plot_x + (float)title_w + 8.0f < plot_r - (float)clock_w) {
+        DrawText(clock, (int)plot_r - clock_w, (int)panel_y + 4,
+            18, PUFF_WHITE);
+    }
+    Color frame = {70, 76, 88, 255};
+    DrawRectangle((int)plot_x, (int)top, (int)plot_w, (int)plot_h,
+        (Color){20, 24, 32, 255});
+    for (int lane = 1; lane < lanes; lane++) {
+        int y = (int)(top + (float)lane * row_h);
+        DrawLine((int)plot_x, y, (int)(plot_x + plot_w), y, frame);
+    }
+    Rectangle plot = {plot_x, top, plot_w, plot_h};
+    DrawRectangleLinesEx(plot, 1.0f, frame);
+    flow_draw_lane_keys(env, panel_x, top, row_h, lanes);
+    float play_x = plot_x + ((now - axis0) / axis_span) * plot_w;
+    DrawLine((int)play_x, (int)top, (int)play_x, (int)bot, WHITE);
+    flow_draw_time_axis(plot_x, plot_w, bot, axis0, axis1);
+
+    int origin = 0;
+    if (env->sim_infinite && env->timestep >= times) {
+        origin = env->timestep - times + 1;
+    }
+    int n = env->flow_hit_n;
+    int start = 0;
+    if (n >= FLOW_HIT_MAX) {
+        n = FLOW_HIT_MAX;
+        start = env->flow_hit_i;
+    }
+    Color crash = {220, 45, 52, 255};
+    Color offroad = {245, 208, 40, 255};
+    int bh = 8;
+    if ((float)bh > row_h * 0.4f) {
+        bh = (int)(row_h * 0.4f);
+    }
+    if (bh < 4) {
+        bh = 4;
+    }
+    int bw = 3;
+    for (int k = 0; k < n; k++) {
+        int idx = start + k;
+        if (idx >= FLOW_HIT_MAX) {
+            idx -= FLOW_HIT_MAX;
+        }
+        int tstep = env->flow_hit_t[idx];
+        int lane = env->flow_hit_lane[idx];
+        int col = tstep - origin;
+        if (lane < 0 || lane >= lanes || col < 0 || col >= times) {
+            continue;
+        }
+        int slot = 0;
+        for (int j = 0; j < k; j++) {
+            int jdx = start + j;
+            if (jdx >= FLOW_HIT_MAX) {
+                jdx -= FLOW_HIT_MAX;
+            }
+            if (env->flow_hit_t[jdx] == tstep
+                && env->flow_hit_lane[jdx] == lane) {
+                slot++;
+            }
+        }
+        float row_top = top + (float)lane * row_h;
+        float y = row_top + (row_h - (float)bh) * 0.5f;
+        y += (float)((slot % 3) - 1) * 2.0f;
+        if (y < row_top + 1.0f) {
+            y = row_top + 1.0f;
+        }
+        float y_max = row_top + row_h - (float)bh - 1.0f;
+        if (y > y_max) {
+            y = y_max;
+        }
+        float cx = plot_x + ((float)col + 0.5f) / (float)times * plot_w;
+        Color mark = crash;
+        if (env->flow_hit_kind[idx] == OFFROAD) {
+            mark = offroad;
+        }
+        DrawRectangle((int)(cx - (float)bw * 0.5f), (int)y, bw, bh, mark);
+    }
+}
+
+// Lane centerlines. A quiet tint of the diagram chip, not a paint stripe.
+static Vector2 flow_lane_screen[FLOW_LANE_MAX];
+static int flow_lane_screen_ok[FLOW_LANE_MAX];
+
+static void flow_lane_ribbon(float ax, float ay, float bx, float by, Color color) {
+    float dx = bx - ax;
+    float dy = by - ay;
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len < 1.0e-4f) {
+        return;
+    }
+    float half = 0.45f;
+    float px = -dy / len * half;
+    float py = dx / len * half;
+    float z = 1.25f;
+    Vector3 a = {ax + px, ay + py, z};
+    Vector3 b = {ax - px, ay - py, z};
+    Vector3 c = {bx - px, by - py, z};
+    Vector3 d = {bx + px, by + py, z};
+    DrawTriangle3D(a, b, c, color);
+    DrawTriangle3D(a, c, b, color);
+    DrawTriangle3D(a, c, d, color);
+    DrawTriangle3D(a, d, c, color);
+}
+
+static void flow_draw_lanes(Drive* env, Client* client) {
+    int n = env->flow_nlanes;
+    if (n > FLOW_LANE_MAX) {
+        n = FLOW_LANE_MAX;
+    }
+    for (int lane = 0; lane < FLOW_LANE_MAX; lane++) {
+        flow_lane_screen_ok[lane] = 0;
+    }
+    if (puf_record_enabled() || !env->flow_segs || n <= 0) {
+        return;
+    }
+    Rectangle diagram = flow_panel_rect(client->width, client->height, n);
+    Rectangle col = sim_col_rect(client->width);
+    float view_x = client->width * 0.40f;
+    float view_y = diagram.y - 80.0f;
+    if (view_y < 190.0f) {
+        view_y = 190.0f;
+    }
+    float x_max = col.x - 12.0f;
+    for (int lane = 0; lane < n; lane++) {
+        Color color = flow_lane_road_color(lane);
+        int beg = env->flow_lane_beg[lane];
+        int count = env->flow_lane_n[lane];
+        float best = 1.0e30f;
+        for (int s = 0; s < count; s++) {
+            FlowSeg* g = &env->flow_segs[beg + s];
+            flow_lane_ribbon(g->ax, g->ay, g->bx, g->by, color);
+            float mx = 0.5f * (g->ax + g->bx);
+            float my = 0.5f * (g->ay + g->by);
+            Vector2 sp = GetWorldToScreen((Vector3){mx, my, 2.0f}, client->camera);
+            if (sp.x < 8.0f || sp.y < 170.0f || sp.x > x_max) {
+                continue;
+            }
+            if (sp.y > client->height - 12.0f) {
+                continue;
+            }
+            if (sp.x > diagram.x - 8.0f && sp.y > diagram.y - 12.0f) {
+                continue;
+            }
+            float ddx = sp.x - view_x;
+            float ddy = sp.y - view_y;
+            float dist = ddx * ddx + ddy * ddy;
+            if (dist < best) {
+                best = dist;
+                flow_lane_screen[lane] = sp;
+                flow_lane_screen_ok[lane] = 1;
+            }
+        }
+    }
+}
+
+static void flow_draw_lane_names(Drive* env, Client* client) {
+    if (puf_record_enabled() || !env->flow_segs) {
+        return;
+    }
+    int n = env->flow_nlanes;
+    if (n > FLOW_LANE_MAX) {
+        n = FLOW_LANE_MAX;
+    }
+    int x[FLOW_LANE_MAX];
+    int y[FLOW_LANE_MAX];
+    int tw[FLOW_LANE_MAX];
+    int which[FLOW_LANE_MAX];
+    int nuse = 0;
+    for (int lane = 0; lane < n; lane++) {
+        if (!flow_lane_screen_ok[lane]) {
+            continue;
+        }
+        which[nuse] = lane;
+        x[nuse] = (int)flow_lane_screen[lane].x;
+        y[nuse] = (int)flow_lane_screen[lane].y;
+        tw[nuse] = MeasureText(env->flow_lane_name[lane], 16);
+        nuse++;
+    }
+    for (int pass = 0; pass < nuse; pass++) {
+        for (int i = 0; i < nuse; i++) {
+            for (int j = 0; j < i; j++) {
+                int x_hit = x[i] < x[j] + tw[j] + 8 && x[j] < x[i] + tw[i] + 8;
+                int dy = y[i] - y[j];
+                if (dy < 0) {
+                    dy = -dy;
+                }
+                if (!x_hit || dy >= 18) {
+                    continue;
+                }
+                if (y[i] >= y[j]) {
+                    y[i] = y[j] + 18;
+                } else {
+                    y[j] = y[i] + 18;
+                }
+            }
+        }
+    }
+    Rectangle diagram = flow_panel_rect(client->width, client->height, n);
+    Rectangle hits = flow_hit_panel(client->width, client->height, n);
+    int y_floor = (int)client->height - 8;
+    for (int i = 0; i < nuse; i++) {
+        int y_lim = y_floor;
+        if (x[i] < (int)(diagram.x + diagram.width) + 8) {
+            int cap = (int)diagram.y - 20;
+            if (cap < y_lim) {
+                y_lim = cap;
+            }
+        }
+        if (hits.width >= 180.0f && x[i] + tw[i] > (int)hits.x - 4
+            && x[i] < (int)(hits.x + hits.width) + 4) {
+            int cap = (int)hits.y - 20;
+            if (cap < y_lim) {
+                y_lim = cap;
+            }
+        }
+        if (y[i] > y_lim) {
+            y[i] = y_lim;
+        }
+        const char* name = env->flow_lane_name[which[i]];
+        Color color = flow_lane_color(which[i]);
+        DrawRectangle(x[i] - 2, y[i] - 1, tw[i] + 6, 18, (Color){12, 14, 20, 220});
+        DrawText(name, x[i], y[i], 16, color);
+    }
+}
+
 void puf_render(Drive* env) {
     if (env->client == NULL) {
         env->client = make_client(env);
@@ -1578,7 +2999,7 @@ void puf_render(Drive* env) {
     ClearBackground(ROAD_COLOR);
     BeginMode3D(client->camera);
     if (!puf_record_enabled()) {
-        handle_camera_controls(client);
+        handle_camera_controls(env);
     }
 
     if (env->map_corners) {
@@ -1608,12 +3029,7 @@ void puf_render(Drive* env) {
                 }
             }
 
-            // Respawned agents are hidden for spawn immunity. The recorded
-            // chase still draws its agent, or the car vanishes after the goal.
-            int followed = puf_record_enabled() && is_active_agent
-                && agent_index == env->human_agent_idx;
-            if ((!is_active_agent && !is_static_agent)
-                || (env->entities[i].respawn_timestep != -1 && !followed)) {
+            if (!is_active_agent && !is_static_agent) {
                 continue;
             }
 
@@ -1727,14 +3143,21 @@ void puf_render(Drive* env) {
             }
         }
     }
+    flow_draw_lanes(env, client);
     EndMode3D();
+    flow_draw_lane_names(env, client);
 
     // Draw debug info
     DrawText(TextFormat("Camera Position: (%.2f, %.2f, %.2f)",
         client->camera.position.x, client->camera.position.y, client->camera.position.z), 10, 10, 20, PUFF_WHITE);
     DrawText(TextFormat("Camera Target: (%.2f, %.2f, %.2f)",
         client->camera.target.x, client->camera.target.y, client->camera.target.z), 10, 30, 20, PUFF_WHITE);
-    DrawText(TextFormat("Timestep: %d", env->timestep), 10, 50, 20, PUFF_WHITE);
+    const char* paused_mark = "";
+    if (!puf_record_enabled() && env->sim_paused) {
+        paused_mark = "   paused";
+    }
+    DrawText(TextFormat("Time: %.1f s%s", env->timestep * SIM_DT, paused_mark),
+        10, 50, 20, PUFF_WHITE);
     int human_idx = -1;
     int accel = 0;
     int steer = 0;
@@ -1751,13 +3174,14 @@ void puf_render(Drive* env) {
     DrawText(TextFormat("Controlling Agent: %d", env->human_agent_idx), 10, 70, 20, PUFF_WHITE);
     DrawText(TextFormat("Agent Index: %d", human_idx), 10, 90, 20, PUFF_WHITE);
     if (!puf_record_enabled()) {
-        DrawText("Controls: W/S - Accelerate/Brake, A/D - Steer, 1-4 - Switch Agent",
-                 10, client->height - 30, 20, PUFF_WHITE);
+        sim_transport_draw(env);
     }
     DrawText(TextFormat("Acceleration: %d", accel), 10, 110, 20, PUFF_WHITE);
     DrawText(TextFormat("Steering: %d", steer), 10, 130, 20, PUFF_WHITE);
     DrawText(TextFormat("Grid Rows: %d", env->grid_rows), 10, 150, 20, PUFF_WHITE);
     DrawText(TextFormat("Grid Cols: %d", env->grid_cols), 10, 170, 20, PUFF_WHITE);
+    flow_diagram_draw(env, client);
+    flow_hit_draw(env, client);
     EndDrawing();
     if (puf_record_enabled()) {
         puf_record_capture((int)client->width, (int)client->height);
@@ -1766,6 +3190,10 @@ void puf_render(Drive* env) {
 }
 
 void close_client(Client* client) {
+    if (client->flow_tex.id) {
+        UnloadTexture(client->flow_tex);
+    }
+    free(client->flow_pix);
     for (int i = 0; i < 6; i++) {
         UnloadModel(client->cars[i]);
     }

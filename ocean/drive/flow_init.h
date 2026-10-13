@@ -9,12 +9,15 @@
 // (id,length,maxSpeed) use SUMO's default width 1.8 and height 1.5.
 //
 // A flow emits one vehicle every 3600/vehsPerHour seconds from begin up to
-// end. This file does not move vehicles. It places the ones that would still
-// be on the route at time `end` if each had held depart speed with no
-// car-following and no lane changes. departSpeed "desired" and "max" use
-// min(vType maxSpeed, lane speed) on each lane; there is no leader yet, so
-// "max" matches "desired". departPos is SUMO's default "base" (front bumper
-// at length + 0.1 m). The bicycle model in puf_step is unchanged.
+// end. Placement puts down the vehicles that would still be on the route at
+// time `end` if each had held depart speed with no car-following and no lane
+// changes. departSpeed "desired" and "max" use min(vType maxSpeed, lane speed)
+// on each lane; there is no leader yet, so "max" matches "desired". departPos
+// is SUMO's default "base" (front bumper at length + 0.1 m).
+//
+// control_mode policy leaves the bicycle model in puf_step alone.
+// control_mode precal_idm keeps these routes and integrates SUMO's IDM
+// (MSCFModel_IDM) along them. That controller replaces the bicycle model.
 //
 // departLane "random" and "free" assign departure lanes round-robin across
 // the first edge, shifted by env->rng, so parallel envs differ but the count
@@ -131,9 +134,33 @@ typedef struct {
     float x, y, heading, speed;
     float goal_x, goal_y;
     int flow;
+    int path;
+    float along;
     double age;
     const VTypeSpec* vtype;
 } SpawnVeh;
+
+// SUMO passenger-car IDM, from MSCFModel_IDM and the vType defaults.
+// accel/decel/tau/minGap are the calibrated passenger values. delta and
+// stepping are the IDM defaults (stepping is the internal Euler substep).
+#define IDM_ACCEL 2.6f
+#define IDM_DECEL 4.5f
+#define IDM_TAU 1.0f
+#define IDM_MIN_GAP 2.5f
+#define IDM_DELTA 4.0f
+#define IDM_STEPPING 0.25f
+// Adjacent lanes on this net are 3.2 m apart. A leader on another route
+// counts only when it sits on this route's centerline.
+#define IDM_LATERAL 1.2f
+
+typedef struct {
+    FlowPath* paths;
+    int npaths;
+    int* path_of;
+    float* s;
+    float* s0;
+    int nveh;
+} IdmLanes;
 
 static void flow_die(const char* msg) {
     fprintf(stderr, "structured init: %s\n", msg);
@@ -968,6 +995,410 @@ static void plan_free(FlowPlan* plan) {
     plan->npaths = 0;
 }
 
+static int read_control_mode(Drive* env) {
+    const char* mode = env->cfg ? cfg_str(env->cfg, "control_mode") : NULL;
+    if (!mode || strcmp(mode, "policy") == 0) return CONTROL_POLICY;
+    if (strcmp(mode, "precal_idm") == 0) return CONTROL_PRECAL_IDM;
+    fprintf(stderr, "env.control_mode must be policy or precal_idm, got '%s'\n", mode);
+    exit(1);
+}
+
+static FlowPath path_copy(const FlowPath* src) {
+    FlowPath dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.n = src->n;
+    dst.len = src->len;
+    if (src->n <= 0) return dst;
+    dst.pieces = (FlowPiece*)calloc((size_t)src->n, sizeof(FlowPiece));
+    if (!dst.pieces) {
+        perror("calloc");
+        exit(1);
+    }
+    for (int i = 0; i < src->n; i++) {
+        FlowPiece* sp = &src->pieces[i];
+        FlowPiece* dp = &dst.pieces[i];
+        dp->n = sp->n;
+        dp->speed = sp->speed;
+        dp->len = sp->len;
+        dp->x = (float*)malloc((size_t)sp->n * sizeof(float));
+        dp->y = (float*)malloc((size_t)sp->n * sizeof(float));
+        if (!dp->x || !dp->y) {
+            perror("malloc");
+            exit(1);
+        }
+        memcpy(dp->x, sp->x, (size_t)sp->n * sizeof(float));
+        memcpy(dp->y, sp->y, (size_t)sp->n * sizeof(float));
+    }
+    return dst;
+}
+
+static void idm_bind(Drive* env, FlowPlan* plans, int nf, SpawnVeh* spawns, int nspawn) {
+    int npaths = 0;
+    for (int f = 0; f < nf; f++) npaths += plans[f].npaths;
+    if (npaths <= 0) flow_die("precal_idm has no routes");
+    IdmLanes* lanes = (IdmLanes*)calloc(1, sizeof(IdmLanes));
+    if (!lanes) {
+        perror("calloc");
+        exit(1);
+    }
+    lanes->npaths = npaths;
+    lanes->nveh = nspawn;
+    lanes->paths = (FlowPath*)calloc((size_t)npaths, sizeof(FlowPath));
+    lanes->path_of = (int*)calloc((size_t)nspawn, sizeof(int));
+    lanes->s = (float*)calloc((size_t)nspawn, sizeof(float));
+    lanes->s0 = (float*)calloc((size_t)nspawn, sizeof(float));
+    if (!lanes->paths || !lanes->path_of || !lanes->s || !lanes->s0) {
+        perror("calloc");
+        exit(1);
+    }
+    int k = 0;
+    for (int f = 0; f < nf; f++) {
+        for (int i = 0; i < plans[f].npaths; i++) {
+            lanes->paths[k++] = path_copy(&plans[f].paths[i]);
+        }
+    }
+    for (int i = 0; i < nspawn; i++) {
+        if (spawns[i].path < 0 || spawns[i].path >= npaths) {
+            flow_die("vehicle route index is out of range");
+        }
+        lanes->path_of[i] = spawns[i].path;
+        lanes->s[i] = spawns[i].along;
+        lanes->s0[i] = spawns[i].along;
+    }
+    env->lane_state = lanes;
+    static int logged = 0;
+    if (!logged && env->control_mode == CONTROL_PRECAL_IDM &&
+            env->max_agents == MAX_AGENTS) {
+        logged = 1;
+        printf("control_mode precal_idm: SUMO IDM accel %.3g decel %.3g "
+            "tau %.3g minGap %.3g delta %.3g\n",
+            IDM_ACCEL, IDM_DECEL, IDM_TAU, IDM_MIN_GAP, IDM_DELTA);
+    }
+}
+
+static void idm_free(Drive* env) {
+    IdmLanes* lanes = (IdmLanes*)env->lane_state;
+    if (!lanes) return;
+    for (int p = 0; p < lanes->npaths; p++) path_free(&lanes->paths[p]);
+    free(lanes->paths);
+    free(lanes->path_of);
+    free(lanes->s);
+    free(lanes->s0);
+    free(lanes);
+    env->lane_state = NULL;
+}
+
+static void idm_shift_paths(Drive* env) {
+    IdmLanes* lanes = (IdmLanes*)env->lane_state;
+    if (!lanes) return;
+    float mx = env->world_mean_x;
+    float my = env->world_mean_y;
+    for (int p = 0; p < lanes->npaths; p++) {
+        FlowPath* path = &lanes->paths[p];
+        for (int i = 0; i < path->n; i++) {
+            FlowPiece* pc = &path->pieces[i];
+            for (int k = 0; k < pc->n; k++) {
+                pc->x[k] -= mx;
+                pc->y[k] -= my;
+            }
+        }
+    }
+}
+
+static void idm_rewind(Drive* env) {
+    IdmLanes* lanes = (IdmLanes*)env->lane_state;
+    if (!lanes) return;
+    for (int i = 0; i < lanes->nveh; i++) lanes->s[i] = lanes->s0[i];
+}
+
+static void idm_rewind_one(Drive* env, int agent_idx) {
+    IdmLanes* lanes = (IdmLanes*)env->lane_state;
+    if (!lanes || agent_idx < 0 || agent_idx >= lanes->nveh) return;
+    lanes->s[agent_idx] = lanes->s0[agent_idx];
+}
+
+// One goal for the episode, on this car's own route. 40 m is close: a
+// lap at highway speed outlasts the spawn-collision grace. The route end
+// is far. The same point is kept after a respawn, so it can pay +1 again.
+// path_sample is already in the centered frame.
+static void assign_episode_goals(Drive* env) {
+    IdmLanes* lanes = (IdmLanes*)env->lane_state;
+    if (!lanes || env->agent_initialization != AGENT_INIT_STRUCTURED) {
+        return;
+    }
+    int n = env->active_agent_count;
+    if (n > lanes->nveh) {
+        n = lanes->nveh;
+    }
+    for (int i = 0; i < n; i++) {
+        int agent = env->active_agent_indices[i];
+        if (agent < 0 || agent >= lanes->nveh) {
+            continue;
+        }
+        FlowPath* path = &lanes->paths[lanes->path_of[agent]];
+        float s0 = lanes->s0[agent];
+        float s_far = path->len;
+        float s_near = s0 + 40.0f;
+        if (s_near > s_far) {
+            s_near = s_far;
+        }
+        float u = (float)(rand_r(&env->rng) % 10001) / 10000.0f;
+        float goal_s = s_near + u * (s_far - s_near);
+        float gx, gy, gh;
+        if (!path_sample(path, goal_s, &gx, &gy, &gh)) {
+            continue;
+        }
+        Entity* e = &env->entities[agent];
+        e->goal_position_x = gx;
+        e->goal_position_y = gy;
+        e->goal_position_z = 0.0f;
+    }
+}
+
+// The bicycle model does not update arc length. Snap s to the car before
+// the first ODE step so it is not pulled back to the spawn point.
+static void idm_sync_arc(Drive* env) {
+    IdmLanes* lanes = (IdmLanes*)env->lane_state;
+    if (!lanes) {
+        return;
+    }
+    int n = env->active_agent_count;
+    if (n > lanes->nveh) {
+        n = lanes->nveh;
+    }
+    for (int i = 0; i < n; i++) {
+        int agent = env->active_agent_indices[i];
+        if (agent < 0 || agent >= lanes->nveh) {
+            continue;
+        }
+        Entity* e = &env->entities[agent];
+        if (e->x == INVALID_POSITION) {
+            continue;
+        }
+        FlowPath* path = &lanes->paths[lanes->path_of[agent]];
+        float best = 1.0e30f;
+        float best_s = lanes->s[agent];
+        float walked = 0.0f;
+        for (int p = 0; p < path->n; p++) {
+            FlowPiece* pc = &path->pieces[p];
+            float acc = 0.0f;
+            for (int k = 0; k + 1 < pc->n; k++) {
+                float dx = pc->x[k + 1] - pc->x[k];
+                float dy = pc->y[k + 1] - pc->y[k];
+                float seg = sqrtf(dx * dx + dy * dy);
+                if (seg < 1.0e-6f) {
+                    continue;
+                }
+                float t = ((e->x - pc->x[k]) * dx + (e->y - pc->y[k]) * dy);
+                t /= seg * seg;
+                if (t < 0.0f) {
+                    t = 0.0f;
+                }
+                if (t > 1.0f) {
+                    t = 1.0f;
+                }
+                float px = pc->x[k] + dx * t;
+                float py = pc->y[k] + dy * t;
+                float lat = (e->x - px) * (e->x - px) + (e->y - py) * (e->y - py);
+                if (lat < best) {
+                    best = lat;
+                    best_s = walked + acc + t * seg;
+                }
+                acc += seg;
+            }
+            walked += pc->len;
+        }
+        lanes->s[agent] = best_s;
+    }
+}
+
+// Closest point on the route in the 250 m ahead of s_from.
+static int path_ahead(const FlowPath* path, float s_from, float x, float y,
+        float* s_out, float* lat_out) {
+    float best_lat = 1e9f;
+    float best_s = s_from;
+    int found = 0;
+    float walked = 0;
+    float s_hi = s_from + 250.f;
+    for (int p = 0; p < path->n; p++) {
+        FlowPiece* pc = &path->pieces[p];
+        float acc = 0;
+        for (int i = 0; i + 1 < pc->n; i++) {
+            float dx = pc->x[i + 1] - pc->x[i];
+            float dy = pc->y[i + 1] - pc->y[i];
+            float seg = sqrtf(dx * dx + dy * dy);
+            if (seg < 1e-6f) continue;
+            float s0 = walked + acc;
+            if (s0 > s_hi) {
+                *s_out = best_s;
+                *lat_out = best_lat;
+                return found;
+            }
+            float t = ((x - pc->x[i]) * dx + (y - pc->y[i]) * dy) / (seg * seg);
+            if (t < 0) t = 0;
+            if (t > 1) t = 1;
+            float px = pc->x[i] + dx * t;
+            float py = pc->y[i] + dy * t;
+            float ddx = x - px;
+            float ddy = y - py;
+            float lat = sqrtf(ddx * ddx + ddy * ddy);
+            float s = s0 + t * seg;
+            if (s >= s_from && lat < best_lat) {
+                best_lat = lat;
+                best_s = s;
+                found = 1;
+            }
+            acc += seg;
+        }
+        walked += pc->len;
+    }
+    *s_out = best_s;
+    *lat_out = best_lat;
+    return found;
+}
+
+// One SUMO IDM step. gap2pred is the bumper gap with minGap already removed
+// when respect_min_gap is set, matching MSCFModel_IDM::_v. The result is
+// then held to SUMO's minNextSpeed (decel * dt).
+static float idm_ode_speed(float gap2pred, float ego, float pred, float des,
+        int respect_min_gap) {
+    float two = 2.f * sqrtf(IDM_ACCEL * IDM_DECEL);
+    int iters = (int)(SIM_DT / IDM_STEPPING + 0.5f);
+    if (iters < 1) iters = 1;
+    float new_v = ego;
+    float gap = gap2pred;
+    if (respect_min_gap) gap += IDM_MIN_GAP;
+    for (int i = 0; i < iters; i++) {
+        float dv = new_v - pred;
+        float s = new_v * IDM_TAU + new_v * dv / two;
+        if (s < 0) s = 0;
+        if (respect_min_gap) s += IDM_MIN_GAP;
+        if (gap < 1e-6f) gap = 1e-6f;
+        float denom = des > 1e-6f ? des : 1e-6f;
+        float ratio = new_v / denom;
+        float acc = IDM_ACCEL * (1.f - powf(ratio, IDM_DELTA) - (s * s) / (gap * gap));
+        new_v += acc * SIM_DT / (float)iters;
+        if (new_v < 0) new_v = 0;
+        float close = (new_v - pred) * SIM_DT / (float)iters;
+        if (close > 0) gap -= close;
+    }
+    if (new_v < 0) new_v = 0;
+    float vmin = ego - IDM_DECEL * SIM_DT;
+    if (vmin < 0) vmin = 0;
+    if (new_v < vmin) new_v = vmin;
+    return new_v;
+}
+
+static int idm_slower_ahead(const FlowPath* path, float s, float des,
+        float* seen, float* low) {
+    float walked = 0;
+    for (int i = 0; i < path->n; i++) {
+        float end = walked + path->pieces[i].len;
+        if (walked > s + 0.05f && path->pieces[i].speed < des - 0.05f) {
+            *seen = walked - s;
+            *low = path->pieces[i].speed;
+            return 1;
+        }
+        walked = end;
+    }
+    return 0;
+}
+
+static float idm_next_speed(Drive* env, IdmLanes* lanes, int ego_i, float ego_v) {
+    Entity* ego = &env->entities[ego_i];
+    int epi = lanes->path_of[ego_i];
+    FlowPath* path = &lanes->paths[epi];
+    float es = lanes->s[ego_i];
+    float des = path_speed_at(path, es);
+    float best = 1e6f;
+    float pred_v = des;
+    int found = 0;
+    for (int j = 0; j < lanes->nveh; j++) {
+        if (j == ego_i) continue;
+        Entity* o = &env->entities[j];
+        if (o->type != VEHICLE || o->x == INVALID_POSITION) continue;
+        float os = 0;
+        float lat = 0;
+        int ahead = 0;
+        if (lanes->path_of[j] == epi) {
+            os = lanes->s[j];
+            ahead = os > es;
+        } else if (path_ahead(path, es, o->x, o->y, &os, &lat)) {
+            ahead = lat < IDM_LATERAL && os > es;
+        }
+        if (!ahead) continue;
+        float gap = os - es - 0.5f * (ego->length + o->length);
+        if (!found || gap < best) {
+            found = 1;
+            best = gap;
+            pred_v = sqrtf(o->vx * o->vx + o->vy * o->vy);
+        }
+    }
+    float v_next;
+    if (found) {
+        v_next = idm_ode_speed(best - IDM_MIN_GAP, ego_v, pred_v, des, 1);
+    } else if (ego_v <= des) {
+        v_next = idm_ode_speed(1e6f, ego_v, des, des, 0);
+    } else {
+        float two = 2.f * sqrtf(IDM_ACCEL * IDM_DECEL);
+        float sec = ego_v * IDM_TAU + ego_v * ego_v / two;
+        if (sec < 0) sec = 0;
+        v_next = idm_ode_speed(sec, ego_v, 0, des, 0);
+        if (v_next > des) v_next = des;
+    }
+    float seen = 0;
+    float low = des;
+    if (idm_slower_ahead(path, es, des, &seen, &low)) {
+        float two = 2.f * sqrtf(IDM_ACCEL * IDM_DECEL);
+        float sec = ego_v * IDM_TAU + ego_v * ego_v / two;
+        if (sec < 0) sec = 0;
+        float gap = seen > sec ? seen : sec;
+        float v_lim = idm_ode_speed(gap, ego_v, 0, low, 0);
+        if (seen < sec && v_lim > low) v_lim = low;
+        if (v_lim < v_next) v_next = v_lim;
+    }
+    return v_next;
+}
+
+static void idm_step(Drive* env) {
+    IdmLanes* lanes = (IdmLanes*)env->lane_state;
+    if (!lanes) return;
+    int nm = env->active_agent_count;
+    if (nm > MAX_AGENTS) nm = MAX_AGENTS;
+    int idx[MAX_AGENTS];
+    float v_now[MAX_AGENTS];
+    float v_next[MAX_AGENTS];
+    for (int i = 0; i < nm; i++) {
+        idx[i] = env->active_agent_indices[i];
+        Entity* e = &env->entities[idx[i]];
+        v_now[i] = sqrtf(e->vx * e->vx + e->vy * e->vy);
+        v_next[i] = idm_next_speed(env, lanes, idx[i], v_now[i]);
+    }
+    for (int i = 0; i < nm; i++) {
+        int agent = idx[i];
+        if (agent < 0 || agent >= lanes->nveh) continue;
+        FlowPath* path = &lanes->paths[lanes->path_of[agent]];
+        float s = lanes->s[agent] + 0.5f * (v_now[i] + v_next[i]) * SIM_DT;
+        float v = v_next[i];
+        if (s >= path->len) {
+            s = path->len;
+            v = 0;
+        }
+        if (s < 0) s = 0;
+        lanes->s[agent] = s;
+        float x, y, heading;
+        if (!path_sample(path, s, &x, &y, &heading)) continue;
+        Entity* e = &env->entities[agent];
+        e->x = x;
+        e->y = y;
+        e->heading = heading;
+        e->heading_x = cosf(heading);
+        e->heading_y = sinf(heading);
+        e->vx = v * e->heading_x;
+        e->vy = v * e->heading_y;
+    }
+}
+
 static void spawn_flow_vehicles(Drive* env) {
     if (!env->cfg) flow_die("missing env config");
     char net_path[512];
@@ -1026,6 +1457,12 @@ static void spawn_flow_vehicles(Drive* env) {
         exit(1);
     }
     float goal_dist = flow_goal_distance(env);
+    int path_off[FLOW_MAX];
+    int path_count = 0;
+    for (int f = 0; f < nf; f++) {
+        path_off[f] = path_count;
+        path_count += plans[f].npaths;
+    }
     int written = 0;
     for (int f = 0; f < nf; f++) {
         if (alloc[f] <= 0) continue;
@@ -1070,6 +1507,8 @@ static void spawn_flow_vehicles(Drive* env) {
             s->goal_x = gx;
             s->goal_y = gy;
             s->flow = f;
+            s->path = path_off[f] + lane_i;
+            s->along = center_s;
             s->age = age;
             s->vtype = vt;
         }
@@ -1107,7 +1546,12 @@ static void spawn_flow_vehicles(Drive* env) {
         Entity tmp = neu[primary];
         neu[primary] = neu[nspawn - 1];
         neu[nspawn - 1] = tmp;
+        SpawnVeh stmp = spawns[primary];
+        spawns[primary] = spawns[nspawn - 1];
+        spawns[nspawn - 1] = stmp;
     }
+    // Always keep the routes. The window can switch to the ODE later.
+    idm_bind(env, plans, nf, spawns, nspawn);
     if (nroads > 0) {
         memcpy(neu + nspawn, env->entities + env->num_objects, (size_t)nroads * sizeof(Entity));
     }

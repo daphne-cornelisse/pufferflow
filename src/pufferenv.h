@@ -55,6 +55,17 @@ void puf_log(Log* log, Dict* out);
 static inline void puf_set_bot_policy(Env* env, int bot_policy) {
 }
 #endif
+// Interactive playback. Headless and recording callers do not ask.
+// Drive defines PUF_HAS_SIM_CONTROL and stores the flag on Env.
+#ifndef PUF_HAS_SIM_CONTROL
+static inline void puf_sim_poll(Env* env) {
+    (void)env;
+}
+static inline int puf_sim_paused(Env* env) {
+    (void)env;
+    return 0;
+}
+#endif
 
 typedef uint16_t bf16;
 
