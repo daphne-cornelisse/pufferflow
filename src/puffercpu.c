@@ -936,7 +936,7 @@ int main(int argc, char** argv) {
     puf_init(&env, env_sec);
 #ifdef PUF_HAS_AGENT_SLIDER
     env.checkpoint_ok = have_net;
-    if (!have_net && (path || env.control_mode == CONTROL_POLICY)) {
+    if (!have_net) {
         if (!path) {
             snprintf(env.checkpoint_error, sizeof(env.checkpoint_error),
                 "Checkpoint cannot be loaded, showing random behavior");
@@ -1058,25 +1058,24 @@ int main(int argc, char** argv) {
             puf_sim_poll(&env);
 #ifdef PUF_HAS_AGENT_SLIDER
             if (env.sim_agents_apply || env.sim_speed_apply
-                    || env.sim_std_apply) {
-                if (env.sim_speed_apply || env.sim_std_apply) {
+                    || env.sim_hi_apply) {
+                if (env.sim_speed_apply || env.sim_hi_apply) {
                     env.sim_speed_on = env.sim_speed_req;
                     if (env.sim_speed_on < SIM_SPEED_MIN) {
                         env.sim_speed_on = SIM_SPEED_MIN;
                     }
-                    if (env.sim_speed_max >= SIM_SPEED_MIN
-                        && env.sim_speed_on > env.sim_speed_max) {
-                        env.sim_speed_on = env.sim_speed_max;
+                    if (env.sim_speed_on > MAX_SPEED) {
+                        env.sim_speed_on = MAX_SPEED;
                     }
-                    env.sim_std_on = env.sim_std_req;
-                    if (env.sim_std_on < 0.0f) {
-                        env.sim_std_on = 0.0f;
+                    env.sim_hi_on = env.sim_hi_req;
+                    if (env.sim_hi_on < SIM_SPEED_MIN) {
+                        env.sim_hi_on = SIM_SPEED_MIN;
                     }
-                    if (env.sim_std_on > SIM_STD_MAX) {
-                        env.sim_std_on = SIM_STD_MAX;
+                    if (env.sim_hi_on > MAX_SPEED) {
+                        env.sim_hi_on = MAX_SPEED;
                     }
                     env.sim_speed_apply = 0;
-                    env.sim_std_apply = 0;
+                    env.sim_hi_apply = 0;
                 }
                 int req = env.sim_agents_apply
                     ? env.sim_agents_req : env.sim_agents_on;

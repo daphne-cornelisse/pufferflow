@@ -21,5 +21,3 @@ Open it in the GUI window:
 ```
 ./drive checkpoints/bottleneck.bin --policy.hidden_size=512 --policy.num_layers=5
 ```
-
-`config/drive.ini` `control_mode = precal_idm` drives every vehicle with SUMO's calibrated IDM instead of the learned policy. `policy` is the bicycle model.
