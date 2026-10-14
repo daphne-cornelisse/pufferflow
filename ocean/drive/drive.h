@@ -350,6 +350,8 @@ struct Env {
     // Set from the window. Headless eval and recording never read these.
     int sim_paused;
     int sim_infinite;
+    // Overhead camera stays on human_agent_idx. Off restores the map view.
+    int sim_follow;
     // One frame after Reset, so that click draws timestep 0.
     int sim_hold_step;
     // Agents per map. The slider writes req. Play copies it to on.
@@ -1773,7 +1775,7 @@ void puf_reset(Drive* env) {
 }
 
 // Rebuild one map at n cars and reset. Observations must already be bound.
-// control_mode, pause, sim_infinite, and the speed mean and std stay.
+// control_mode, pause, sim_infinite, sim_follow, and the speed mean and std stay.
 void puf_set_population(Drive* env, int n) {
     if (n < 1) n = 1;
     if (n > DRIVE_AGENT_MAX) n = DRIVE_AGENT_MAX;
@@ -2099,10 +2101,13 @@ Client* make_client(Drive* env) {
     return client;
 }
 
-// Right-hand column: playback, controller, episode length, agents, speed.
+// Right-hand column: playback, controller, episode length, follow, agents.
 #define SIM_COL_W 132.0f
 #define SIM_AGENT_H 46.0f
 #define SIM_DIST_H 78.0f
+#define SIM_OBS_W 220.0f
+#define SIM_OBS_H 264.0f
+#define SIM_OBS_RANGE 12.0f
 
 enum {
     SIM_PLAY = 0,
@@ -2112,7 +2117,8 @@ enum {
     SIM_POLICY = 4,
     SIM_FINITE = 5,
     SIM_INFINITE = 6,
-    SIM_NBTN = 7
+    SIM_FOLLOW = 7,
+    SIM_NBTN = 8
 };
 
 static void sim_rects(float width, Rectangle r[SIM_NBTN]) {
@@ -2136,14 +2142,16 @@ static void sim_rects(float width, Rectangle r[SIM_NBTN]) {
     r[SIM_FINITE] = (Rectangle){x, y, bw, bh};
     y += bh + gap;
     r[SIM_INFINITE] = (Rectangle){x, y, bw, bh};
+    y += bh + grp;
+    r[SIM_FOLLOW] = (Rectangle){x, y, bw, bh};
 }
 
 static Rectangle sim_agents_rect(float width) {
     Rectangle r[SIM_NBTN];
     sim_rects(width, r);
-    float y = r[SIM_INFINITE].y + r[SIM_INFINITE].height + 18.0f;
+    float y = r[SIM_FOLLOW].y + r[SIM_FOLLOW].height + 18.0f;
     return (Rectangle){
-        r[SIM_INFINITE].x, y, r[SIM_INFINITE].width, SIM_AGENT_H
+        r[SIM_FOLLOW].x, y, r[SIM_FOLLOW].width, SIM_AGENT_H
     };
 }
 
@@ -2295,6 +2303,16 @@ static Rectangle flow_hit_panel(float width, float height, int lanes) {
     return (Rectangle){x, speed.y, w, speed.height};
 }
 
+// Left of the control column, top aligned. 12 m radius.
+static Rectangle sim_obs_rect(float width) {
+    float col_x = width - 8.0f - SIM_COL_W;
+    float x = col_x - 8.0f - SIM_OBS_W;
+    if (x < 8.0f) {
+        x = 8.0f;
+    }
+    return (Rectangle){x, 8.0f, SIM_OBS_W, SIM_OBS_H};
+}
+
 static int sim_ui_hot(Drive* env) {
     Client* client = env->client;
     if (!client) {
@@ -2302,6 +2320,10 @@ static int sim_ui_hot(Drive* env) {
     }
     Vector2 mouse = GetMousePosition();
     if (CheckCollisionPointRec(mouse, sim_col_rect(env))) {
+        return 1;
+    }
+    if (!puf_record_enabled()
+        && CheckCollisionPointRec(mouse, sim_obs_rect(client->width))) {
         return 1;
     }
     if (puf_record_enabled()) {
@@ -2516,6 +2538,224 @@ static void sim_finite_label(Drive* env, char* dst, int n) {
     }
 }
 
+// Ego meters to the crop. Forward is up, left is left.
+static void sim_obs_seg(float cx, float cy, float ppm,
+        float f0, float l0, float f1, float l1,
+        float thick, Color color) {
+    Vector2 a = {cx - l0 * ppm, cy - f0 * ppm};
+    Vector2 b = {cx - l1 * ppm, cy - f1 * ppm};
+    DrawLineEx(a, b, thick, color);
+}
+
+// vlen is meters of travel. The whole arrow, head included, grows with it.
+static void sim_obs_arrow(float cx, float cy, float ppm,
+        float f, float l, float c, float s, float vlen, Color color) {
+    if (vlen < 0.15f) {
+        return;
+    }
+    float f1 = f + c * vlen;
+    float l1 = l + s * vlen;
+    sim_obs_seg(cx, cy, ppm, f, l, f1, l1, 1.5f, color);
+    float dx = -s;
+    float dy = -c;
+    float norm = sqrtf(dx * dx + dy * dy);
+    if (norm < 1.0e-4f) {
+        return;
+    }
+    dx /= norm;
+    dy /= norm;
+    float reach = vlen * ppm;
+    float head = reach * 0.32f;
+    if (head < 4.5f) {
+        head = 4.5f;
+    }
+    if (head > 13.0f) {
+        head = 13.0f;
+    }
+    float wing = head * 0.55f;
+    float px = -dy;
+    float py = dx;
+    float tipx = cx - l1 * ppm;
+    float tipy = cy - f1 * ppm;
+    Vector2 tip = {tipx, tipy};
+    Vector2 left = {
+        tipx - dx * head + px * wing,
+        tipy - dy * head + py * wing
+    };
+    Vector2 right = {
+        tipx - dx * head - px * wing,
+        tipy - dy * head - py * wing
+    };
+    sim_dist_fill(tip, left, right, color);
+}
+
+// Decode the selected car's observation. Empty slots stay blank.
+static void sim_obs_draw(Drive* env) {
+    if (!env->client || puf_record_enabled()) {
+        return;
+    }
+    Rectangle rect = sim_obs_rect(env->client->width);
+    DrawRectangleRec(rect, (Color){12, 14, 20, 255});
+    DrawRectangleLinesEx(rect, 1.0f, (Color){70, 76, 88, 255});
+
+    int n = env->active_agent_count;
+    int slot = env->human_agent_idx;
+    if (n < 0) {
+        n = 0;
+    }
+    if (slot < 0 || slot >= n) {
+        slot = 0;
+    }
+    const char* title = "Agent";
+    if (n > 0) {
+        title = TextFormat("Agent %d", slot);
+    }
+    DrawText(title, (int)rect.x + 10, (int)rect.y + 8, 16, PUFF_WHITE);
+
+    float* obs = NULL;
+    if (n > 0 && slot < DRIVE_AGENT_MAX) {
+        obs = env->agents[slot].observations;
+    }
+    Color dim = {150, 156, 168, 255};
+    if (!obs) {
+        DrawText("no view", (int)rect.x + 10, (int)rect.y + 30, 14, dim);
+        return;
+    }
+    float spd = obs[2] / OBS_SPEED_SCALE;
+    float mx = obs[EGO_FEATURES - 1] * MAX_SPEED;
+    int hit = obs[5] > 0.5f;
+    float gf = obs[0] / OBS_GOAL_SCALE;
+    float gl = obs[1] / OBS_GOAL_SCALE;
+    float gd = sqrtf(gf * gf + gl * gl);
+    char cap[64];
+    snprintf(cap, sizeof(cap), "v %.1f  max %.1f%s",
+        spd, mx, hit ? "  hit" : "");
+    Color cap_c = hit ? (Color){210, 80, 70, 255} : PUFF_WHITE;
+    DrawText(cap, (int)rect.x + 10, (int)rect.y + 28, 14, cap_c);
+    char goal_txt[32];
+    if (gd >= 10.0f) {
+        snprintf(goal_txt, sizeof(goal_txt), "goal %.0f m", gd);
+    } else {
+        snprintf(goal_txt, sizeof(goal_txt), "goal %.1f m", gd);
+    }
+    DrawText(goal_txt, (int)rect.x + 10, (int)rect.y + 44, 14,
+        (Color){90, 190, 110, 255});
+
+    Rectangle plot = {
+        rect.x + 10.0f, rect.y + 64.0f,
+        rect.width - 20.0f, rect.height - 74.0f
+    };
+    float side = plot.width;
+    if (plot.height < side) {
+        side = plot.height;
+    }
+    float ppm = (side * 0.5f) / SIM_OBS_RANGE;
+    float cx = plot.x + plot.width * 0.5f;
+    float cy = plot.y + plot.height * 0.5f;
+
+    BeginScissorMode((int)plot.x, (int)plot.y,
+        (int)plot.width, (int)plot.height);
+    DrawCircleLines((int)cx, (int)cy, ppm * (SIM_OBS_RANGE - 0.5f),
+        (Color){70, 76, 88, 255});
+
+    // One midpoint per segment. Edges are red, lanes and lines are white.
+    int road0 = EGO_FEATURES + PARTNER_FEATURES * MAX_OBS_AGENTS;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
+            float* road = obs + road0 + k * ROAD_FEATURES;
+            if (road[0] == 0.0f && road[1] == 0.0f && road[2] == 0.0f) {
+                continue;
+            }
+            int edge = (int)(road[6] + 0.5f) >= 2;
+            if (edge != pass) {
+                continue;
+            }
+            float mid_f = road[0] / OBS_POSITION_SCALE;
+            float mid_l = road[1] / OBS_POSITION_SCALE;
+            Color pt = {241, 241, 241, 255};
+            if (edge) {
+                pt = (Color){210, 64, 64, 255};
+            }
+            DrawCircleV((Vector2){cx - mid_l * ppm, cy - mid_f * ppm},
+                2.2f, pt);
+        }
+    }
+
+    for (int j = 0; j < MAX_OBS_AGENTS; j++) {
+        float* p = obs + EGO_FEATURES + j * PARTNER_FEATURES;
+        if (p[0] == 0.0f && p[1] == 0.0f
+            && p[2] == 0.0f && p[3] == 0.0f) {
+            continue;
+        }
+        float f = p[0] / OBS_POSITION_SCALE;
+        float l = p[1] / OBS_POSITION_SCALE;
+        float hw = p[2] * MAX_VEH_WIDTH * 0.5f;
+        float hl = p[3] * MAX_VEH_LEN * 0.5f;
+        if (hw < 0.4f) {
+            hw = 0.4f;
+        }
+        if (hl < 0.6f) {
+            hl = 0.6f;
+        }
+        float ang = atan2f(p[5], p[4]);
+        float c = cosf(ang);
+        float s = sinf(ang);
+        float lf = -s;
+        float ll = c;
+        Color car = {240, 150, 60, 255};
+        float f0 = f + hl * c + hw * lf;
+        float l0 = l + hl * s + hw * ll;
+        float f1 = f + hl * c - hw * lf;
+        float l1 = l + hl * s - hw * ll;
+        float f2 = f - hl * c - hw * lf;
+        float l2 = l - hl * s - hw * ll;
+        float f3 = f - hl * c + hw * lf;
+        float l3 = l - hl * s + hw * ll;
+        sim_obs_seg(cx, cy, ppm, f0, l0, f1, l1, 1.25f, car);
+        sim_obs_seg(cx, cy, ppm, f1, l1, f2, l2, 1.25f, car);
+        sim_obs_seg(cx, cy, ppm, f2, l2, f3, l3, 1.25f, car);
+        sim_obs_seg(cx, cy, ppm, f3, l3, f0, l0, 1.25f, car);
+        // From the nose. Shorter than the selected car so it matches the box.
+        sim_obs_arrow(cx, cy, ppm, f + c * hl, l + s * hl, c, s,
+            p[6] * MAX_SPEED * 0.10f, PUFF_WHITE);
+    }
+
+    int outside = gd > SIM_OBS_RANGE;
+    float df = gf;
+    float dl = gl;
+    Color goal = {90, 190, 110, 255};
+    if (outside && gd > 1.0e-3f) {
+        float rim = SIM_OBS_RANGE - 1.5f;
+        df = gf * rim / gd;
+        dl = gl * rim / gd;
+    }
+    DrawCircleV((Vector2){cx - dl * ppm, cy - df * ppm}, 3.5f, goal);
+    if (outside && gd > 1.0e-3f) {
+        float ux = gf / gd;
+        float uy = gl / gd;
+        sim_obs_seg(cx, cy, ppm,
+            df - ux * 6.0f, dl - uy * 6.0f, df, dl, 1.5f, goal);
+    }
+
+    float ego_hw = obs[3] * MAX_VEH_WIDTH * 0.5f;
+    float ego_hl = obs[4] * MAX_VEH_LEN * 0.5f;
+    if (ego_hw < 0.4f) {
+        ego_hw = 0.4f;
+    }
+    if (ego_hl < 0.6f) {
+        ego_hl = 0.6f;
+    }
+    Color ego = hit ? (Color){210, 70, 70, 255} : (Color){241, 241, 241, 255};
+    sim_obs_seg(cx, cy, ppm, ego_hl, ego_hw, ego_hl, -ego_hw, 1.25f, ego);
+    sim_obs_seg(cx, cy, ppm, ego_hl, -ego_hw, -ego_hl, -ego_hw, 1.25f, ego);
+    sim_obs_seg(cx, cy, ppm, -ego_hl, -ego_hw, -ego_hl, ego_hw, 1.25f, ego);
+    sim_obs_seg(cx, cy, ppm, -ego_hl, ego_hw, ego_hl, ego_hw, 1.25f, ego);
+    sim_obs_arrow(cx, cy, ppm, ego_hl, 0.0f, 1.0f, 0.0f,
+        spd * 0.25f, PUFF_WHITE);
+    EndScissorMode();
+    DrawRectangleLinesEx(plot, 1.0f, (Color){70, 76, 88, 255});
+}
+
 static void sim_transport_draw(Drive* env) {
     if (!env->client) {
         return;
@@ -2525,7 +2765,8 @@ static void sim_transport_draw(Drive* env) {
     char finite[16];
     sim_finite_label(env, finite, (int)sizeof(finite));
     const char* labels[SIM_NBTN] = {
-        "Play", "Pause", "Reset", "ODE", "Policy", finite, "Infinite"
+        "Play", "Pause", "Reset", "ODE", "Policy", finite, "Infinite",
+        "Follow"
     };
     int on[SIM_NBTN] = {
         !env->sim_paused,
@@ -2534,7 +2775,8 @@ static void sim_transport_draw(Drive* env) {
         env->control_mode == CONTROL_PRECAL_IDM,
         env->control_mode != CONTROL_PRECAL_IDM,
         !env->sim_infinite,
-        env->sim_infinite
+        env->sim_infinite,
+        env->sim_follow
     };
     DrawRectangleRec(sim_col_rect(env), (Color){12, 14, 20, 230});
     Vector2 mouse = GetMousePosition();
@@ -2546,12 +2788,15 @@ static void sim_transport_draw(Drive* env) {
     int x1 = (int)(r[SIM_PLAY].x + r[SIM_PLAY].width);
     DrawLine(x0, y1, x1, y1, sep);
     DrawLine(x0, y2, x1, y2, sep);
+    int y_inf = (int)(r[SIM_INFINITE].y + r[SIM_INFINITE].height
+        + r[SIM_FOLLOW].y) / 2;
+    DrawLine(x0, y_inf, x1, y_inf, sep);
     for (int i = 0; i < SIM_NBTN; i++) {
         int hot = CheckCollisionPointRec(mouse, r[i]);
         sim_choice(r[i], labels[i], on[i], hot, i == SIM_PAUSE);
     }
     Rectangle zone = sim_agents_rect(env->client->width);
-    int y3 = (int)(r[SIM_INFINITE].y + r[SIM_INFINITE].height + zone.y) / 2;
+    int y3 = (int)(r[SIM_FOLLOW].y + r[SIM_FOLLOW].height + zone.y) / 2;
     DrawLine(x0, y3, x1, y3, sep);
     char num[8];
     snprintf(num, sizeof(num), "%d", env->sim_agents_req);
@@ -2583,6 +2828,18 @@ static void sim_transport_draw(Drive* env) {
         int dist_pending = sim_speed_pending(env) || sim_std_pending(env);
         sim_dist_draw(env, sim_dist_rect(env->client->width), dist_pending);
     }
+    sim_obs_draw(env);
+}
+
+static void sim_camera_bev(Drive* env) {
+    Client* client = env->client;
+    if (!client) {
+        return;
+    }
+    client->camera.position = client->default_camera_position;
+    client->camera.target = client->default_camera_target;
+    client->camera.up = (Vector3){0.0f, -1.0f, 0.0f};
+    client->camera.fovy = 45.0f;
 }
 
 // Read once per frame, before the step, so a click applies on this tick.
@@ -2682,6 +2939,11 @@ static inline void puf_sim_poll(Drive* env) {
         sim_use_finite(env);
     } else if (CheckCollisionPointRec(mouse, r[SIM_INFINITE])) {
         env->sim_infinite = 1;
+    } else if (CheckCollisionPointRec(mouse, r[SIM_FOLLOW])) {
+        env->sim_follow = !env->sim_follow;
+        if (!env->sim_follow) {
+            sim_camera_bev(env);
+        }
     }
 }
 
@@ -2695,8 +2957,10 @@ void handle_camera_controls(Drive* env) {
     }
     float camera_move_speed = 0.5f;
 
-    // A click on the controls or the diagram must not pan the map.
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+    // Follow owns the map position. A click on the panels must not pan.
+    if (env->sim_follow) {
+        is_dragging = false;
+    } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         if (!sim_ui_hot(env)) {
             prev_mouse_pos = GetMousePosition();
             is_dragging = true;
@@ -2744,6 +3008,39 @@ void handle_camera_controls(Drive* env) {
         client->camera.position.y = client->camera.target.y + direction.y;
         client->camera.position.z = client->camera.target.z + direction.z;
     }
+}
+
+// Keep the current overhead offset and aim it at the selected car.
+static void sim_follow_camera(Drive* env) {
+    Client* client = env->client;
+    if (!env->sim_follow || !client || puf_record_enabled()) {
+        return;
+    }
+    if (env->active_agent_count <= 0 || !env->entities
+        || !env->active_agent_indices) {
+        return;
+    }
+    int slot = env->human_agent_idx;
+    if (slot < 0 || slot >= env->active_agent_count) {
+        slot = 0;
+    }
+    int idx = env->active_agent_indices[slot];
+    if (idx < 0 || idx >= env->num_entities) {
+        return;
+    }
+    Entity* agent = &env->entities[idx];
+    if (agent->x == INVALID_POSITION || agent->y == INVALID_POSITION) {
+        return;
+    }
+    float ox = client->camera.position.x - client->camera.target.x;
+    float oy = client->camera.position.y - client->camera.target.y;
+    float oz = client->camera.position.z - client->camera.target.z;
+    client->camera.target = (Vector3){agent->x, agent->y, 1.0f};
+    client->camera.position = (Vector3){
+        agent->x + ox, agent->y + oy, 1.0f + oz
+    };
+    client->camera.up = (Vector3){0.0f, -1.0f, 0.0f};
+    client->camera.fovy = 45.0f;
 }
 
 void draw_agent_obs(Drive* env, int agent_index) {
@@ -3389,6 +3686,7 @@ static void flow_draw_lanes(Drive* env, Client* client) {
         view_y = 190.0f;
     }
     float x_max = col.x - 12.0f;
+    Rectangle eye = sim_obs_rect(client->width);
     for (int lane = 0; lane < n; lane++) {
         Color color = flow_lane_road_color(lane);
         int beg = env->flow_lane_beg[lane];
@@ -3409,6 +3707,11 @@ static void flow_draw_lanes(Drive* env, Client* client) {
             if (sp.x > diagram.x - 8.0f && sp.y > diagram.y - 12.0f) {
                 continue;
             }
+            if (sp.x >= eye.x - 6.0f && sp.x <= eye.x + eye.width + 6.0f
+                && sp.y >= eye.y - 4.0f
+                && sp.y <= eye.y + eye.height + 4.0f) {
+                continue;
+            }
             float ddx = sp.x - view_x;
             float ddy = sp.y - view_y;
             float dist = ddx * ddx + ddy * ddy;
@@ -3422,7 +3725,7 @@ static void flow_draw_lanes(Drive* env, Client* client) {
 }
 
 static void flow_draw_lane_names(Drive* env, Client* client) {
-    if (puf_record_enabled() || !env->flow_segs) {
+    if (puf_record_enabled() || env->sim_follow || !env->flow_segs) {
         return;
     }
     int n = env->flow_nlanes;
@@ -3484,6 +3787,15 @@ static void flow_draw_lane_names(Drive* env, Client* client) {
         if (y[i] > y_lim) {
             y[i] = y_lim;
         }
+        Rectangle eye = sim_obs_rect(client->width);
+        if (x[i] + tw[i] > (int)eye.x - 4
+            && x[i] < (int)(eye.x + eye.width) + 4) {
+            int cover_top = (int)eye.y - 20;
+            int cover_bot = (int)(eye.y + eye.height) + 2;
+            if (y[i] > cover_top && y[i] < cover_bot) {
+                y[i] = cover_bot;
+            }
+        }
         const char* name = env->flow_lane_name[which[i]];
         Color color = flow_lane_color(which[i]);
         DrawRectangle(x[i] - 2, y[i] - 1, tw[i] + 6, 18, (Color){12, 14, 20, 220});
@@ -3502,10 +3814,11 @@ void puf_render(Drive* env) {
     }
     BeginDrawing();
     ClearBackground(ROAD_COLOR);
-    BeginMode3D(client->camera);
     if (!puf_record_enabled()) {
         handle_camera_controls(env);
+        sim_follow_camera(env);
     }
+    BeginMode3D(client->camera);
 
     if (env->map_corners) {
         DrawLine3D((Vector3){env->map_corners[0], env->map_corners[1], 0}, (Vector3){env->map_corners[2], env->map_corners[1], 0}, PUFF_CYAN);
