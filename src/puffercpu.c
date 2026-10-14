@@ -902,11 +902,21 @@ int main(int argc, char** argv) {
     }
 #endif
 #endif
-    assert(!weights || (need - file_floats <= 7 && file_floats <= need));
+    // A missing file or the wrong network used to abort, or play action 0
+    // with no message. Keep going and say so.
+    int opened = weights != NULL;
+    int raw_floats = file_floats;
+    int fits = !weights || (need - file_floats <= 7 && file_floats <= need);
+    if (weights && !fits) {
+        free(weights);
+        weights = NULL;
+        file_floats = 0;
+    }
     int have_net = weights != NULL;
+    int shown_floats = have_net ? file_floats : raw_floats;
     if (headless && eval_episodes > 0) {
         printf("CPU_META env=%s path=%s file_floats=%d need=%d untrained=%d hidden=%d layers=%d\n",
-            env_name, path ? path : "-", file_floats, need, !have_net,
+            env_name, path ? path : "-", shown_floats, need, !have_net,
             hidden_size, num_layers);
         fflush(stdout);
     }
@@ -924,6 +934,24 @@ int main(int argc, char** argv) {
 
     Env env = {0};
     puf_init(&env, env_sec);
+#ifdef PUF_HAS_AGENT_SLIDER
+    env.checkpoint_ok = have_net;
+    if (!have_net && (path || env.control_mode == CONTROL_POLICY)) {
+        if (!path) {
+            snprintf(env.checkpoint_error, sizeof(env.checkpoint_error),
+                "Checkpoint cannot be loaded, showing random behavior");
+        } else if (!opened) {
+            snprintf(env.checkpoint_error, sizeof(env.checkpoint_error),
+                "Checkpoint cannot be loaded, showing random behavior (%s: file not found)",
+                path);
+        } else {
+            snprintf(env.checkpoint_error, sizeof(env.checkpoint_error),
+                "Checkpoint cannot be loaded, showing random behavior (%s: %d floats, network wants %d)",
+                path, raw_floats, need);
+        }
+        sim_checkpoint_rejected(&env);
+    }
+#endif
 
     // Heap, not VLAs: snake=256 / obs=968 overflows the 512KB WASM stack.
     size_t n_obs = (size_t)env.num_agents * (size_t)OBS_SIZE;
@@ -1206,7 +1234,7 @@ int main(int argc, char** argv) {
             dict_clear(&out);
         }
         printf("CPU_EVAL env=%s file_floats=%d need=%d match=%d untrained=%d n=%.0f perf=%.6f score=%.6f steps=%d agents=%d\n",
-            env_name, file_floats, need,
+            env_name, shown_floats, need,
             (need - file_floats <= 7) ? 1 : 0,
             !have_net, n, perf, score, steps, env.num_agents);
         fflush(stdout);

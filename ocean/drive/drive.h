@@ -320,6 +320,9 @@ struct Env {
     unsigned int rng;
     int agent_initialization;
     int control_mode;
+    // 1 after ./drive loads a checkpoint that matches this network.
+    int checkpoint_ok;
+    char checkpoint_error[256];
     // Route polylines and arc lengths for CONTROL_PRECAL_IDM. Owned by flow_init.h.
     void* lane_state;
     // Mean speed (m/s) of every vehicle on a lane, per step. -1 is empty.
@@ -2480,6 +2483,14 @@ static void sim_choice(Rectangle r, const char* label, int on, int hot, int ambe
     sim_draw_button(r, label, fill, edge);
 }
 
+static void sim_checkpoint_rejected(Drive* env) {
+    const char* msg = env->checkpoint_error[0]
+        ? env->checkpoint_error
+        : "Checkpoint cannot be loaded, showing random behavior";
+    fprintf(stderr, "%s\n", msg);
+    fflush(stderr);
+}
+
 static void sim_use_ode(Drive* env) {
     if (!env->lane_state || env->control_mode == CONTROL_PRECAL_IDM) {
         return;
@@ -2664,6 +2675,9 @@ static inline void puf_sim_poll(Drive* env) {
         sim_use_ode(env);
     } else if (CheckCollisionPointRec(mouse, r[SIM_POLICY])) {
         env->control_mode = CONTROL_POLICY;
+        if (!env->checkpoint_ok) {
+            sim_checkpoint_rejected(env);
+        }
     } else if (CheckCollisionPointRec(mouse, r[SIM_FINITE])) {
         sim_use_finite(env);
     } else if (CheckCollisionPointRec(mouse, r[SIM_INFINITE])) {
@@ -3649,6 +3663,11 @@ void puf_render(Drive* env) {
     }
     DrawText(TextFormat("Time: %.1f s%s", env->timestep * SIM_DT, paused_mark),
         10, 50, 20, PUFF_WHITE);
+    if (!puf_record_enabled() && env->control_mode == CONTROL_POLICY
+            && !env->checkpoint_ok) {
+        DrawText("Checkpoint cannot be loaded, showing random behavior",
+            10, 190, 20, (Color){240, 196, 120, 255});
+    }
     int human_idx = -1;
     int accel = 0;
     int steer = 0;
