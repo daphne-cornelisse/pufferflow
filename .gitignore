@@ -160,7 +160,7 @@ dmypy.json
 # weights and the 256x4 trial 29 weights (about 1M parameters).
 checkpoints/*
 !checkpoints/bottleneck.bin
-!checkpoints/bottleneck-1m.bin
+!checkpoints/bottleneck_1m.bin
 experiments/
 wandb/
 .neptune/
