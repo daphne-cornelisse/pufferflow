@@ -156,10 +156,11 @@ dmypy.json
 # ROMs
 *.gb
 
-# Run directories stay local. checkpoints/bottleneck.bin is the final
-# policy kept for tests.
+# Run directories stay local. The kept policies are the 512x5 trial 17
+# weights and the 256x4 trial 29 weights (about 1M parameters).
 checkpoints/*
 !checkpoints/bottleneck.bin
+!checkpoints/bottleneck-1m.bin
 experiments/
 wandb/
 .neptune/
