@@ -2562,6 +2562,28 @@ typedef struct {
     TrainResult result;
 } SweepJob;
 
+// Flat policy weights for this env: encoder, MinGRU, and the decoder
+// value head. Matches weights_create. num_layers is truncated, same as train.
+static long policy_param_count(int hidden, int layers) {
+    int act_sizes[] = ACT_SIZES;
+    int act_n = 0;
+    int n_cont = 0;
+    for (int i = 0; i < NUM_ATNS; i++) {
+        if (act_sizes[i] == 1) {
+            n_cont++;
+        }
+        act_n += act_sizes[i];
+    }
+    int decoder_out = n_cont > 0 ? NUM_ATNS : act_n;
+    long n = (long)hidden * OBS_SIZE
+        + (long)layers * 3 * hidden * hidden
+        + (long)(decoder_out + 1) * hidden;
+    if (n_cont > 0) {
+        n += decoder_out;
+    }
+    return n;
+}
+
 void run_sweep(Ini* ini, const char* exe_path) {
     // Build SweepSpace + param map from [sweep.<section>.<key>] sections.
     const char* goal = puf_ini_get_str(ini, "sweep", "goal");
@@ -2687,6 +2709,16 @@ void run_sweep(Ini* ini, const char* exe_path) {
     SweepJob* jobs = (SweepJob*)calloc(parallel, sizeof(SweepJob));
     int failed_workers = 0;
     int next_run_id = 0;
+    long max_policy_params = 0;
+    {
+        DictItem* cap = dict_find(puf_ini_section(ini, "sweep", 0), "max_policy_params");
+        if (cap) {
+            max_policy_params = (long)cap->value;
+        }
+    }
+    if (max_policy_params > 0) {
+        fprintf(stderr, "sweep max_policy_params=%ld\n", max_policy_params);
+    }
     int completed = 0;
     int active = 0;
     // Free-list: slot i owns GPUs [i*train_gpus, (i+1)*train_gpus). Refill as
@@ -2733,6 +2765,23 @@ void run_sweep(Ini* ini, const char* exe_path) {
                 snprintf(key, sizeof(key), "%s.%s",
                     params[p].section, params[p].key);
                 puf_ini_put(ini, key, buf);
+            }
+            if (max_policy_params > 0) {
+                int hidden = (int)puf_ini_get(ini, "policy", "hidden_size");
+                int layers = (int)puf_ini_get(ini, "policy", "num_layers");
+                long nparams = policy_param_count(hidden, layers);
+                if (nparams > max_policy_params) {
+                    fprintf(stderr,
+                        "sweep worker run=%d skipped: policy %dx%d has %ld params, cap %ld\n",
+                        job.run, hidden, layers, nparams, max_policy_params);
+                    protein_sweep_observe(protein, job.sample, NAN, max_cost, 1);
+                    assert(++failed_workers <= 1000
+                        && "too many failed sweep workers");
+                    // Same slot, new sample. Leaving the slot empty with
+                    // nothing active would end the sweep.
+                    i--;
+                    continue;
+                }
             }
             char run_id[128];
             snprintf(run_id, sizeof(run_id), "sweep_%ld_%04d",
