@@ -21,3 +21,9 @@ Open it in the GUI window:
 ```
 ./drive checkpoints/bottleneck.bin --policy.hidden_size=512 --policy.num_layers=5
 ```
+
+`checkpoints/bottleneck_2m.bin` is the 512×3 policy (trial 37, goal score 0.761):
+
+```
+./drive checkpoints/bottleneck_2m.bin --policy.hidden_size=512 --policy.num_layers=3
+```
