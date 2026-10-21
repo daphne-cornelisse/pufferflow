@@ -60,7 +60,7 @@ Client* make_client(Drive* env) {
                 client->height = (float)h;
             }
         }
-        SetTargetFPS(30);
+        SetTargetFPS(PUF_STEPS_PER_SEC);
     } else {
         rlDisableBackfaceCulling();
     }
@@ -842,19 +842,21 @@ void puf_render(Drive* env) {
         }
     }
 
-    // The 5 m grid is a debug overlay. Skip it while recording so a full map
-    // does not spend the frame drawing thousands of wires into the mp4.
-    if (!puf_record_enabled()) {
-        float grid_start_x = env->map_corners ? env->map_corners[0] : 0.0f;
-        float grid_start_y = env->map_corners ? env->map_corners[1] : 0.0f;
-        for (int i = 0; i < env->grid_cols; i++) {
-            for (int j = 0; j < env->grid_rows; j++) {
-                float x = grid_start_x + i * GRID_CELL_SIZE;
-                float y = grid_start_y + j * GRID_CELL_SIZE;
-                DrawCubeWires(
-                    (Vector3){x + GRID_CELL_SIZE / 2, y + GRID_CELL_SIZE / 2, 1},
-                    GRID_CELL_SIZE, GRID_CELL_SIZE, 0.1f, GRID);
-            }
+    // One line per cell edge, under the lane marks. A wire box on every
+    // cell sat on the cars and took a draw call per cell.
+    if (!puf_record_enabled() && env->map_corners) {
+        float x0 = env->map_corners[0];
+        float y0 = env->map_corners[1];
+        float x1 = env->map_corners[2];
+        float y1 = env->map_corners[3];
+        float z = 0.02f;
+        for (int i = 0; i <= env->grid_cols; i++) {
+            float x = x0 + i * GRID_CELL_SIZE;
+            DrawLine3D((Vector3){x, y0, z}, (Vector3){x, y1, z}, GRID);
+        }
+        for (int j = 0; j <= env->grid_rows; j++) {
+            float y = y0 + j * GRID_CELL_SIZE;
+            DrawLine3D((Vector3){x0, y, z}, (Vector3){x1, y, z}, GRID);
         }
     }
     draw_goal_markers(env);

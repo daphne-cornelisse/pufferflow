@@ -970,13 +970,14 @@ int main(int argc, char** argv) {
 #ifndef PUF_STEPS_PER_SEC
 #define PUF_STEPS_PER_SEC 60
 #endif
-    // Interactive: keep sim at PUF_STEPS_PER_SEC using wall clock.
-    // Each tick is still one training step (one forward + one puf_step / ACTION_DT).
-    // Slow renders catch up with extra ticks; they do not stretch dt.
+    // Interactive: one displayed frame is one step, paced by SetTargetFPS.
+    // A catch-up burst draws several steps in one frame, so the view jumps.
+#ifndef PUF_HAS_SIM_CONTROL
     const double sim_dt = 1.0 / PUF_STEPS_PER_SEC;
     double sim_accum = 0.0;
     double sim_prev = -1.0;
     int sim_tick_cap = 5;
+#endif
     int hold = 0;
     int steps = 0;
     int recording = puf_record_enabled();
@@ -1006,6 +1007,12 @@ int main(int argc, char** argv) {
         int ticks = 1;
         if (!headless && !recording) {
             puf_sim_poll(&env);
+#ifdef PUF_HAS_SIM_CONTROL
+            ticks = 0;
+            if (!puf_sim_paused(&env)) {
+                ticks = 1;
+            }
+#else
             double now = GetTime();
             ticks = 0;
             if (puf_sim_paused(&env)) {
@@ -1027,6 +1034,7 @@ int main(int argc, char** argv) {
                 ticks = 1;
             }
             sim_prev = now;
+#endif
         }
         for (int t = 0; t < ticks; t++) {
 #ifdef PUF_EVAL_SHOULD_FORWARD
@@ -1036,6 +1044,14 @@ int main(int argc, char** argv) {
 #endif
             int eval_human = !headless && IsWindowReady() &&
                 IsKeyDown(KEY_LEFT_SHIFT);
+            // Bin 0 is full brake and full lock. With no weights, coast,
+            // and let Shift overwrite the selected car inside puf_step.
+            if (!have_net) {
+                for (int i = 0; i < env.num_agents; i++) {
+                    actions[i * NUM_ATNS + 0] = 3;
+                    actions[i * NUM_ATNS + 1] = 6;
+                }
+            }
             if (have_net && eval_fwd && hold == 0 && !eval_human) {
 #ifdef PUF_NMMO3_NET
                 forward(net, observations, terminals, actions);
