@@ -3,14 +3,14 @@
 // network.png is the roadgraph the simulator loaded: lane centers, road
 // lines, road edges, and vehicles.
 // observation.png is one agent's observation buffer, decoded the same way
-// as PufferDrive 2.0 draw_agent_obs(..., mode=1) (drive.h around line 2434):
+// as PufferDrive 2.0 draw_agent_obs(..., mode=1) (ocean/drive/render.h):
 // world frame, and only road edges. Lane centers and road lines stay in the
 // vector and are not drawn.
 //
 //   ./build/render_sanity <data_dir> <map_id|random> <output_dir> [agent_slot]
 //
-// agent_slot is the active-agent index. The default is human_agent_idx (the
-// SDC, active slot 0).
+// agent_slot selects one car. The default is human_agent_idx. Entity i is
+// agent i.
 
 #include "drive.h"
 
@@ -64,23 +64,13 @@ static void draw_oriented_box(float x, float y, float hx, float hy,
     DrawLine3D((Vector3){x, y, z}, nose, wire);
 }
 
-static int is_tracked_vehicle(Drive* env, int entity_index) {
-    for (int j = 0; j < env->active_agent_count; j++) {
-        if (env->active_agent_indices[j] == entity_index) return 1;
-    }
-    for (int j = 0; j < env->static_agent_count; j++) {
-        if (env->static_agent_indices[j] == entity_index) return 1;
-    }
-    return 0;
-}
-
 static void draw_network(Drive* env, int agent_slot) {
     for (int i = 0; i < env->num_entities; i++) {
         Entity* e = &env->entities[i];
         if (e->type < ROAD_LANE || e->array_size < 2) continue;
         for (int j = 0; j < e->array_size - 1; j++) {
-            Vector3 a = {e->traj_x[j], e->traj_y[j], 0.05f};
-            Vector3 b = {e->traj_x[j + 1], e->traj_y[j + 1], 0.05f};
+            Vector3 a = {e->pts_x[j], e->pts_y[j], 0.05f};
+            Vector3 b = {e->pts_x[j + 1], e->pts_y[j + 1], 0.05f};
             if (e->type == ROAD_EDGE) {
                 draw_road_edge(env, a.x, a.y, b.x, b.y);
                 rlSetLineWidth(2.0f);
@@ -107,29 +97,17 @@ static void draw_network(Drive* env, int agent_slot) {
         }
     }
 
-    int ego_entity = env->active_agent_indices[agent_slot];
-    for (int i = 0; i < env->num_entities; i++) {
+    for (int i = 0; i < env->active_agent_count; i++) {
         Entity* e = &env->entities[i];
-        if (e->type != VEHICLE && e->type != PEDESTRIAN && e->type != CYCLIST) continue;
-        if (!is_tracked_vehicle(env, i) || e->respawn_timestep != -1) continue;
+        if (e->type != VEHICLE || e->respawn_timestep != -1) continue;
         if (e->x == INVALID_POSITION || e->y == INVALID_POSITION) continue;
-        Color color = (Color){150, 150, 150, 255};
-        int active_slot = -1;
-        for (int j = 0; j < env->active_agent_count; j++) {
-            if (env->active_agent_indices[j] == i) {
-                active_slot = j;
-                break;
-            }
-        }
-        if (active_slot >= 0) color = BLUE;
-        if (i == ego_entity) color = EGO_COLOR;
+        Color color = (i == agent_slot) ? EGO_COLOR : BLUE;
         draw_oriented_box(e->x, e->y, e->heading_x, e->heading_y,
                           e->length * 0.5f, e->width * 0.5f,
                           Fade(color, 0.55f), color, 0.6f);
-        if (active_slot >= 0) {
-            Color goal = (i == ego_entity) ? LIGHTBLUE : DARKGREEN;
-            DrawSphere((Vector3){e->goal_position_x, e->goal_position_y, 0.4f}, 1.2f, goal);
-        }
+        Color goal = (i == agent_slot) ? LIGHTBLUE : DARKGREEN;
+        DrawSphere((Vector3){e->goal_position_x, e->goal_position_y, 0.4f},
+            1.2f, goal);
     }
 }
 
@@ -137,8 +115,7 @@ static void draw_network(Drive* env, int agent_slot) {
 // drawn features reach, so the camera can contain the goal.
 static float draw_observation(Drive* env, int agent_slot, int* edges_out, int* partners_out) {
     float* obs = env->agents[agent_slot].observations;
-    int entity_index = env->active_agent_indices[agent_slot];
-    Entity* ego = &env->entities[entity_index];
+    Entity* ego = &env->entities[agent_slot];
     float px = ego->x;
     float py = ego->y;
     float hx = ego->heading_x;
@@ -295,7 +272,7 @@ static void render_pair(Drive* env, int agent_slot, const char* network_path, co
     float max_x = env->map_corners[2];
     float max_y = env->map_corners[3];
     for (int i = 0; i < env->active_agent_count; i++) {
-        Entity* e = &env->entities[env->active_agent_indices[i]];
+        Entity* e = &env->entities[i];
         if (e->x < min_x) min_x = e->x;
         if (e->y < min_y) min_y = e->y;
         if (e->x > max_x) max_x = e->x;
@@ -358,7 +335,7 @@ static void render_pair(Drive* env, int agent_slot, const char* network_path, co
 
     int obs_px = 1280;
     RenderTexture2D obs_target = LoadRenderTexture(obs_px, obs_px);
-    Entity* ego = &env->entities[env->active_agent_indices[agent_slot]];
+    Entity* ego = &env->entities[agent_slot];
     BeginTextureMode(obs_target);
     ClearBackground(ROAD_COLOR);
     Camera3D obs_cam = ortho_camera(ego->x, ego->y, half * 2.0f);
@@ -374,8 +351,8 @@ static void render_pair(Drive* env, int agent_slot, const char* network_path, co
     export_texture(obs_target, obs_path);
     UnloadRenderTexture(obs_target);
 
-    printf("agent_slot=%d entity=%d pos=(%.1f, %.1f) heading=%.3f\n",
-           agent_slot, env->active_agent_indices[agent_slot], ego->x, ego->y, ego->heading);
+    printf("agent_slot=%d pos=(%.1f, %.1f) heading=%.3f\n",
+           agent_slot, ego->x, ego->y, ego->heading);
     printf("obs road slots: lane=%d line=%d edge=%d other=%d empty=%d drawn_edges=%d partners=%d\n",
            lane, line, edge_slots, other, empty, edges, partners);
     printf("goal_ego=(%.1f, %.1f) reach=%.1f m  drawn_reach=%.1f m  frame_diameter=%.1f m\n",
@@ -416,6 +393,7 @@ static void load_env(Drive* env, const char* data_dir, int map_id) {
     Dict* env_sec = puf_ini_section(&ini, "env", 0);
     memset(env, 0, sizeof(*env));
     puf_init(env, env_sec);
+    env->drive_mode = DRIVE_MODE_INFERENCE;
 
     size_t n_obs = (size_t)env->num_agents * (size_t)OBS_SIZE;
     obs_t* observations = calloc(n_obs > 0 ? n_obs : 1, sizeof(obs_t));
@@ -468,11 +446,7 @@ int main(int argc, char** argv) {
     const char* slash = strrchr(data_dir, '/');
     const char* base = slash ? slash + 1 : data_dir;
     char stem[64];
-    if (random_map || strncmp(base, "womd", 4) == 0) {
-        snprintf(stem, sizeof(stem), "waymo_map_%03d", map_id);
-    } else {
-        snprintf(stem, sizeof(stem), "%s", base);
-    }
+    snprintf(stem, sizeof(stem), "%s", base);
     char network_path[512];
     char obs_path[512];
     snprintf(network_path, sizeof(network_path), "%s/%s_network.png", out_dir, stem);

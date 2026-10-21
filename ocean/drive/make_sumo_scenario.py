@@ -314,7 +314,8 @@ def build():
     made, next_id = road_features(edges, "road_edge", ROAD_EDGE_BOUNDARY, next_id)
     roads.extend(made)
 
-    # Last object is the primary agent (the env treats num_objects - 1 as the SDC).
+    # Dummy tracks keep the old binary layout. The env skips them and
+    # places cars from the roadgraph.
     specs = [
         (right, 70.0, 20.0, 150.0),
         (right, 180.0, 20.0, 150.0),

@@ -1,4 +1,4 @@
-// Structured vehicle initialization (env.agent_initialization = 1).
+// Vehicle placement from the roadgraph and the [env] flows.
 //
 // The [env] keys play the role of a SUMO route file:
 //   vtype_N = id,length,width,height,maxSpeed
@@ -11,9 +11,12 @@
 // A flow emits one vehicle every 3600/vehsPerHour seconds from begin up to
 // end. Placement puts down the vehicles that would still be on the route at
 // time `end` if each had held depart speed with no car-following and no lane
-// changes. departSpeed "desired" and "max" use min(vType maxSpeed, lane speed)
-// on each lane; there is no leader yet, so "max" matches "desired". departPos
-// is SUMO's default "base" (front bumper at length + 0.1 m).
+// changes. A station whose box overlaps a car already placed is slid along
+// the route to the nearest clear point, upstream first. That box is the one
+// collision_check uses. departSpeed "desired" and "max" use min(vType
+// maxSpeed, lane speed) on each lane; there is no leader yet, so "max"
+// matches "desired". departPos is SUMO's default "base" (front bumper at
+// length + 0.1 m).
 //
 // Train keeps that warm start. Each reset samples a goal from 40 m ahead
 // to the route end, and a car that arrives respawns at its own spawn.
@@ -39,16 +42,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define FLOW_MAX 16
-#define FLOW_MAX_EDGES 16
-#define FLOW_MAX_LANES 16
-#define FLOW_NAME 64
-#define DEPART_POS_EPS 0.1f
-// Center-to-center gap required at the entrance. length 4.3 + minGap 2.8.
-#define FLOW_INSERT_GAP 8.0f
-// Departures held while the entrance is blocked or every slot is full.
-#define FLOW_QUEUE 32
 
 enum {
     LANE_SPLIT = 0,
@@ -153,8 +146,8 @@ typedef struct {
     const VTypeSpec* vtype;
 } SpawnVeh;
 
-// Routes kept after placement. s0 is the spawn arc. Goals are sampled
-// from it at reset. The bicycle model does not integrate along the path.
+// Routes kept after placement. s0 is the spawn arc. Reset samples the
+// position and the goal from it. The bicycle does not follow the path.
 typedef struct {
     FlowPath* paths;
     int npaths;
@@ -886,47 +879,15 @@ static void allocate_slots(const int* natural, int n, int cap, int* out) {
     }
 }
 
-static float* one_float(float v) {
-    float* p = (float*)malloc(sizeof(float));
-    if (!p) {
-        perror("malloc");
-        exit(1);
-    }
-    *p = v;
-    return p;
-}
-
-static int* one_int(int v) {
-    int* p = (int*)malloc(sizeof(int));
-    if (!p) {
-        perror("malloc");
-        exit(1);
-    }
-    *p = v;
-    return p;
-}
-
 static void fill_vehicle(Entity* e, const SpawnVeh* s) {
     memset(e, 0, sizeof(*e));
     const VTypeSpec* vt = s->vtype;
-    float heading = normalize_heading(s->heading);
     e->type = VEHICLE;
-    e->array_size = 1;
-    e->traj_x = one_float(s->x);
-    e->traj_y = one_float(s->y);
-    e->traj_z = one_float(0);
-    e->traj_vx = one_float(s->speed * cosf(heading));
-    e->traj_vy = one_float(s->speed * sinf(heading));
-    e->traj_vz = one_float(0);
-    e->traj_heading = one_float(heading);
-    e->traj_valid = one_int(1);
-    e->width = vt->width;
-    e->length = vt->length;
+    e->width = vt->width * COLLISION_BOX_SCALE;
+    e->length = vt->length * COLLISION_BOX_SCALE;
     e->height = vt->height;
-    e->goal_position_x = s->goal_x;
-    e->goal_position_y = s->goal_y;
-    e->goal_position_z = 0;
-    e->mark_as_expert = 0;
+    e->active_agent = 1;
+    e->valid = 1;
     e->respawn_timestep = -1;
     e->max_speed = s->max_speed;
 }
@@ -1119,26 +1080,63 @@ static void route_shift(Drive* env) {
     }
 }
 
+static int route_pose(Drive* env, int agent, float s,
+        float* x, float* y, float* h) {
+    FlowRoutes* lanes = (FlowRoutes*)env->lane_state;
+    if (!lanes || agent < 0 || agent >= lanes->nveh) return 0;
+    int pi = lanes->path_of[agent];
+    if (pi < 0 || pi >= lanes->npaths) return 0;
+    return path_sample(&lanes->paths[pi], s, x, y, h);
+}
+
+// Spawn station on this car's route. Reset and respawn both start here.
+static int spawn_pose(Drive* env, int agent, float* x, float* y, float* h) {
+    FlowRoutes* lanes = (FlowRoutes*)env->lane_state;
+    if (!lanes || agent < 0 || agent >= lanes->nveh) return 0;
+    return route_pose(env, agent, lanes->s0[agent], x, y, h);
+}
+
+// Place every car by sampling its route at the spawn station. The goal
+// is sampled next, in the same centered frame. No pose is kept from the
+// previous episode.
+static void sample_initial_positions(Drive* env) {
+    FlowRoutes* lanes = (FlowRoutes*)env->lane_state;
+    if (!lanes) return;
+    int n = env->active_agent_count;
+    if (n > lanes->nveh) n = lanes->nveh;
+    for (int i = 0; i < n; i++) {
+        float x, y, h;
+        if (!spawn_pose(env, i, &x, &y, &h)) continue;
+        Entity* e = &env->entities[i];
+        h = normalize_heading(h);
+        e->x = x;
+        e->y = y;
+        e->z = 0.0f;
+        e->heading = h;
+        e->heading_x = cosf(h);
+        e->heading_y = sinf(h);
+        e->origin_x = x;
+        e->origin_y = y;
+        e->vx = 0.0f;
+        e->vy = 0.0f;
+        e->vz = 0.0f;
+        e->prev_accel = 0.0f;
+        e->prev_steer = 0.0f;
+    }
+}
+
 // Train draws a goal from 40 m ahead to the route end, so some trips
 // are short and some run the length of the road. Inference puts every
 // goal on the last point of that car's route. path_sample is centered.
 static void assign_episode_goals(Drive* env) {
     FlowRoutes* lanes = (FlowRoutes*)env->lane_state;
-    if (!lanes || env->agent_initialization != AGENT_INIT_STRUCTURED) {
-        return;
-    }
+    if (!lanes) return;
     int inference = env->drive_mode == DRIVE_MODE_INFERENCE;
     int n = env->active_agent_count;
-    if (n > lanes->nveh) {
-        n = lanes->nveh;
-    }
+    if (n > lanes->nveh) n = lanes->nveh;
     for (int i = 0; i < n; i++) {
-        int agent = env->active_agent_indices[i];
-        if (agent < 0 || agent >= lanes->nveh) {
-            continue;
-        }
-        FlowPath* path = &lanes->paths[lanes->path_of[agent]];
-        float s0 = lanes->s0[agent];
+        FlowPath* path = &lanes->paths[lanes->path_of[i]];
+        float s0 = lanes->s0[i];
         float s_far = path->len;
         float goal_s = s_far;
         if (!inference) {
@@ -1153,7 +1151,7 @@ static void assign_episode_goals(Drive* env) {
         if (!path_sample(path, goal_s, &gx, &gy, &gh)) {
             continue;
         }
-        Entity* e = &env->entities[agent];
+        Entity* e = &env->entities[i];
         e->goal_position_x = gx;
         e->goal_position_y = gy;
         e->goal_position_z = 0.0f;
@@ -1221,17 +1219,13 @@ static float sample_target_speed(Drive* env, float lo, float hi) {
 // A respawn keeps the target and returns to it.
 static void assign_episode_speeds(Drive* env) {
     FlowRoutes* lanes = (FlowRoutes*)env->lane_state;
-    if (!lanes || env->agent_initialization != AGENT_INIT_STRUCTURED) {
-        return;
-    }
+    if (!lanes) return;
     float lo = env->sim_speed_on;
     float hi = env->sim_hi_on;
     int n = env->active_agent_count;
     if (n > lanes->nveh) n = lanes->nveh;
     for (int i = 0; i < n; i++) {
-        int agent = env->active_agent_indices[i];
-        if (agent < 0 || agent >= lanes->nveh) continue;
-        Entity* e = &env->entities[agent];
+        Entity* e = &env->entities[i];
         float v = sample_target_speed(env, lo, hi);
         e->max_speed = v;
         e->vx = v * e->heading_x;
@@ -1330,11 +1324,7 @@ static int flow_gap_clear(Drive* env, float x, float y) {
         n = DRIVE_AGENT_MAX;
     }
     for (int i = 0; i < n; i++) {
-        int idx = env->active_agent_indices[i];
-        if (idx < 0) {
-            continue;
-        }
-        Entity* o = &env->entities[idx];
+        Entity* o = &env->entities[i];
         if (o->x == INVALID_POSITION || o->y == INVALID_POSITION) {
             continue;
         }
@@ -1353,13 +1343,7 @@ static int flow_free_slot(Drive* env) {
         n = DRIVE_AGENT_MAX;
     }
     for (int i = 0; i < n; i++) {
-        int idx = env->active_agent_indices[i];
-        if (idx < 0) {
-            continue;
-        }
-        if (env->entities[idx].x == INVALID_POSITION) {
-            return i;
-        }
+        if (env->entities[i].x == INVALID_POSITION) return i;
     }
     return -1;
 }
@@ -1411,7 +1395,7 @@ static void flow_inject(Drive* env) {
                 continue;
             }
             (void)gh;
-            int agent = env->active_agent_indices[slot];
+            int agent = slot;
             Entity* e = &env->entities[agent];
             heading = normalize_heading(heading);
             float spd = sample_target_speed(env, env->sim_speed_on, env->sim_hi_on);
@@ -1448,6 +1432,71 @@ static void flow_inject(Drive* env) {
             break;
         }
     }
+}
+
+static void spawn_box(Entity* e, float x, float y, float heading,
+        float length, float width) {
+    memset(e, 0, sizeof(*e));
+    e->x = x;
+    e->y = y;
+    e->heading = heading;
+    e->heading_x = cosf(heading);
+    e->heading_y = sinf(heading);
+    e->length = length * COLLISION_BOX_SCALE;
+    e->width = width * COLLISION_BOX_SCALE;
+}
+
+static int spawn_blocked(const SpawnVeh* done, int n,
+        float x, float y, float heading, const VTypeSpec* vt) {
+    Entity a;
+    Entity b;
+    spawn_box(&a, x, y, heading, vt->length, vt->width);
+    for (int i = 0; i < n; i++) {
+        const VTypeSpec* ot = done[i].vtype;
+        if (!ot) continue;
+        spawn_box(&b, done[i].x, done[i].y, done[i].heading,
+            ot->length, ot->width);
+        if (check_aabb_collision(&a, &b)) return 1;
+    }
+    return 0;
+}
+
+// Nearest station to s_pref whose box misses every car already placed.
+// The free-flow station is kept when it is already clear. Otherwise the
+// search steps upstream, then downstream.
+static int spawn_clear_station(const FlowPath* path, float s_pref,
+        float goal_dist, const SpawnVeh* done, int n,
+        const VTypeSpec* vt, float* s_out, float* ox, float* oy,
+        float* oh) {
+    const float step = 1.0f;
+    int limit = (int)(path->len / step);
+    if (limit < 1) limit = 1;
+    if (limit > 4000) limit = 4000;
+    for (int k = 0; k <= limit * 2; k++) {
+        float s = s_pref;
+        if (k > 0) {
+            int mag = (k + 1) / 2;
+            if ((k & 1) != 0) s = s_pref - (float)mag * step;
+            else s = s_pref + (float)mag * step;
+        }
+        if (s < 0.0f || s > path->len) continue;
+        float x, y, h, gx, gy, gh;
+        if (!path_sample(path, s, &x, &y, &h)) continue;
+        float goal_s = s + goal_dist;
+        if (goal_s > path->len) goal_s = path->len;
+        if (!path_sample(path, goal_s, &gx, &gy, &gh)) continue;
+        (void)gh;
+        float dx = gx - x;
+        float dy = gy - y;
+        if (sqrtf(dx * dx + dy * dy) < MIN_DISTANCE_TO_GOAL) continue;
+        if (spawn_blocked(done, n, x, y, h, vt)) continue;
+        *s_out = s;
+        *ox = x;
+        *oy = y;
+        *oh = h;
+        return 1;
+    }
+    return 0;
 }
 
 static void spawn_flow_vehicles(Drive* env) {
@@ -1552,6 +1601,7 @@ static void spawn_flow_vehicles(Drive* env) {
         path_count += plans[f].npaths;
     }
     int written = 0;
+    int shifted = 0;
     for (int f = 0; f < nf; f++) {
         if (alloc[f] <= 0) continue;
         FlowPlan* plan = &plans[f];
@@ -1568,13 +1618,18 @@ static void spawn_flow_vehicles(Drive* env) {
             // Lane speed places the car. Reset assigns the target.
             float center_s = 0;
             if (!path_move(path, center0, age, MAX_SPEED, &center_s)) continue;
-            float goal_s = center_s + goal_dist;
-            if (goal_s > path->len) goal_s = path->len;
-            float x, y, heading, gx, gy, goal_heading;
-            if (!path_sample(path, center_s, &x, &y, &heading) ||
-                !path_sample(path, goal_s, &gx, &gy, &goal_heading)) {
+            float fit_s = center_s;
+            float x, y, heading;
+            if (!spawn_clear_station(path, center_s, goal_dist,
+                    spawns, written, vt,
+                    &fit_s, &x, &y, &heading)) {
                 continue;
             }
+            if (fit_s != center_s) shifted++;
+            float goal_s = fit_s + goal_dist;
+            if (goal_s > path->len) goal_s = path->len;
+            float gx, gy, goal_heading;
+            if (!path_sample(path, goal_s, &gx, &gy, &goal_heading)) continue;
             (void)goal_heading;
             float dx = gx - x;
             float dy = gy - y;
@@ -1583,13 +1638,13 @@ static void spawn_flow_vehicles(Drive* env) {
             s->x = x;
             s->y = y;
             s->heading = heading;
-            s->speed = path_speed_at(path, center_s, MAX_SPEED);
+            s->speed = path_speed_at(path, fit_s, MAX_SPEED);
             s->max_speed = 0.0f;
             s->goal_x = gx;
             s->goal_y = gy;
             s->flow = f;
             s->path = path_off[f] + lane_i;
-            s->along = center_s;
+            s->along = fit_s;
             s->age = age;
             s->vtype = vt;
         }
@@ -1606,6 +1661,10 @@ static void spawn_flow_vehicles(Drive* env) {
         flow_init_logged = 1;
         printf("structured init: %d vehicles (demand %d, cap %d) from %s\n",
             nspawn, demand, cap, net_path);
+        if (shifted > 0) {
+            printf("structured init: moved %d vehicles off an overlap\n",
+                shifted);
+        }
         for (int f = 0; f < nf; f++) {
             printf("  flow %s: %d/%d  %.4g veh/h  route %s  t=%.4g..%.4g  departLane %s  departSpeed %s\n",
                 flows[f].id, alloc[f], natural[f], flows[f].vehs_per_hour, flows[f].route_id,
@@ -1620,21 +1679,7 @@ static void spawn_flow_vehicles(Drive* env) {
         exit(1);
     }
     for (int i = 0; i < nspawn; i++) fill_vehicle(&neu[i], &spawns[i]);
-    int primary = 0;
-    for (int i = 1; i < nspawn; i++) {
-        int better = spawns[i].flow < spawns[primary].flow ||
-            (spawns[i].flow == spawns[primary].flow && spawns[i].age < spawns[primary].age);
-        if (better) primary = i;
-    }
-    if (primary != nspawn - 1) {
-        Entity tmp = neu[primary];
-        neu[primary] = neu[nspawn - 1];
-        neu[nspawn - 1] = tmp;
-        SpawnVeh stmp = spawns[primary];
-        spawns[primary] = spawns[nspawn - 1];
-        spawns[nspawn - 1] = stmp;
-    }
-    // Keep the routes. Reset samples a goal on each one.
+    // Entity i is agent i. Reset samples a goal on each route.
     route_bind(env, plans, nf, spawns, nspawn, flows, base_vph);
     if (nroads > 0) {
         memcpy(neu + nspawn, env->entities + env->num_objects, (size_t)nroads * sizeof(Entity));
@@ -1644,6 +1689,7 @@ static void spawn_flow_vehicles(Drive* env) {
     env->entities = neu;
     env->num_objects = nspawn;
     env->num_entities = nspawn + nroads;
+    env->active_agent_count = nspawn;
 
     free(spawns);
     for (int f = 0; f < nf; f++) plan_free(&plans[f]);

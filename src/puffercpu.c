@@ -935,6 +935,9 @@ int main(int argc, char** argv) {
     Env env = {0};
     puf_init(&env, env_sec);
 #ifdef PUF_HAS_AGENT_SLIDER
+    // puf_init leaves train mode. The viewer is inference: route-end goals
+    // and the insertion clock, applied by the reset below.
+    env.drive_mode = DRIVE_MODE_INFERENCE;
     env.checkpoint_ok = have_net;
     if (!have_net) {
         if (!path) {
