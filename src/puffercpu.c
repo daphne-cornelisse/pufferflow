@@ -594,56 +594,6 @@ void forward_puffernet(PufferNet* net, float* observations, float* actions,
     }
 }
 
-static Linear* linear_rebatch(Linear* layer, int batch_size) {
-    if (!layer || layer->batch_size == batch_size) return layer;
-    size_t bytes = (size_t)batch_size * (size_t)layer->output_dim * sizeof(float);
-    Linear* next = calloc(1, sizeof(Linear) + bytes);
-    if (!next) {
-        perror("calloc");
-        exit(1);
-    }
-    next->output = (float*)(next + 1);
-    next->weights = layer->weights;
-    next->batch_size = batch_size;
-    next->input_dim = layer->input_dim;
-    next->output_dim = layer->output_dim;
-    free(layer);
-    return next;
-}
-
-static void mingru_rebatch(MinGRU* layer, int batch_size) {
-    if (!layer) return;
-    int H = layer->hidden_size;
-    int L = layer->num_layers;
-    if (layer->batch_size != batch_size) {
-        free(layer->state);
-        free(layer->output);
-        layer->state = calloc((size_t)L * (size_t)batch_size * (size_t)H,
-            sizeof(float));
-        layer->output = calloc((size_t)batch_size * (size_t)H, sizeof(float));
-        if (!layer->state || !layer->output) {
-            perror("calloc");
-            exit(1);
-        }
-        layer->batch_size = batch_size;
-        for (int l = 0; l < L; l++) {
-            layer->proj[l] = linear_rebatch(layer->proj[l], batch_size);
-        }
-    } else {
-        memset(layer->state, 0,
-            (size_t)L * (size_t)batch_size * (size_t)H * sizeof(float));
-    }
-}
-
-static void puffernet_set_agents(PufferNet* net, int num_agents) {
-    if (!net || num_agents < 1) return;
-    net->encoder = linear_rebatch(net->encoder, num_agents);
-    net->decoder = linear_rebatch(net->decoder, num_agents);
-    mingru_rebatch(net->mingru, num_agents);
-    if (net->multidiscrete) net->multidiscrete->batch_size = num_agents;
-    net->num_agents = num_agents;
-}
-
 void free_puffernet(PufferNet* net) {
     free(net->obs);
     free(net->encoder);
@@ -688,9 +638,9 @@ static int puffernet_weight_count(int input_dim, int hidden, int layers,
     return n;
 }
 
-#ifdef MAX_OBS_AGENTS
+#ifdef MAX_AGENTS
 // An old checkpoint has 7 ego features and 63 partners (973 inputs).
-// The current net adds the max-speed feature and one partner slot.
+// The current net adds one open ego slot and one partner slot.
 // Both inserts are zero, so that policy's actions stay put.
 static Weights* puf_widen_partner_ckpt(Weights* weights, int hidden,
         int layers, const int act_sizes[], int num_actions,
@@ -698,13 +648,13 @@ static Weights* puf_widen_partner_ckpt(Weights* weights, int hidden,
     const int legacy_ego = 7;
     const int legacy_partners = 63;
     if (EGO_FEATURES < legacy_ego) return weights;
-    if (MAX_OBS_AGENTS < legacy_partners) return weights;
+    if (MAX_AGENTS < legacy_partners) return weights;
     int legacy_in = legacy_ego
         + PARTNER_FEATURES * legacy_partners
         + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
     int ego_insert = EGO_FEATURES - legacy_ego;
     int partner_insert =
-        (MAX_OBS_AGENTS - legacy_partners) * PARTNER_FEATURES;
+        (MAX_AGENTS - legacy_partners) * PARTNER_FEATURES;
     if (OBS_SIZE != legacy_in + ego_insert + partner_insert) {
         return weights;
     }
@@ -894,7 +844,7 @@ int main(int argc, char** argv) {
 #else
     int need = puffernet_weight_count(OBS_SIZE, hidden_size, num_layers,
         act_sizes, num_actions);
-#ifdef MAX_OBS_AGENTS
+#ifdef MAX_AGENTS
     if (weights && file_floats + 7 < need) {
         weights = puf_widen_partner_ckpt(weights, hidden_size, num_layers,
             act_sizes, num_actions, file_floats);
@@ -934,10 +884,7 @@ int main(int argc, char** argv) {
 
     Env env = {0};
     puf_init(&env, env_sec);
-#ifdef PUF_HAS_AGENT_SLIDER
-    // puf_init leaves train mode. The viewer is inference: route-end goals
-    // and the insertion clock, applied by the reset below.
-    env.drive_mode = DRIVE_MODE_INFERENCE;
+#ifdef PUF_HAS_SIM_CONTROL
     env.checkpoint_ok = have_net;
     if (!have_net) {
         if (!path) {
@@ -1059,81 +1006,6 @@ int main(int argc, char** argv) {
         int ticks = 1;
         if (!headless && !recording) {
             puf_sim_poll(&env);
-#ifdef PUF_HAS_AGENT_SLIDER
-            if (env.sim_agents_apply || env.sim_speed_apply
-                    || env.sim_hi_apply) {
-                if (env.sim_speed_apply || env.sim_hi_apply) {
-                    env.sim_speed_on = env.sim_speed_req;
-                    if (env.sim_speed_on < SIM_SPEED_MIN) {
-                        env.sim_speed_on = SIM_SPEED_MIN;
-                    }
-                    if (env.sim_speed_on > MAX_SPEED) {
-                        env.sim_speed_on = MAX_SPEED;
-                    }
-                    env.sim_hi_on = env.sim_hi_req;
-                    if (env.sim_hi_on < SIM_SPEED_MIN) {
-                        env.sim_hi_on = SIM_SPEED_MIN;
-                    }
-                    if (env.sim_hi_on > MAX_SPEED) {
-                        env.sim_hi_on = MAX_SPEED;
-                    }
-                    env.sim_speed_apply = 0;
-                    env.sim_hi_apply = 0;
-                }
-                int req = env.sim_agents_apply
-                    ? env.sim_agents_req : env.sim_agents_on;
-                if (req < 1) req = 1;
-                if (req > DRIVE_AGENT_MAX) req = DRIVE_AGENT_MAX;
-                size_t n_obs_n = (size_t)req * (size_t)OBS_SIZE;
-                size_t n_atn_n = (size_t)req * (size_t)NUM_ATNS;
-                observations = realloc(observations, n_obs_n * sizeof(obs_t));
-                actions = realloc(actions, n_atn_n * sizeof(float));
-                rewards = realloc(rewards, (size_t)req * sizeof(float));
-                terminals = realloc(terminals, (size_t)req * sizeof(float));
-                masks = realloc(masks, (size_t)req * (size_t)act_n);
-#if !defined(PUF_NMMO3_NET) && !defined(PUF_ASTEROIDS_NET) && !defined(PUF_MINIMAL_NET) && !defined(PUF_CRAFTAX_NET)
-                obs_f = realloc(obs_f, n_obs_n * sizeof(float));
-                if (!obs_f) {
-                    perror("realloc");
-                    exit(1);
-                }
-                memset(obs_f, 0, n_obs_n * sizeof(float));
-#endif
-                if (!observations || !actions || !rewards
-                    || !terminals || !masks) {
-                    perror("realloc");
-                    exit(1);
-                }
-                memset(observations, 0, n_obs_n * sizeof(obs_t));
-                memset(actions, 0, n_atn_n * sizeof(float));
-                memset(rewards, 0, (size_t)req * sizeof(float));
-                memset(terminals, 0, (size_t)req * sizeof(float));
-                memset(masks, 1, (size_t)req * (size_t)act_n);
-                for (int i = 0; i < DRIVE_AGENT_MAX; i++) {
-                    env.agents[i].observations = NULL;
-                    env.agents[i].actions = NULL;
-                    env.agents[i].rewards = NULL;
-                    env.agents[i].terminals = NULL;
-                    env.agents[i].action_mask = NULL;
-                }
-                for (int i = 0; i < req; i++) {
-                    env.agents[i].observations = observations + i * OBS_SIZE;
-                    env.agents[i].actions = actions + i * NUM_ATNS;
-                    env.agents[i].rewards = rewards + i;
-                    env.agents[i].terminals = terminals + i;
-                    env.agents[i].action_mask = masks + i * act_n;
-                    env.agents[i].policy = 0;
-                }
-                puf_set_population(&env, req);
-#if !defined(PUF_NMMO3_NET) && !defined(PUF_ASTEROIDS_NET) && !defined(PUF_MINIMAL_NET) && !defined(PUF_CRAFTAX_NET)
-                if (net && env.num_agents > 0) {
-                    puffernet_set_agents(net, env.num_agents);
-                }
-#endif
-                n_obs = (size_t)env.num_agents * (size_t)OBS_SIZE;
-                sim_accum = 0.0;
-            }
-#endif
             double now = GetTime();
             ticks = 0;
             if (puf_sim_paused(&env)) {
