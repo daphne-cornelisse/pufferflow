@@ -25,6 +25,7 @@ struct Log {
     float score;
     float offroad_rate;
     float collision_rate;
+    float collision_count;
     float completion_rate;
     float n;
 };
@@ -1597,6 +1598,7 @@ void puf_step(Drive* env) {
             env->log.completion_rate += env->logs[i].completion_rate;
             env->log.offroad_rate += env->logs[i].offroad_rate;
             env->log.collision_rate += env->logs[i].collision_rate;
+            env->log.collision_count += env->logs[i].collision_count;
             env->log.score += env->logs[i].score;
             env->log.perf += env->logs[i].perf;
             env->log.episode_length += env->logs[i].episode_length;
@@ -1630,6 +1632,7 @@ void puf_step(Drive* env) {
             env->agents[i].rewards[0] = env->reward_vehicle_collision;
             env->logs[i].episode_return += env->reward_vehicle_collision;
             env->logs[i].collision_rate = 1.0f;
+            env->logs[i].collision_count += 1.0f;
         } else if (collision_state == OFFROAD) {
             env->agents[i].rewards[0] = env->reward_offroad_collision;
             env->logs[i].offroad_rate = 1.0f;
@@ -1644,7 +1647,7 @@ void puf_step(Drive* env) {
             agent->x, agent->y,
             agent->goal_position_x, agent->goal_position_y);
 
-        // Inside 1 m: pay reward_goal, then respawn with a new goal.
+        // Inside 2 m: pay reward_goal, then respawn with a new goal.
         int at_goal = distance_to_goal < MIN_DISTANCE_TO_GOAL;
         if (at_goal) {
             env->agents[i].rewards[0] += env->reward_goal;
@@ -1717,6 +1720,7 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "episode_length", log->episode_length);
     dict_set(out, "offroad_rate", log->offroad_rate);
     dict_set(out, "collision_rate", log->collision_rate);
+    dict_set(out, "collision_count", log->collision_count);
     dict_set(out, "n", log->n);
     dict_set(out, "completion_rate", log->completion_rate);
 }

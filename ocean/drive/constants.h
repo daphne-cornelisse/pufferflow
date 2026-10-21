@@ -70,7 +70,7 @@
 
 // Distance thresholds
 // Arrival radius. Inside this, the goal is counted and a new one is sampled.
-#define MIN_DISTANCE_TO_GOAL 1.0f
+#define MIN_DISTANCE_TO_GOAL 2.0f
 // Respawn pose stays within this of the upstream map edge.
 #define EARLY_ROAD 100.0f
 #define COLLISION_DIST_SQ 225.0f
