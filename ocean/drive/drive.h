@@ -115,7 +115,6 @@ struct Env {
     float world_mean_x;
     float world_mean_y;
     float reward_goal;
-    float reward_vehicle_collision_post_respawn;
     float reward_jerk;
     unsigned int rng;
     // 1 after ./drive loads a checkpoint that matches this network.
@@ -1691,7 +1690,6 @@ void puf_init(Env* env, Dict* kwargs) {
     env->reward_vehicle_collision = dict_get(kwargs, "reward_vehicle_collision");
     env->reward_offroad_collision = dict_get(kwargs, "reward_offroad_collision");
     env->reward_goal = dict_get(kwargs, "reward_goal");
-    env->reward_vehicle_collision_post_respawn = dict_get(kwargs, "reward_vehicle_collision_post_respawn");
     env->reward_jerk = dict_get(kwargs, "reward_jerk");
     env->cfg = kwargs;
     int map_id = dict_get(kwargs, "map_id");
