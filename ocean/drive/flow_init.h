@@ -15,10 +15,18 @@
 // on each lane; there is no leader yet, so "max" matches "desired". departPos
 // is SUMO's default "base" (front bumper at length + 0.1 m).
 //
+// Train keeps that warm start. Each reset samples a goal from 40 m ahead
+// to the route end, and a car that arrives respawns at its own spawn.
+// Inference (./drive) keeps the warm start too, puts every goal at the
+// route end, and keeps inserting at the entrance on the same clock.
+// A car that reaches the end leaves, which frees its slot for the next
+// insertion. The veh/h slider scales the mainline rate. Other flows keep
+// the ini ratio. The clock is SUMO's: depart_k = begin + k * 3600/vph,
+// and the first insertion is the first depart at or after `end`.
+//
 // The learned policy's bicycle model moves every car. The routes stay so
-// a reset can restore each spawn, sample one goal on that path, and
-// sample one max speed. A respawn copies the spawn pose back and keeps
-// both.
+// a reset can restore each spawn. A train respawn copies the spawn pose
+// back and keeps the goal and the max speed.
 //
 // departLane "random" and "free" assign departure lanes round-robin across
 // the first edge, shifted by env->rng, so parallel envs differ but the count
@@ -37,6 +45,10 @@
 #define FLOW_MAX_LANES 16
 #define FLOW_NAME 64
 #define DEPART_POS_EPS 0.1f
+// Center-to-center gap required at the entrance. length 4.3 + minGap 2.8.
+#define FLOW_INSERT_GAP 8.0f
+// Departures held while the entrance is blocked or every slot is full.
+#define FLOW_QUEUE 32
 
 enum {
     LANE_SPLIT = 0,
@@ -149,6 +161,18 @@ typedef struct {
     int* path_of;
     float* s0;
     int nveh;
+    // Insertion clock. base_vph is the ini rate. vph follows the slider.
+    int nflows;
+    double base_vph[FLOW_MAX];
+    double vph[FLOW_MAX];
+    double begin[FLOW_MAX];
+    double end[FLOW_MAX];
+    double next_depart[FLOW_MAX];
+    float length[FLOW_MAX];
+    int path0[FLOW_MAX];
+    int npath[FLOW_MAX];
+    int pending[FLOW_MAX];
+    int cursor[FLOW_MAX];
 } FlowRoutes;
 
 static void flow_die(const char* msg) {
@@ -1025,7 +1049,8 @@ static FlowPath path_copy(const FlowPath* src) {
     return dst;
 }
 
-static void route_bind(Drive* env, FlowPlan* plans, int nf, SpawnVeh* spawns, int nspawn) {
+static void route_bind(Drive* env, FlowPlan* plans, int nf, SpawnVeh* spawns, int nspawn,
+        const FlowSpec* flows, const double* base_vph) {
     int npaths = 0;
     for (int f = 0; f < nf; f++) npaths += plans[f].npaths;
     if (npaths <= 0) flow_die("structured init has no routes");
@@ -1044,7 +1069,14 @@ static void route_bind(Drive* env, FlowPlan* plans, int nf, SpawnVeh* spawns, in
         exit(1);
     }
     int k = 0;
+    lanes->nflows = nf;
     for (int f = 0; f < nf; f++) {
+        lanes->base_vph[f] = base_vph[f];
+        lanes->begin[f] = flows[f].begin;
+        lanes->end[f] = flows[f].end;
+        lanes->length[f] = plans[f].vtype ? plans[f].vtype->length : 4.3f;
+        lanes->path0[f] = k;
+        lanes->npath[f] = plans[f].npaths;
         for (int i = 0; i < plans[f].npaths; i++) {
             lanes->paths[k++] = path_copy(&plans[f].paths[i]);
         }
@@ -1087,15 +1119,15 @@ static void route_shift(Drive* env) {
     }
 }
 
-// One goal for the episode, on this car's own route. 40 m is close: a
-// lap at highway speed outlasts the spawn-collision grace. The route end
-// is far. The same point is kept after a respawn, so it can pay +1 again.
-// path_sample is already in the centered frame.
+// Train draws a goal from 40 m ahead to the route end, so some trips
+// are short and some run the length of the road. Inference puts every
+// goal on the last point of that car's route. path_sample is centered.
 static void assign_episode_goals(Drive* env) {
     FlowRoutes* lanes = (FlowRoutes*)env->lane_state;
     if (!lanes || env->agent_initialization != AGENT_INIT_STRUCTURED) {
         return;
     }
+    int inference = env->drive_mode == DRIVE_MODE_INFERENCE;
     int n = env->active_agent_count;
     if (n > lanes->nveh) {
         n = lanes->nveh;
@@ -1108,12 +1140,15 @@ static void assign_episode_goals(Drive* env) {
         FlowPath* path = &lanes->paths[lanes->path_of[agent]];
         float s0 = lanes->s0[agent];
         float s_far = path->len;
-        float s_near = s0 + 40.0f;
-        if (s_near > s_far) {
-            s_near = s_far;
+        float goal_s = s_far;
+        if (!inference) {
+            float s_near = s0 + 40.0f;
+            if (s_near > s_far) {
+                s_near = s_far;
+            }
+            float u = (float)(rand_r(&env->rng) % 10001) / 10000.0f;
+            goal_s = s_near + u * (s_far - s_near);
         }
-        float u = (float)(rand_r(&env->rng) % 10001) / 10000.0f;
-        float goal_s = s_near + u * (s_far - s_near);
         float gx, gy, gh;
         if (!path_sample(path, goal_s, &gx, &gy, &gh)) {
             continue;
@@ -1204,6 +1239,217 @@ static void assign_episode_speeds(Drive* env) {
     }
 }
 
+// Slider rate onto each flow. Flow 0 is the mainline. The rest keep
+// base_vph[f] / base_vph[0].
+static void flow_write_rates(FlowRoutes* lanes, int main_vph) {
+    double base0 = lanes->nflows > 0 ? lanes->base_vph[0] : 0;
+    double scale = 0;
+    if (base0 > 1e-6 && main_vph > 0) {
+        scale = (double)main_vph / base0;
+    }
+    for (int f = 0; f < lanes->nflows; f++) {
+        lanes->vph[f] = lanes->base_vph[f] * scale;
+    }
+}
+
+// First depart is the first SUMO slot at or after the warm-start time.
+// That is one period after the youngest car already on the road.
+static void flow_schedule_reset(Drive* env) {
+    FlowRoutes* lanes = (FlowRoutes*)env->lane_state;
+    if (!lanes || lanes->nflows <= 0) {
+        return;
+    }
+    int main = env->sim_vph_on;
+    if (main < 0) {
+        main = 0;
+    }
+    if (main > DRIVE_VPH_MAX) {
+        main = DRIVE_VPH_MAX;
+    }
+    flow_write_rates(lanes, main);
+    for (int f = 0; f < lanes->nflows; f++) {
+        lanes->pending[f] = 0;
+        lanes->cursor[f] = 0;
+        double vph = lanes->vph[f];
+        if (vph <= 1e-6) {
+            lanes->next_depart[f] = 1e300;
+            continue;
+        }
+        double period = 3600.0 / vph;
+        double span = lanes->end[f] - lanes->begin[f];
+        double k = ceil(span / period - 1e-9);
+        double next = lanes->begin[f] + k * period;
+        double delay = next - lanes->end[f];
+        if (delay < 0) {
+            delay = 0;
+        }
+        lanes->next_depart[f] = delay;
+    }
+    if (env->drive_mode == DRIVE_MODE_INFERENCE && !env->stream_banner) {
+        env->stream_banner = 1;
+        fprintf(stderr, "inference: goals at the route end, insert");
+        for (int f = 0; f < lanes->nflows; f++) {
+            fprintf(stderr, " %.0f", lanes->vph[f]);
+        }
+        fprintf(stderr, " veh/h\n");
+    }
+}
+
+// Live demand change. The cars already on the road stay. The next
+// entrance attempt is one period from now, so a drag does not dump a queue.
+static void flow_set_vph(Drive* env, int main_vph) {
+    if (main_vph < 0) {
+        main_vph = 0;
+    }
+    if (main_vph > DRIVE_VPH_MAX) {
+        main_vph = DRIVE_VPH_MAX;
+    }
+    env->sim_vph_req = main_vph;
+    env->sim_vph_on = main_vph;
+    FlowRoutes* lanes = (FlowRoutes*)env->lane_state;
+    if (!lanes || lanes->nflows <= 0) {
+        return;
+    }
+    flow_write_rates(lanes, main_vph);
+    double now = (double)env->timestep * (double)SIM_DT;
+    for (int f = 0; f < lanes->nflows; f++) {
+        lanes->pending[f] = 0;
+        double vph = lanes->vph[f];
+        if (vph <= 1e-6) {
+            lanes->next_depart[f] = 1e300;
+            continue;
+        }
+        lanes->next_depart[f] = now + 3600.0 / vph;
+    }
+}
+
+static int flow_gap_clear(Drive* env, float x, float y) {
+    float lim = FLOW_INSERT_GAP * FLOW_INSERT_GAP;
+    int n = env->active_agent_count;
+    if (n > DRIVE_AGENT_MAX) {
+        n = DRIVE_AGENT_MAX;
+    }
+    for (int i = 0; i < n; i++) {
+        int idx = env->active_agent_indices[i];
+        if (idx < 0) {
+            continue;
+        }
+        Entity* o = &env->entities[idx];
+        if (o->x == INVALID_POSITION || o->y == INVALID_POSITION) {
+            continue;
+        }
+        float dx = o->x - x;
+        float dy = o->y - y;
+        if (dx * dx + dy * dy < lim) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int flow_free_slot(Drive* env) {
+    int n = env->active_agent_count;
+    if (n > DRIVE_AGENT_MAX) {
+        n = DRIVE_AGENT_MAX;
+    }
+    for (int i = 0; i < n; i++) {
+        int idx = env->active_agent_indices[i];
+        if (idx < 0) {
+            continue;
+        }
+        if (env->entities[idx].x == INVALID_POSITION) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// One due vehicle per flow, at the route start, if a slot is free and
+// the entrance has FLOW_INSERT_GAP of room. SUMO would queue the rest.
+static void flow_inject(Drive* env) {
+    FlowRoutes* lanes = (FlowRoutes*)env->lane_state;
+    if (!lanes || env->drive_mode != DRIVE_MODE_INFERENCE) {
+        return;
+    }
+    double now = (double)env->timestep * (double)SIM_DT;
+    for (int f = 0; f < lanes->nflows; f++) {
+        double vph = lanes->vph[f];
+        if (vph <= 1e-6 || lanes->npath[f] <= 0) {
+            continue;
+        }
+        double period = 3600.0 / vph;
+        while (lanes->pending[f] < FLOW_QUEUE
+                && now + 1e-9 >= lanes->next_depart[f]) {
+            lanes->pending[f]++;
+            lanes->next_depart[f] += period;
+        }
+        if (lanes->pending[f] <= 0) {
+            continue;
+        }
+        int slot = flow_free_slot(env);
+        if (slot < 0) {
+            continue;
+        }
+        int npath = lanes->npath[f];
+        for (int k = 0; k < npath; k++) {
+            int lane_i = (lanes->cursor[f] + k) % npath;
+            int pi = lanes->path0[f] + lane_i;
+            if (pi < 0 || pi >= lanes->npaths) {
+                continue;
+            }
+            FlowPath* path = &lanes->paths[pi];
+            float center0 = lanes->length[f] * 0.5f + DEPART_POS_EPS;
+            float x, y, heading;
+            if (!path_sample(path, center0, &x, &y, &heading)) {
+                continue;
+            }
+            if (!flow_gap_clear(env, x, y)) {
+                continue;
+            }
+            float gx, gy, gh;
+            if (!path_sample(path, path->len, &gx, &gy, &gh)) {
+                continue;
+            }
+            (void)gh;
+            int agent = env->active_agent_indices[slot];
+            Entity* e = &env->entities[agent];
+            heading = normalize_heading(heading);
+            float spd = sample_target_speed(env, env->sim_speed_on, env->sim_hi_on);
+            e->x = x;
+            e->y = y;
+            e->z = 0;
+            e->heading = heading;
+            e->heading_x = cosf(heading);
+            e->heading_y = sinf(heading);
+            e->max_speed = spd;
+            e->vx = spd * e->heading_x;
+            e->vy = spd * e->heading_y;
+            e->vz = 0;
+            e->goal_position_x = gx;
+            e->goal_position_y = gy;
+            e->goal_position_z = 0;
+            e->origin_x = x;
+            e->origin_y = y;
+            e->reached_goal = 0;
+            e->collided_before_goal = 0;
+            e->reached_goal_this_episode = 0;
+            e->collision_state = NO_COLLISION;
+            e->prev_accel = 0;
+            e->prev_steer = 0;
+            e->respawn_timestep = env->timestep;
+            e->valid = 1;
+            if (agent < lanes->nveh) {
+                lanes->path_of[agent] = pi;
+                lanes->s0[agent] = center0;
+            }
+            lanes->cursor[f] = lane_i + 1;
+            lanes->pending[f]--;
+            env->stream_in++;
+            break;
+        }
+    }
+}
+
 static void spawn_flow_vehicles(Drive* env) {
     if (!env->cfg) flow_die("missing env config");
     char net_path[512];
@@ -1257,6 +1503,22 @@ static void spawn_flow_vehicles(Drive* env) {
         }
     }
 
+    double base_vph[FLOW_MAX];
+    for (int f = 0; f < nf; f++) {
+        base_vph[f] = flows[f].vehs_per_hour;
+    }
+    if (!env->sim_vph_ready && nf > 0) {
+        int v = (int)(base_vph[0] + 0.5);
+        if (v < 0) {
+            v = 0;
+        }
+        if (v > DRIVE_VPH_MAX) {
+            v = DRIVE_VPH_MAX;
+        }
+        env->sim_vph_on = v;
+        env->sim_vph_req = v;
+        env->sim_vph_ready = 1;
+    }
     FlowPlan plans[FLOW_MAX];
     memset(plans, 0, sizeof(plans));
     int natural[FLOW_MAX];
@@ -1373,7 +1635,7 @@ static void spawn_flow_vehicles(Drive* env) {
         spawns[nspawn - 1] = stmp;
     }
     // Keep the routes. Reset samples a goal on each one.
-    route_bind(env, plans, nf, spawns, nspawn);
+    route_bind(env, plans, nf, spawns, nspawn, flows, base_vph);
     if (nroads > 0) {
         memcpy(neu + nspawn, env->entities + env->num_objects, (size_t)nroads * sizeof(Entity));
     }
