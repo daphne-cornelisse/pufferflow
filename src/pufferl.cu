@@ -1126,13 +1126,13 @@ static void* vec_thread_main(void* arg) {
     int* state = &vec->worker_state[buf];
     int horizon = pufferl->hypers.horizon;
     cudaSetDevice(pufferl->hypers.gpu_id);
-    cublas_init_handle();
     int apb = vec->agents_per_buf;
     int agent_start = buf * apb;
     int env_start = vec->env_starts[buf];
     int env_count = vec->env_counts[buf];
     Env* envs = vec->envs;
     cudaStream_t stream = pufferl->streams[buf];
+    cublas_init_stream(stream);
     cudaEvent_t ev[NUM_EV];
     for (int i = 0; i < NUM_EV; i++) {
         cudaEventCreate(&ev[i]);
@@ -1924,6 +1924,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     } else {
         assert(cudaStreamCreate(&pufferl->train_stream) == cudaSuccess);
     }
+    cublas_init_stream(pufferl->train_stream);
 
     Allocator* acts = &pufferl->activ_alloc;
     Allocator* grads = &pufferl->grads_alloc;
@@ -2072,6 +2073,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         } else {
             assert(cudaStreamCreate(&pufferl->streams[i]) == cudaSuccess);
         }
+    }
+    // CPU rollout workers register their streams in vec_thread_main.
+    if (PUF_BACKEND == PUF_GPU) {
+        cublas_init_stream(pufferl->streams[0]);
     }
 
     env_start(pufferl);
@@ -2562,28 +2567,6 @@ typedef struct {
     TrainResult result;
 } SweepJob;
 
-// Flat policy weights for this env: encoder, MinGRU, and the decoder
-// value head. Matches weights_create. num_layers is truncated, same as train.
-static long policy_param_count(int hidden, int layers) {
-    int act_sizes[] = ACT_SIZES;
-    int act_n = 0;
-    int n_cont = 0;
-    for (int i = 0; i < NUM_ATNS; i++) {
-        if (act_sizes[i] == 1) {
-            n_cont++;
-        }
-        act_n += act_sizes[i];
-    }
-    int decoder_out = n_cont > 0 ? NUM_ATNS : act_n;
-    long n = (long)hidden * OBS_SIZE
-        + (long)layers * 3 * hidden * hidden
-        + (long)(decoder_out + 1) * hidden;
-    if (n_cont > 0) {
-        n += decoder_out;
-    }
-    return n;
-}
-
 void run_sweep(Ini* ini, const char* exe_path) {
     // Build SweepSpace + param map from [sweep.<section>.<key>] sections.
     const char* goal = puf_ini_get_str(ini, "sweep", "goal");
@@ -2709,16 +2692,6 @@ void run_sweep(Ini* ini, const char* exe_path) {
     SweepJob* jobs = (SweepJob*)calloc(parallel, sizeof(SweepJob));
     int failed_workers = 0;
     int next_run_id = 0;
-    long max_policy_params = 0;
-    {
-        DictItem* cap = dict_find(puf_ini_section(ini, "sweep", 0), "max_policy_params");
-        if (cap) {
-            max_policy_params = (long)cap->value;
-        }
-    }
-    if (max_policy_params > 0) {
-        fprintf(stderr, "sweep max_policy_params=%ld\n", max_policy_params);
-    }
     int completed = 0;
     int active = 0;
     // Free-list: slot i owns GPUs [i*train_gpus, (i+1)*train_gpus). Refill as
@@ -2765,23 +2738,6 @@ void run_sweep(Ini* ini, const char* exe_path) {
                 snprintf(key, sizeof(key), "%s.%s",
                     params[p].section, params[p].key);
                 puf_ini_put(ini, key, buf);
-            }
-            if (max_policy_params > 0) {
-                int hidden = (int)puf_ini_get(ini, "policy", "hidden_size");
-                int layers = (int)puf_ini_get(ini, "policy", "num_layers");
-                long nparams = policy_param_count(hidden, layers);
-                if (nparams > max_policy_params) {
-                    fprintf(stderr,
-                        "sweep worker run=%d skipped: policy %dx%d has %ld params, cap %ld\n",
-                        job.run, hidden, layers, nparams, max_policy_params);
-                    protein_sweep_observe(protein, job.sample, NAN, max_cost, 1);
-                    assert(++failed_workers <= 1000
-                        && "too many failed sweep workers");
-                    // Same slot, new sample. Leaving the slot empty with
-                    // nothing active would end the sweep.
-                    i--;
-                    continue;
-                }
             }
             char run_id[128];
             snprintf(run_id, sizeof(run_id), "sweep_%ld_%04d",
@@ -2907,10 +2863,6 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
     while (true) {
         if (render) {
             puf_render(p->vec->envs);
-            if (puf_record_done()) {
-                puf_record_finish();
-                return result;
-            }
             if (WindowShouldClose()) {
                 return result;
             }
@@ -3037,6 +2989,65 @@ EvalResult run_eval(Ini* ini, TrainContext* ctx, int mode, int verbose,
     return r;
 }
 
+// CPU player records a split BEV / agent view from this checkpoint.
+// Failure leaves the train result intact. The caller is still inside the
+// train process, so the next checkpoint waits until the clip is written.
+static void record_rollout_video(Ini* ini, const char* checkpoint_dir,
+        const char* checkpoint) {
+    if (!checkpoint || !checkpoint[0] || !checkpoint_dir || !checkpoint_dir[0]) {
+        return;
+    }
+    size_t n = strlen(checkpoint);
+    if (n < 5 || strcmp(checkpoint + n - 4, ".bin") != 0) {
+        fprintf(stderr, "record: checkpoint path is not a .bin, skipping\n");
+        return;
+    }
+    char ini_path[4096];
+    char out_path[4096];
+    snprintf(ini_path, sizeof(ini_path), "%s/rollout.ini", checkpoint_dir);
+    snprintf(out_path, sizeof(out_path), "%.*s.mp4", (int)(n - 4), checkpoint);
+    if (strchr(ini_path, '\'') || strchr(checkpoint, '\'') || strchr(out_path, '\'')) {
+        fprintf(stderr, "record: path has a quote, skipping video\n");
+        return;
+    }
+    FILE* fp = fopen(ini_path, "w");
+    if (!fp) {
+        fprintf(stderr, "record: could not write %s\n", ini_path);
+        return;
+    }
+    puf_ini_write(fp, ini);
+    fclose(fp);
+    char cmd[8192];
+    int wrote = snprintf(cmd, sizeof(cmd),
+        "env -u DISPLAY python3 scripts/record_policy.py --ini '%s' --checkpoint '%s' --out '%s'",
+        ini_path, checkpoint, out_path);
+    if (wrote < 0 || wrote >= (int)sizeof(cmd)) {
+        fprintf(stderr, "record: command too long, skipping video\n");
+        return;
+    }
+    fprintf(stderr, "record: %s\n", cmd);
+    fflush(stderr);
+    int rc = system(cmd);
+    if (rc != 0) {
+        fprintf(stderr, "record: video failed (%d); training result kept\n", rc);
+        fflush(stderr);
+    }
+}
+
+// record_rollout_every: 0 never. Otherwise epoch 0 is always recorded,
+// then every Nth checkpoint saved after that (1 records each save).
+// Only the artifact owner calls this.
+static void maybe_record_rollout(Ini* ini, int every, int* saved,
+        const char* checkpoint_dir, const char* checkpoint) {
+    if (!checkpoint || !checkpoint[0]) {
+        return;
+    }
+    int index = (*saved)++;
+    if (every > 0 && index % every == 0) {
+        record_rollout_video(ini, checkpoint_dir, checkpoint);
+    }
+}
+
 TrainResult run_train(Ini* ini, TrainContext* ctx) {
     int use_selfplay = puf_ini_get(ini, "selfplay", "enabled");
     if (!use_selfplay) {
@@ -3080,6 +3091,17 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    int record_every = (int)puf_ini_get(ini, "base", "record_rollout_every");
+    int checkpoints_saved = 0;
+    // Epoch 0 is the initial policy, before any update. Not part of the
+    // every-Nth checkpoint count.
+    if (ctx->artifact_owner && record_every > 0) {
+        char initial_checkpoint[4096];
+        snprintf(initial_checkpoint, sizeof(initial_checkpoint),
+            "%s/%016ld.bin", checkpoint_dir, pufferl->global_step);
+        puf_save_weights(pufferl, initial_checkpoint);
+        record_rollout_video(ini, checkpoint_dir, initial_checkpoint);
+    }
     Selfplay selfplay = {0};
     if (use_selfplay) {
         char initial_checkpoint[4096];
@@ -3168,6 +3190,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             if (ctx->artifact_owner) {
                 snprintf(final_checkpoint, sizeof(final_checkpoint),
                     "%s", saved_checkpoint);
+                maybe_record_rollout(ini, record_every, &checkpoints_saved,
+                    checkpoint_dir, saved_checkpoint);
             }
         }
         if (use_selfplay && saved_checkpoint[0]) {
@@ -3562,7 +3586,7 @@ int main(int argc, char** argv) {
     setbuf(stderr, NULL);
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s train|eval|match|sweep [latest|MODEL.bin] [--headless] [--record [file.mp4]] [--section.key=value ...]\n",
+            "usage: %s train|eval|match|sweep [latest|MODEL.bin] [--headless] [--section.key=value ...]\n",
             argv[0]);
         exit(1);
     }
@@ -3580,25 +3604,11 @@ int main(int argc, char** argv) {
         model = argv[argi++];
     }
     int headless = 0;
-    int record = 0;
-    int record_frames = 91;
-    const char* record_path = NULL;
     char* ini_argv[argc > 0 ? (size_t)argc : 1];
     int ini_argc = 0;
     for (int i = argi; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0) {
             headless = 1;
-            continue;
-        }
-        if (strcmp(argv[i], "--record") == 0) {
-            record = 1;
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                record_path = argv[++i];
-            }
-            continue;
-        }
-        if (strcmp(argv[i], "--record-frames") == 0 && i + 1 < argc) {
-            record_frames = atoi(argv[++i]);
             continue;
         }
         ini_argv[ini_argc++] = argv[i];
@@ -3608,17 +3618,8 @@ int main(int argc, char** argv) {
     if (model) {
         puf_ini_put(&ini, "base.load_model_path", model);
     }
-    if (record) {
-        char default_path[256];
-        const char* env_name = puf_ini_get_str(&ini, "base", "env_name");
-        snprintf(default_path, sizeof(default_path), "logs/%s.mp4",
-            env_name ? env_name : "drive");
-        puf_record_request(record_path ? record_path : default_path, record_frames, 10);
-    }
     TrainContext ctx = {.world_size = 1, .artifact_owner = 1};
-    // --record renders one episode to an mp4 and does not need a display.
-    // Plain --headless stays a fast eval with no frames.
-    int render = record || !headless;
+    int render = !headless;
 
     if (strcmp(mode, "train") == 0) {
         launch_train(&ini);

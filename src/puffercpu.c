@@ -981,6 +981,10 @@ int main(int argc, char** argv) {
     int hold = 0;
     int steps = 0;
     int recording = puf_record_enabled();
+    if (recording && path && !have_net) {
+        fprintf(stderr, "record: checkpoint did not load (%s)\n", path);
+        exit(1);
+    }
     if (recording && !have_net) {
         // Coast at the logged speed. Action 0 is full brake and full steer.
         for (int i = 0; i < env.num_agents; i++) {

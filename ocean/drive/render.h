@@ -23,6 +23,13 @@ struct Client {
     int car_assignments[DRIVE_AGENT_MAX];
     Vector3 default_camera_position;
     Vector3 default_camera_target;
+    // Headless record: left panel is the scene BEV, right is one agent's view.
+    // The top-right inset is that agent's observation.
+    RenderTexture2D record_bev;
+    RenderTexture2D record_pov;
+    int record_views;
+    Font font;
+    int font_ready;
 };
 
 Client* make_client(Drive* env) {
@@ -90,6 +97,25 @@ Client* make_client(Drive* env) {
     client->camera.fovy = 45.0f;
     client->camera.projection = CAMERA_PERSPECTIVE;
     client->camera_zoom = 1.0f;
+    // Nimbus Sans is the Helvetica clone, but it is CFF and will not load.
+    // Liberation Sans is the TrueType stand-in.
+    const char* sans_paths[] = {
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    };
+    for (int i = 0; i < 2; i++) {
+        if (!FileExists(sans_paths[i])) {
+            continue;
+        }
+        Font font = LoadFontEx(sans_paths[i], 64, NULL, 0);
+        if (font.glyphCount <= 0) {
+            continue;
+        }
+        SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
+        client->font = font;
+        client->font_ready = 1;
+        break;
+    }
     return client;
 }
 
@@ -167,6 +193,7 @@ static const Color SAGE_INK = {4, 120, 87, 255};
 static const Color STEEL = {92, 143, 197, 255};
 static const Color STEEL_INK = {53, 94, 121, 255};
 static const Color CORAL = {242, 152, 111, 255};
+static const Color AMBER = {230, 186, 64, 255};
 static const Color CRIMSON = {185, 28, 28, 255};
 
 static void sim_draw_button(Rectangle r, const char* label, Color fill, Color edge) {
@@ -212,6 +239,18 @@ static void sim_obs_seg(float cx, float cy, float ppm,
     DrawLineEx(a, b, thick, color);
 }
 
+static Font sim_font(Drive* env) {
+    if (env->client && env->client->font_ready) {
+        return env->client->font;
+    }
+    return GetFontDefault();
+}
+
+static void sim_sans(Drive* env, const char* text, float x, float y,
+        float size, Color color) {
+    DrawTextEx(sim_font(env), text, (Vector2){x, y}, size, 0.4f, color);
+}
+
 // vlen is meters of travel. The whole arrow, head included, grows with it.
 static void sim_obs_arrow(float cx, float cy, float ppm,
         float f, float l, float c, float s, float vlen, Color color) {
@@ -253,6 +292,26 @@ static void sim_obs_arrow(float cx, float cy, float ppm,
     };
     DrawTriangle(tip, left, right, color);
     DrawTriangle(tip, right, left, color);
+}
+
+// Box in the ego frame. (c, s) is the car's heading, forward then left.
+static void sim_obs_box(float cx, float cy, float ppm,
+        float f, float l, float hl, float hw,
+        float c, float s, float thick, Color color) {
+    float lf = -s;
+    float ll = c;
+    float f0 = f + hl * c + hw * lf;
+    float l0 = l + hl * s + hw * ll;
+    float f1 = f + hl * c - hw * lf;
+    float l1 = l + hl * s - hw * ll;
+    float f2 = f - hl * c - hw * lf;
+    float l2 = l - hl * s - hw * ll;
+    float f3 = f - hl * c + hw * lf;
+    float l3 = l - hl * s + hw * ll;
+    sim_obs_seg(cx, cy, ppm, f0, l0, f1, l1, thick, color);
+    sim_obs_seg(cx, cy, ppm, f1, l1, f2, l2, thick, color);
+    sim_obs_seg(cx, cy, ppm, f2, l2, f3, l3, thick, color);
+    sim_obs_seg(cx, cy, ppm, f3, l3, f0, l0, thick, color);
 }
 
 // Decode the selected car's observation. Empty slots stay blank.
@@ -713,35 +772,265 @@ void draw_road_edge(Drive* env, float start_x, float start_y, float end_x, float
     DrawTriangle3D(b4, t4, b1, CURB_SIDE); DrawTriangle3D(t4, t1, b1, CURB_SIDE);
 }
 
-// The overview camera sits ~200 m off the map center, so a moving car is a
-// few pixels and then leaves the frame. While recording, chase one agent
-// (the configured selected_agent_idx) from just behind and above.
-static void drive_record_camera(Drive* env, Client* client) {
-    if (env->active_agent_count <= 0 || !env->entities) {
-        return;
-    }
+static void draw_world(Drive* env, Client* client);
+static void puf_render_hud(Drive* env, Client* client);
+
+static int selected_slot(Drive* env) {
     int slot = env->selected_agent_idx;
     if (slot < 0 || slot >= env->active_agent_count) {
         slot = 0;
     }
-    Entity* agent = &env->entities[slot];
+    return slot;
+}
+
+// Orthographic top-down of the whole map. fovy is the vertical span;
+// widen it when the map is wider than the panel.
+static Camera3D bev_camera(Drive* env, float aspect) {
+    float x0 = -40.0f;
+    float y0 = -40.0f;
+    float x1 = 40.0f;
+    float y1 = 40.0f;
+    if (env->map_corners) {
+        x0 = env->map_corners[0];
+        y0 = env->map_corners[1];
+        x1 = env->map_corners[2];
+        y1 = env->map_corners[3];
+    }
+    float map_w = fabsf(x1 - x0);
+    float map_h = fabsf(y1 - y0);
+    if (map_w < 1.0f) {
+        map_w = 1.0f;
+    }
+    if (map_h < 1.0f) {
+        map_h = 1.0f;
+    }
+    if (aspect < 0.05f) {
+        aspect = 0.05f;
+    }
+    float fovy = map_h;
+    if (map_w / aspect > fovy) {
+        fovy = map_w / aspect;
+    }
+    Camera3D cam = {0};
+    cam.position = (Vector3){0.5f * (x0 + x1), 0.5f * (y0 + y1), 400.0f};
+    cam.target = (Vector3){cam.position.x, cam.position.y, 0.0f};
+    cam.up = (Vector3){0.0f, -1.0f, 0.0f};
+    cam.fovy = fovy * 1.06f;
+    cam.projection = CAMERA_ORTHOGRAPHIC;
+    return cam;
+}
+
+// Chase the selected agent from behind and above. Same pose as the
+// interactive space-bar view.
+static Camera3D pov_camera(Drive* env) {
+    Camera3D cam = {0};
+    cam.up = (Vector3){0.0f, 0.0f, 1.0f};
+    cam.fovy = 60.0f;
+    cam.projection = CAMERA_PERSPECTIVE;
+    cam.position = (Vector3){0.0f, -25.0f, 15.0f};
+    cam.target = (Vector3){0.0f, 40.0f, 1.0f};
+    if (env->active_agent_count <= 0 || !env->entities) {
+        return cam;
+    }
+    Entity* agent = &env->entities[selected_slot(env)];
+    if (agent->x == INVALID_POSITION || agent->y == INVALID_POSITION) {
+        return cam;
+    }
     float hx = cosf(agent->heading);
     float hy = sinf(agent->heading);
-    const float back = 12.0f;
-    const float height = 7.0f;
-    const float ahead = 6.0f;
-    client->camera.up = (Vector3){0.0f, 0.0f, 1.0f};
-    client->camera.fovy = 30.0f;
-    client->camera.position = (Vector3){
-        agent->x - back * hx,
-        agent->y - back * hy,
-        height
+    cam.position = (Vector3){
+        agent->x - 25.0f * hx,
+        agent->y - 25.0f * hy,
+        15.0f
     };
-    client->camera.target = (Vector3){
-        agent->x + ahead * hx,
-        agent->y + ahead * hy,
+    cam.target = (Vector3){
+        agent->x + 40.0f * hx,
+        agent->y + 40.0f * hy,
         1.0f
     };
+    return cam;
+}
+
+// Top-right of a recorded frame. The selected agent's observation, in
+// that car's frame. Forward is up and left is left. The crop is a fixed
+// 20 m half-width centered on the car, so it does not zoom. Lane points
+// are muted, edges are amber. Road lines are not drawn. The blue box and
+// the arrow are the ego car. Partner boxes are the cars in view.
+static Rectangle record_agent_view(Drive* env) {
+    const float box_w = 300.0f;
+    const float box_h = 348.0f;
+    float screen_w = 1280.0f;
+    if (env->client && env->client->width > box_w + 24.0f) {
+        screen_w = env->client->width;
+    }
+    Rectangle rect = {screen_w - 12.0f - box_w, 12.0f, box_w, box_h};
+    DrawRectangleRec(rect, CARD);
+    DrawRectangleLinesEx(rect, 1.0f, LINE);
+
+    int slot = 0;
+    if (env->active_agent_count > 0) {
+        slot = selected_slot(env);
+    }
+    float* obs = NULL;
+    if (env->active_agent_count > 0 && slot < DRIVE_AGENT_MAX) {
+        obs = env->agents[slot].observations;
+    }
+    if (!obs) {
+        sim_sans(env, "no view", rect.x + 10.0f, rect.y + 12.0f, 16, MUTED);
+        return rect;
+    }
+
+    float spd = obs[2] / OBS_SPEED_SCALE;
+    int hit = obs[5] > 0.5f;
+    float gf = obs[0] / OBS_GOAL_SCALE;
+    float gl = obs[1] / OBS_GOAL_SCALE;
+    float gd = sqrtf(gf * gf + gl * gl);
+    char cap[64];
+    snprintf(cap, sizeof(cap), "v %.1f%s", spd, hit ? "  hit" : "");
+    sim_sans(env, cap, rect.x + 10.0f, rect.y + 8.0f, 16,
+        hit ? CRIMSON : INK);
+    char goal_txt[64];
+    if (gd >= 10.0f) {
+        snprintf(goal_txt, sizeof(goal_txt),
+            "distance to next destination %.0f m", gd);
+    } else {
+        snprintf(goal_txt, sizeof(goal_txt),
+            "distance to next destination %.1f m", gd);
+    }
+    sim_sans(env, goal_txt, rect.x + 10.0f, rect.y + 26.0f, 13, SAGE_INK);
+    char step_txt[32];
+    snprintf(step_txt, sizeof(step_txt), "t %d", env->timestep);
+    sim_sans(env, step_txt, rect.x + 10.0f, rect.y + 44.0f, 16, INK);
+
+    int road0 = EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS;
+    const float range = 20.0f;
+
+    Rectangle plot = {
+        rect.x + 8.0f, rect.y + 66.0f,
+        rect.width - 16.0f, rect.height - 74.0f
+    };
+    float side = plot.width;
+    if (plot.height < side) {
+        side = plot.height;
+    }
+    float ppm = (side * 0.5f) / range;
+    float cx = plot.x + plot.width * 0.5f;
+    float cy = plot.y + plot.height * 0.5f;
+
+    BeginScissorMode((int)plot.x, (int)plot.y,
+        (int)plot.width, (int)plot.height);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
+            float* road = obs + road0 + k * ROAD_FEATURES;
+            if (road[0] == 0.0f && road[1] == 0.0f && road[2] == 0.0f) {
+                continue;
+            }
+            int kind = (int)(road[6] + 0.5f);
+            int edge = kind >= 2;
+            if (edge != pass) {
+                continue;
+            }
+            if (kind == 1) {
+                continue;
+            }
+            float mid_f = road[0] / OBS_POSITION_SCALE;
+            float mid_l = road[1] / OBS_POSITION_SCALE;
+            Color col = MUTED;
+            if (edge) {
+                col = AMBER;
+            }
+            DrawCircleV((Vector2){cx - mid_l * ppm, cy - mid_f * ppm},
+                3.4f, col);
+        }
+    }
+    for (int j = 0; j < MAX_AGENTS; j++) {
+        float* p = obs + EGO_FEATURES + j * PARTNER_FEATURES;
+        if (p[0] == 0.0f && p[1] == 0.0f
+                && p[2] == 0.0f && p[3] == 0.0f) {
+            continue;
+        }
+        float f = p[0] / OBS_POSITION_SCALE;
+        float l = p[1] / OBS_POSITION_SCALE;
+        float hw = p[2] * MAX_VEH_WIDTH * 0.5f;
+        float hl = p[3] * MAX_VEH_LEN * 0.5f;
+        if (hw < 0.4f) {
+            hw = 0.4f;
+        }
+        if (hl < 0.6f) {
+            hl = 0.6f;
+        }
+        float ang = atan2f(p[5], p[4]);
+        sim_obs_box(cx, cy, ppm, f, l, hl, hw,
+            cosf(ang), sinf(ang), 1.6f, CORAL);
+    }
+    float ego_hw = obs[3] * MAX_VEH_WIDTH * 0.5f;
+    float ego_hl = obs[4] * MAX_VEH_LEN * 0.5f;
+    if (ego_hw < 0.4f) {
+        ego_hw = 0.4f;
+    }
+    if (ego_hl < 0.6f) {
+        ego_hl = 0.6f;
+    }
+    sim_obs_box(cx, cy, ppm, 0.0f, 0.0f, ego_hl, ego_hw,
+        1.0f, 0.0f, 2.0f, STEEL);
+    sim_obs_arrow(cx, cy, ppm, 0.0f, 0.0f, 1.0f, 0.0f,
+        22.0f / ppm, STEEL_INK);
+    EndScissorMode();
+    DrawRectangleLinesEx(plot, 1.0f, LINE);
+    return rect;
+}
+
+// One framebuffer: scene BEV on the left, the selected agent's view on
+// the right. Each panel is its own target so the projection aspect matches
+// the panel instead of the full window. The top-right inset is the
+// observation, drawn after the panels so it sits on the chase view.
+static void record_views(Drive* env) {
+    Client* client = env->client;
+    int w = (int)client->width;
+    int h = (int)client->height;
+    if (w < 2 || h < 2) {
+        return;
+    }
+    int left_w = w / 2;
+    int right_w = w - left_w;
+    if (!client->record_views) {
+        client->record_bev = LoadRenderTexture(left_w, h);
+        client->record_pov = LoadRenderTexture(right_w, h);
+        client->record_views = 1;
+    }
+    rlSetClipPlanes(0.05, 8000.0);
+    BeginTextureMode(client->record_bev);
+    ClearBackground(PAPER);
+    BeginMode3D(bev_camera(env, (float)left_w / (float)h));
+    draw_world(env, client);
+    EndMode3D();
+    EndTextureMode();
+
+    BeginTextureMode(client->record_pov);
+    ClearBackground(PAPER);
+    BeginMode3D(pov_camera(env));
+    draw_world(env, client);
+    EndMode3D();
+    EndTextureMode();
+
+    BeginDrawing();
+    ClearBackground(PAPER);
+    DrawTexturePro(client->record_bev.texture,
+        (Rectangle){0, 0, (float)left_w, (float)-h},
+        (Rectangle){0, 0, (float)left_w, (float)h},
+        (Vector2){0, 0}, 0.0f, WHITE);
+    DrawTexturePro(client->record_pov.texture,
+        (Rectangle){0, 0, (float)right_w, (float)-h},
+        (Rectangle){(float)left_w, 0, (float)right_w, (float)h},
+        (Vector2){0, 0}, 0.0f, WHITE);
+    DrawRectangle(left_w - 1, 0, 2, h, INK);
+    Rectangle obs_box = record_agent_view(env);
+    sim_sans(env, "Full simulator state", 16.0f, 14.0f, 20, INK);
+    const char* who = TextFormat("Selected agent %d", selected_slot(env));
+    Vector2 who_sz = MeasureTextEx(sim_font(env), who, 20, 0.4f);
+    sim_sans(env, who, obs_box.x - who_sz.x - 12.0f, 14.0f, 20, INK);
+    EndDrawing();
+    puf_record_capture(w, h);
 }
 
 static void draw_goal_disc(float x, float y, float radius) {
@@ -795,19 +1084,23 @@ void puf_render(Drive* env) {
     if (env->client == NULL) {
         env->client = make_client(env);
     }
-    drive_human_controls(env);
-    Client* client = env->client;
     if (puf_record_enabled()) {
-        drive_record_camera(env, client);
+        record_views(env);
+        return;
     }
+    human_controls(env);
+    Client* client = env->client;
     BeginDrawing();
     ClearBackground(PAPER);
-    if (!puf_record_enabled()) {
-        handle_camera_controls(env);
-        sim_follow_camera(env);
-    }
+    handle_camera_controls(env);
+    sim_follow_camera(env);
     BeginMode3D(client->camera);
+    draw_world(env, client);
+    EndMode3D();
+    puf_render_hud(env, client);
+}
 
+static void draw_world(Drive* env, Client* client) {
     if (env->map_corners) {
         DrawLine3D((Vector3){env->map_corners[0], env->map_corners[1], 0}, (Vector3){env->map_corners[2], env->map_corners[1], 0}, STEEL);
         DrawLine3D((Vector3){env->map_corners[0], env->map_corners[1], 0}, (Vector3){env->map_corners[0], env->map_corners[3], 0}, STEEL);
@@ -882,6 +1175,9 @@ void puf_render(Drive* env) {
             Color car_tint = WHITE;
             if (env->entities[i].collision_state > NO_COLLISION) {
                 car_tint = CRIMSON;
+            } else if (puf_record_enabled()
+                    && agent_index == env->selected_agent_idx) {
+                car_tint = STEEL;
             }
 
             // The marker floats 8 m above the car. Skip it in the chase shot
@@ -916,6 +1212,10 @@ void puf_render(Drive* env) {
             for (int j = 0; j < 4; j++) {
                 DrawLine3D(corners[j], corners[(j + 1) % 4], STEEL_INK);
             }
+            if (puf_record_enabled() && agent_index == env->selected_agent_idx) {
+                DrawCircle3D((Vector3){position.x, position.y, 0.35f},
+                    2.4f, (Vector3){0.0f, 0.0f, 1.0f}, 90.0f, STEEL_INK);
+            }
 
             // FPV camera
             if (IsKeyDown(KEY_SPACE) && env->selected_agent_idx == agent_index) {
@@ -942,8 +1242,9 @@ void puf_render(Drive* env) {
 
         }
     }
-    EndMode3D();
+}
 
+static void puf_render_hud(Drive* env, Client* client) {
     // Draw debug info
     DrawText(TextFormat("Camera Position: (%.2f, %.2f, %.2f)",
         client->camera.position.x, client->camera.position.y, client->camera.position.z), 10, 10, 20, INK);
@@ -989,10 +1290,18 @@ void puf_render(Drive* env) {
 }
 
 void close_client(Client* client) {
+    if (client->record_views) {
+        UnloadRenderTexture(client->record_bev);
+        UnloadRenderTexture(client->record_pov);
+        client->record_views = 0;
+    }
     for (int i = 0; i < 2; i++) {
         UnloadModel(client->cars[i]);
     }
     UnloadTexture(client->puffers);
+    if (client->font_ready) {
+        UnloadFont(client->font);
+    }
     CloseWindow();
     free(client);
 }

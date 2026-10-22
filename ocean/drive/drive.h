@@ -23,6 +23,12 @@ struct Log {
     float episode_length;
     float perf;
     float score;
+    float score_full_horizon;
+    // Clean first arrival, discounted by the jerk paid this episode.
+    // 0 when the car never scores. Equals score when the penalty is 0.
+    float score_quality;
+    // Sum of the velocity-change penalty over the episode. Negative.
+    float jerk;
     float offroad_rate;
     float collision_rate;
     float collision_count;
@@ -32,8 +38,6 @@ struct Log {
 
 typedef struct Entity {
     int type;
-    // Point count of a road polyline. Cars stay at 0. Reset samples
-    // their position and goal from lane points.
     int array_size;
     float* pts_x;
     float* pts_y;
@@ -56,9 +60,11 @@ typedef struct Entity {
     int valid;
     int reached_goal;
     int collided_before_goal;
+    int goals_sampled;
+    int goals_clean;
+    int collided_this_goal;
     int active_agent;
-    float prev_accel;
-    float prev_steer;
+    int lane_node;
 } Entity;
 
 void free_entity(Entity* entity) {
@@ -122,9 +128,23 @@ struct Env {
     // 1 after ./drive loads a checkpoint that matches this network.
     int checkpoint_ok;
     char checkpoint_error[256];
-    // Straight-line goal band, meters. Reset samples a lane point in it.
+    // Euclidean goal band, meters. The point is on the forward centerline.
     float goal_distance_min;
     float goal_distance_max;
+    // Lane points in polyline order. lane_x owns the block; the other
+    // lane pointers sit inside it. lane_next is the next point on this
+    // polyline. A join is decided while walking, not stored.
+    int lane_n;
+    float* lane_x;
+    float* lane_y;
+    float* lane_hx;
+    float* lane_hy;
+    int* lane_next;
+    int lane_polys;
+    int* lane_poly_start;
+    float* lane_dist;
+    float* lane_block;
+    int* lane_seen;
     // Set from the window. Headless eval and recording never read these.
     int sim_paused;
     // Overhead camera stays on selected_agent_idx. Off restores the map view.
@@ -712,145 +732,11 @@ static void bump_pair(Drive* env, Entity* a, Entity* b,
     }
 }
 
-static void car_corners(const Entity* e, float c[4][2]) {
-    float hl = e->length * 0.5f;
-    float hw = e->width * 0.5f;
-    float co = e->heading_x;
-    float si = e->heading_y;
-    for (int i = 0; i < 4; i++) {
-        c[i][0] = e->x + (offsets[i][0] * hl * co - offsets[i][1] * hw * si);
-        c[i][1] = e->y + (offsets[i][0] * hl * si + offsets[i][1] * hw * co);
-    }
-}
-
-// Push the car back onto the side its center already occupies. If the
-// center crossed this segment during the step, push it back to the side
-// it left. Depth is how far the box still reaches across the curb.
-static int curb_push(const Entity* car, float px, float py,
-        float ax, float ay, float bx, float by,
-        float* nx, float* ny, float* depth) {
-    float dx = bx - ax;
-    float dy = by - ay;
-    float len = sqrtf(dx * dx + dy * dy);
-    if (len < 1.0e-4f) {
-        return 0;
-    }
-    float lx = -dy / len;
-    float ly = dx / len;
-    float sd_c = (car->x - ax) * lx + (car->y - ay) * ly;
-    float sd_p = (px - ax) * lx + (py - ay) * ly;
-    float p0[2] = {px, py};
-    float p1[2] = {car->x, car->y};
-    float q0[2] = {ax, ay};
-    float q1[2] = {bx, by};
-    int crossed = check_line_intersection(p0, p1, q0, q1);
-    float keep = crossed ? sd_p : sd_c;
-    float sign = (keep >= 0.0f) ? 1.0f : -1.0f;
-    float ox = lx * sign;
-    float oy = ly * sign;
-    float corners[4][2];
-    car_corners(car, corners);
-    float pen = 0.0f;
-    for (int i = 0; i < 4; i++) {
-        float sd = (corners[i][0] - ax) * ox + (corners[i][1] - ay) * oy;
-        if (-sd > pen) {
-            pen = -sd;
-        }
-    }
-    if (pen <= 0.0f) {
-        return 0;
-    }
-    *nx = ox;
-    *ny = oy;
-    *depth = pen;
-    return 1;
-}
-
-static int curb_hit(const Entity* car, float px, float py,
-        float ax, float ay, float bx, float by) {
-    float corners[4][2];
-    car_corners(car, corners);
-    float q0[2] = {ax, ay};
-    float q1[2] = {bx, by};
-    for (int k = 0; k < 4; k++) {
-        float* c0 = corners[k];
-        float* c1 = corners[(k + 1) % 4];
-        if (check_line_intersection(c0, c1, q0, q1)) {
-            return 1;
-        }
-    }
-    float p0[2] = {px, py};
-    float p1[2] = {car->x, car->y};
-    return check_line_intersection(p0, p1, q0, q1);
-}
-
-static void bump_curb(Drive* env, Entity* car, float px, float py) {
-    if (car->x == INVALID_POSITION || car->active_agent != 1) {
+// through leaves overlapping cars where they are. Road edges never push.
+static void bump_agents(Drive* env) {
+    if (env->collision_physics == COLLISION_THROUGH) {
         return;
     }
-    // A bend is several short segments. Each push can land on the next
-    // one, so repeat. Bounce once, on the first contact.
-    int bounced = 0;
-    for (int iter = 0; iter < 4; iter++) {
-        int list[MAX_ENTITIES_PER_CELL * 2 * 25];
-        int n = check_neighbors(env, car->x, car->y, list,
-            MAX_ENTITIES_PER_CELL * 2 * 25, collision_offsets, 25);
-        float best = 0.0f;
-        float bnx = 0.0f;
-        float bny = 0.0f;
-        for (int i = 0; i < n; i += 2) {
-            int idx = list[i];
-            if (idx < 0) {
-                continue;
-            }
-            Entity* edge = &env->entities[idx];
-            if (edge->type != ROAD_EDGE) {
-                continue;
-            }
-            int g = list[i + 1];
-            if (g < 0 || g + 1 >= edge->array_size) {
-                continue;
-            }
-            float ax = edge->pts_x[g];
-            float ay = edge->pts_y[g];
-            float bx = edge->pts_x[g + 1];
-            float by = edge->pts_y[g + 1];
-            if (!curb_hit(car, px, py, ax, ay, bx, by)) {
-                continue;
-            }
-            float ox, oy, dep;
-            if (!curb_push(car, px, py, ax, ay, bx, by, &ox, &oy, &dep)) {
-                continue;
-            }
-            if (dep > best) {
-                best = dep;
-                bnx = ox;
-                bny = oy;
-            }
-        }
-        if (best <= 0.0f) {
-            return;
-        }
-        float push = best + BUMP_SLOP;
-        if (push > BUMP_MAX) {
-            push = BUMP_MAX;
-        }
-        car->x += bnx * push;
-        car->y += bny * push;
-        if (bounced) {
-            continue;
-        }
-        float vn = car->vx * bnx + car->vy * bny;
-        if (vn < 0.0f) {
-            float j = -(1.0f + BUMP_BOUNCE) * vn;
-            car->vx += j * bnx;
-            car->vy += j * bny;
-            bounced = 1;
-        }
-    }
-}
-
-static void bump_agents(Drive* env) {
     int n = env->active_agent_count;
     if (n > DRIVE_AGENT_MAX) {
         n = DRIVE_AGENT_MAX;
@@ -862,19 +748,14 @@ static void bump_agents(Drive* env) {
         prev_x[i] = e->x - e->vx * SIM_DT;
         prev_y[i] = e->y - e->vy * SIM_DT;
     }
-    // through leaves overlapping cars where they are. Curbs still push.
-    int through = env->collision_physics == COLLISION_THROUGH;
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < n; i++) {
-            if (!through) {
-                for (int j = i + 1; j < n; j++) {
-                    bump_pair(env,
-                        &env->entities[i], &env->entities[j],
-                        prev_x[i], prev_y[i], prev_x[j], prev_y[j],
-                        pass == 0);
-                }
+            for (int j = i + 1; j < n; j++) {
+                bump_pair(env,
+                    &env->entities[i], &env->entities[j],
+                    prev_x[i], prev_y[i], prev_x[j], prev_y[j],
+                    pass == 0);
             }
-            bump_curb(env, &env->entities[i], prev_x[i], prev_y[i]);
         }
     }
 }
@@ -961,9 +842,111 @@ int collision_check(Drive* env, int agent_idx) {
     return car_collided_with_index;
 }
 
+static void build_lanes(Drive* env) {
+    int n = 0;
+    int polys = 0;
+    for (int i = 0; i < env->num_entities; i++) {
+        Entity* e = &env->entities[i];
+        if (e->type != ROAD_LANE || e->array_size < 2) {
+            continue;
+        }
+        n += e->array_size;
+        polys++;
+    }
+    assert(n > 1);
+    env->lane_n = n;
+    env->lane_polys = polys;
+    size_t bytes = (size_t)n * (6 * sizeof(float) + 2 * sizeof(int));
+    bytes += (size_t)polys * sizeof(int);
+    char* buf = (char*)calloc(1, bytes);
+    assert(buf);
+    float* f = (float*)buf;
+    env->lane_x = f;
+    env->lane_y = f + n;
+    env->lane_hx = f + 2 * n;
+    env->lane_hy = f + 3 * n;
+    env->lane_dist = f + 4 * n;
+    env->lane_block = f + 5 * n;
+    int* ip = (int*)(f + 6 * n);
+    env->lane_next = ip;
+    env->lane_seen = ip + n;
+    env->lane_poly_start = ip + 2 * n;
+
+    int cursor = 0;
+    int pi = 0;
+    for (int i = 0; i < env->num_entities; i++) {
+        Entity* e = &env->entities[i];
+        if (e->type != ROAD_LANE || e->array_size < 2) {
+            continue;
+        }
+        env->lane_poly_start[pi++] = cursor;
+        for (int k = 0; k < e->array_size; k++) {
+            int a = k;
+            int b = k + 1;
+            if (b == e->array_size) {
+                a = k - 1;
+                b = k;
+            }
+            float dx = e->pts_x[b] - e->pts_x[a];
+            float dy = e->pts_y[b] - e->pts_y[a];
+            float hyp = sqrtf(dx * dx + dy * dy);
+            if (hyp > 0.0f) {
+                dx /= hyp;
+                dy /= hyp;
+            }
+            env->lane_x[cursor] = e->pts_x[k];
+            env->lane_y[cursor] = e->pts_y[k];
+            env->lane_hx[cursor] = dx;
+            env->lane_hy[cursor] = dy;
+            env->lane_next[cursor] = -1;
+            if (k + 1 < e->array_size) {
+                env->lane_next[cursor] = cursor + 1;
+            }
+            cursor++;
+        }
+    }
+    assert(cursor == n && pi == polys);
+}
+
+static int lane_succ(Drive* env, int node, int* out) {
+    int nxt = env->lane_next[node];
+    if (nxt >= 0) {
+        out[0] = nxt;
+        return 1;
+    }
+    int nout = 0;
+    float x = env->lane_x[node];
+    float y = env->lane_y[node];
+    float hx = env->lane_hx[node];
+    float hy = env->lane_hy[node];
+    float stitch2 = LANE_STITCH * LANE_STITCH;
+    for (int p = 0; p < env->lane_polys; p++) {
+        int s = env->lane_poly_start[p];
+        float dx = env->lane_x[s] - x;
+        float dy = env->lane_y[s] - y;
+        float d2 = dx * dx + dy * dy;
+        if (s == node || d2 > stitch2) {
+            continue;
+        }
+        float hdot = hx * env->lane_hx[s] + hy * env->lane_hy[s];
+        if (hdot <= LANE_HEADING_DOT) {
+            continue;
+        }
+        if (d2 > 1.0e-6f) {
+            float dist = sqrtf(d2);
+            float sdot = (dx / dist) * hx + (dy / dist) * hy;
+            if (sdot <= LANE_HEADING_DOT) {
+                continue;
+            }
+        }
+        assert(nout < LANE_SUCC_MAX);
+        out[nout++] = s;
+    }
+    return nout;
+}
 
 // Initialization / Cleanup
-static void drive_release_world(Drive* env) {
+static void release_world(Drive* env) {
     if (env->entities) {
         for (int i = 0; i < env->num_entities; i++) {
             free_entity(&env->entities[i]);
@@ -989,9 +972,11 @@ static void drive_release_world(Drive* env) {
     env->neighbor_cache_entities = NULL;
     free(env->neighbor_cache_indices);
     env->neighbor_cache_indices = NULL;
+    free(env->lane_x);
+    env->lane_x = NULL;
 }
 
-static void drive_load_world(Drive* env) {
+static void load_world(Drive* env) {
     env->entities = load_map_binary(env->map_name, env);
     assert(env->entities);
     int n = env->max_agents;
@@ -1011,6 +996,7 @@ static void drive_load_world(Drive* env) {
         e->collision_state = NO_COLLISION;
         e->x = INVALID_POSITION;
         e->y = INVALID_POSITION;
+        e->lane_node = -1;
     }
     if (nroads > 0) {
         memcpy(neu + n, env->entities, (size_t)nroads * sizeof(Entity));
@@ -1022,6 +1008,7 @@ static void drive_load_world(Drive* env) {
     env->active_agent_count = n;
     env->num_agents = n;
     set_means(env);
+    build_lanes(env);
     init_grid_map(env);
     env->vision_range = VISION_RANGE;
     init_neighbor_offsets(env);
@@ -1036,7 +1023,7 @@ static void drive_load_world(Drive* env) {
 }
 
 void puf_close(Drive* env) {
-    drive_release_world(env);
+    release_world(env);
 }
 
 // Dynamics
@@ -1209,58 +1196,14 @@ void compute_observations(Drive* env) {
     }
 }
 
-static int lane_point_count(Drive* env) {
-    int n = 0;
-    for (int i = 0; i < env->num_entities; i++) {
-        Entity* e = &env->entities[i];
-        if (e->type != ROAD_LANE || !e->pts_x || e->array_size < 2) {
-            continue;
-        }
-        n += e->array_size;
-    }
-    return n;
-}
-
-// Lane point k, in entity order. Heading follows the segment through it.
-static void lane_point(Drive* env, int k, float* x, float* y, float* h) {
-    for (int i = 0; i < env->num_entities; i++) {
-        Entity* e = &env->entities[i];
-        if (e->type != ROAD_LANE || !e->pts_x || e->array_size < 2) {
-            continue;
-        }
-        if (k >= e->array_size) {
-            k -= e->array_size;
-            continue;
-        }
-        int from = k;
-        int to = k + 1;
-        if (to >= e->array_size) {
-            from = k - 1;
-            to = k;
-        }
-        *x = e->pts_x[k];
-        *y = e->pts_y[k];
-        if (h) {
-            *h = atan2f(e->pts_y[to] - e->pts_y[from],
-                e->pts_x[to] - e->pts_x[from]);
-        }
-        return;
-    }
-    assert(0);
-}
-
-// Lane heading is the flow. One direction, so ahead of it is downstream.
-static int goal_in_front(float x, float y, float hx, float hy,
-        float gx, float gy) {
-    float dx = gx - x;
-    float dy = gy - y;
-    return dx * hx + dy * hy > 0.0f;
-}
-
-static int pose_blocked(Drive* env, int self) {
+static int spot_taken(Drive* env, int self) {
     Entity* a = &env->entities[self];
-    for (int i = 0; i < self; i++) {
-        Entity* o = &env->entities[i];
+    int n = env->active_agent_count;
+    for (int j = 0; j < n; j++) {
+        if (j == self) {
+            continue;
+        }
+        Entity* o = &env->entities[j];
         if (o->x == INVALID_POSITION || o->y == INVALID_POSITION) {
             continue;
         }
@@ -1271,10 +1214,242 @@ static int pose_blocked(Drive* env, int self) {
     return 0;
 }
 
-// One lane point per car, then a lane point in the goal band and in
-// front of the car. Velocity stays at zero.
+static void write_goal(Entity* e, float gx, float gy) {
+    e->goal_position_x = gx;
+    e->goal_position_y = gy;
+    e->goal_position_z = 0.0f;
+    e->reached_goal = 0;
+}
+
+static void sit_on_lane(Drive* env, Entity* e, int k) {
+    e->x = env->lane_x[k];
+    e->y = env->lane_y[k];
+    e->z = 0.0f;
+    e->heading_x = env->lane_hx[k];
+    e->heading_y = env->lane_hy[k];
+    e->heading = normalize_heading(atan2f(e->heading_y, e->heading_x));
+    e->vx = 0.0f;
+    e->vy = 0.0f;
+    e->vz = 0.0f;
+    e->collision_state = NO_COLLISION;
+}
+
+// Shortest forward path. lane_dist stays negative off the walked road.
+// The walk stops past the goal band: a car farther than that cannot
+// sit between the car and a point still inside the band.
+static void lane_reach(Drive* env, int src) {
+    int n = env->lane_n;
+    float path_cap = env->goal_distance_max * 3.0f
+        + GOAL_FOLLOW_GAP + MIN_DISTANCE_TO_GOAL;
+    for (int i = 0; i < n; i++) {
+        env->lane_dist[i] = -1.0f;
+        env->lane_seen[i] = 0;
+    }
+    assert(src >= 0 && src < n);
+    env->lane_dist[src] = 0.0f;
+    for (;;) {
+        int u = -1;
+        float best = path_cap;
+        for (int i = 0; i < n; i++) {
+            if (env->lane_seen[i] || env->lane_dist[i] < 0.0f) {
+                continue;
+            }
+            if (env->lane_dist[i] <= best) {
+                best = env->lane_dist[i];
+                u = i;
+            }
+        }
+        if (u < 0) {
+            break;
+        }
+        env->lane_seen[u] = 1;
+        int succ[LANE_SUCC_MAX];
+        int fn = lane_succ(env, u, succ);
+        for (int k = 0; k < fn; k++) {
+            int v = succ[k];
+            if (env->lane_seen[v]) {
+                continue;
+            }
+            float dx = env->lane_x[v] - env->lane_x[u];
+            float dy = env->lane_y[v] - env->lane_y[u];
+            float nd = env->lane_dist[u] + sqrtf(dx * dx + dy * dy);
+            if (nd > path_cap) {
+                continue;
+            }
+            if (env->lane_dist[v] < 0.0f || nd < env->lane_dist[v]) {
+                env->lane_dist[v] = nd;
+            }
+        }
+    }
+}
+
+// lane_block[i] is the path distance of the nearest car downstream of
+// i, or 1e30 when that branch is empty. A car on a different fork does
+// not close this one. Lanes are about 3.2 m apart, so a car farther
+// than LANE_CAR_RADIUS is next door. Call after lane_reach.
+static void lane_blocks(Drive* env, int self) {
+    int n = env->lane_n;
+    int left = 0;
+    float r2 = LANE_CAR_RADIUS * LANE_CAR_RADIUS;
+    for (int i = 0; i < n; i++) {
+        if (env->lane_dist[i] < 0.0f) {
+            env->lane_block[i] = -2.0f;
+            continue;
+        }
+        env->lane_block[i] = -1.0f;
+        left++;
+    }
+    while (left > 0) {
+        int u = -1;
+        float best = -1.0f;
+        for (int i = 0; i < n; i++) {
+            if (env->lane_block[i] != -1.0f) {
+                continue;
+            }
+            if (env->lane_dist[i] >= best) {
+                best = env->lane_dist[i];
+                u = i;
+            }
+        }
+        if (u < 0) {
+            break;
+        }
+        float block = 1.0e30f;
+        if (env->lane_dist[u] > 0.0f) {
+            for (int j = 0; j < env->active_agent_count; j++) {
+                if (j == self) {
+                    continue;
+                }
+                Entity* o = &env->entities[j];
+                if (o->x == INVALID_POSITION || o->y == INVALID_POSITION) {
+                    continue;
+                }
+                float dx = o->x - env->lane_x[u];
+                float dy = o->y - env->lane_y[u];
+                if (dx * dx + dy * dy > r2) {
+                    continue;
+                }
+                float dot = o->heading_x * env->lane_hx[u]
+                    + o->heading_y * env->lane_hy[u];
+                if (dot > LANE_HEADING_DOT) {
+                    block = env->lane_dist[u];
+                    break;
+                }
+            }
+        }
+        int succ[LANE_SUCC_MAX];
+        int fn = lane_succ(env, u, succ);
+        for (int k = 0; k < fn; k++) {
+            int v = succ[k];
+            if (env->lane_block[v] < 0.0f) {
+                continue;
+            }
+            if (env->lane_dist[v] + 1.0e-3f < env->lane_dist[u]) {
+                continue;
+            }
+            if (env->lane_block[v] < block) {
+                block = env->lane_block[v];
+            }
+        }
+        env->lane_block[u] = block;
+        left--;
+    }
+}
+
+static float open_path_limit(float blocker) {
+    if (blocker >= 1.0e29f) {
+        return 1.0e30f;
+    }
+    return blocker - (GOAL_FOLLOW_GAP + MIN_DISTANCE_TO_GOAL);
+}
+
+// Reservoir sample of forward nodes in the Euclidean band whose arrival
+// disk ends GOAL_FOLLOW_GAP meters before the next car. Returns 0 when
+// that window is empty.
+static int pick_forward_goal(Drive* env, Entity* e, int self) {
+    int node = e->lane_node;
+    if (node < 0 || node >= env->lane_n) {
+        return 0;
+    }
+    lane_reach(env, node);
+    lane_blocks(env, self);
+    float x = e->x;
+    float y = e->y;
+    float hx = e->heading_x;
+    float hy = e->heading_y;
+    float lo2 = env->goal_distance_min * env->goal_distance_min;
+    float hi2 = env->goal_distance_max * env->goal_distance_max;
+    int seen = 0;
+    float pick_x = 0.0f;
+    float pick_y = 0.0f;
+    for (int i = 0; i < env->lane_n; i++) {
+        float path = env->lane_dist[i];
+        float max_path = open_path_limit(env->lane_block[i]);
+        if (path <= 0.0f || path > max_path) {
+            continue;
+        }
+        float dx = env->lane_x[i] - x;
+        float dy = env->lane_y[i] - y;
+        float d2 = dx * dx + dy * dy;
+        if (d2 < lo2 || d2 > hi2) {
+            continue;
+        }
+        if (dx * hx + dy * hy <= 0.0f) {
+            continue;
+        }
+        seen++;
+        if ((int)(rand_r(&env->rng) % (unsigned)seen) == 0) {
+            pick_x = env->lane_x[i];
+            pick_y = env->lane_y[i];
+        }
+    }
+    if (seen == 0) {
+        return 0;
+    }
+    write_goal(e, pick_x, pick_y);
+    return 1;
+}
+
+// Free lane point, not on a curb. Does not clear collided_before_goal.
+static int place_car(Drive* env, int agent_idx) {
+    Entity* e = &env->entities[agent_idx];
+    int npts = env->lane_n;
+    int tries = npts * 4;
+    if (tries < 256) {
+        tries = 256;
+    }
+    for (int attempt = 0; attempt < tries; attempt++) {
+        int k = (int)(rand_r(&env->rng) % (unsigned)npts);
+        if (env->lane_hx[k] == 0.0f && env->lane_hy[k] == 0.0f) {
+            continue;
+        }
+        sit_on_lane(env, e, k);
+        e->reached_goal = 0;
+        e->valid = 1;
+        e->lane_node = k;
+        if (spot_taken(env, agent_idx)) {
+            e->x = INVALID_POSITION;
+            e->y = INVALID_POSITION;
+            continue;
+        }
+        collision_check(env, agent_idx);
+        if (e->collision_state == NO_COLLISION) {
+            return 1;
+        }
+        e->collision_state = NO_COLLISION;
+        e->x = INVALID_POSITION;
+        e->y = INVALID_POSITION;
+    }
+    e->x = INVALID_POSITION;
+    e->y = INVALID_POSITION;
+    return 0;
+}
+
+// Cars first, then a goal on each forward centerline. A goal chosen
+// before the later cars exist can sit past a car placed afterward.
+// Does not clear collided_before_goal. The caller does that here.
 void initialize_env(Drive* env) {
-    int npts = lane_point_count(env);
+    int npts = env->lane_n;
     assert(npts > 1);
     int n = env->active_agent_count;
     float lo2 = env->goal_distance_min * env->goal_distance_min;
@@ -1282,78 +1457,38 @@ void initialize_env(Drive* env) {
     for (int i = 0; i < n; i++) {
         env->entities[i].x = INVALID_POSITION;
         env->entities[i].y = INVALID_POSITION;
-    }
-    int tries = npts * 8;
-    if (tries < 64) {
-        tries = 64;
+        env->entities[i].collided_before_goal = 0;
+        env->entities[i].reached_goal = 0;
+        env->entities[i].goals_sampled = 0;
+        env->entities[i].goals_clean = 0;
+        env->entities[i].collided_this_goal = 0;
     }
     for (int i = 0; i < n; i++) {
-        int placed = 0;
-        for (int attempt = 0; attempt < tries && !placed; attempt++) {
-            int k = (int)(rand_r(&env->rng) % (unsigned)npts);
-            float x, y, h;
-            lane_point(env, k, &x, &y, &h);
-            if (x == INVALID_POSITION || y == INVALID_POSITION) {
-                continue;
-            }
-            h = normalize_heading(h);
-            Entity* e = &env->entities[i];
-            e->x = x;
-            e->y = y;
-            e->z = 0.0f;
-            e->heading = h;
-            e->heading_x = cosf(h);
-            e->heading_y = sinf(h);
-            e->vx = 0.0f;
-            e->vy = 0.0f;
-            e->vz = 0.0f;
-            e->prev_accel = 0.0f;
-            e->prev_steer = 0.0f;
-            e->collision_state = NO_COLLISION;
-            e->reached_goal = 0;
-            e->collided_before_goal = 0;
-            e->valid = 1;
-            if (pose_blocked(env, i)) {
-                e->x = INVALID_POSITION;
-                e->y = INVALID_POSITION;
-                continue;
-            }
-            collision_check(env, i);
-            if (e->collision_state != NO_COLLISION) {
-                e->collision_state = NO_COLLISION;
-                e->x = INVALID_POSITION;
-                e->y = INVALID_POSITION;
-                continue;
-            }
-            int goal_ok = 0;
-            for (int gtry = 0; gtry < npts && !goal_ok; gtry++) {
-                int gk = (int)(rand_r(&env->rng) % (unsigned)npts);
-                float gx, gy;
-                lane_point(env, gk, &gx, &gy, NULL);
-                float dx = gx - x;
-                float dy = gy - y;
-                float d2 = dx * dx + dy * dy;
-                if (d2 < lo2 || d2 > hi2) {
-                    continue;
-                }
-                if (!goal_in_front(x, y, e->heading_x, e->heading_y,
-                        gx, gy)) {
-                    continue;
-                }
-                e->goal_position_x = gx;
-                e->goal_position_y = gy;
-                e->goal_position_z = 0.0f;
-                goal_ok = 1;
-            }
-            if (!goal_ok) {
-                e->x = INVALID_POSITION;
-                e->y = INVALID_POSITION;
-                continue;
-            }
-            placed = 1;
-        }
-        assert(placed);
+        assert(place_car(env, i) && "no free lane point");
     }
+    int rounds = npts * 4;
+    if (rounds < 64) {
+        rounds = 64;
+    }
+    int assigned = 0;
+    for (int round = 0; round < rounds && !assigned; round++) {
+        int fail = -1;
+        for (int i = 0; i < n; i++) {
+            Entity* e = &env->entities[i];
+            if (!pick_forward_goal(env, e, i)) {
+                fail = i;
+                break;
+            }
+        }
+        if (fail < 0) {
+            assigned = 1;
+            break;
+        }
+        env->entities[fail].x = INVALID_POSITION;
+        env->entities[fail].y = INVALID_POSITION;
+        assert(place_car(env, fail) && "no free lane point");
+    }
+    assert(assigned && "no forward goal short of the next car");
     for (int i = 0; i < n; i++) {
         collision_check(env, i);
         assert(env->entities[i].collision_state == NO_COLLISION);
@@ -1362,12 +1497,33 @@ void initialize_env(Drive* env) {
         float dy = e->goal_position_y - e->y;
         float d2 = dx * dx + dy * dy;
         assert(d2 >= lo2 && d2 <= hi2);
-        assert(goal_in_front(e->x, e->y, e->heading_x, e->heading_y,
-            e->goal_position_x, e->goal_position_y));
-        assert(e->vx == 0.0f && e->vy == 0.0f);
+        assert(dx * e->heading_x + dy * e->heading_y > 0.0f);
+        float speed = ((float)rand_r(&env->rng) / (float)RAND_MAX)
+            * SPAWN_SPEED_MAX_MPS;
+        e->vx = speed * e->heading_x;
+        e->vy = speed * e->heading_y;
+        e->vz = 0.0f;
+        assert(speed >= 0.0f && speed <= SPAWN_SPEED_MAX_MPS + 1.0e-4f);
+        assert(e->vx * e->heading_x + e->vy * e->heading_y >= -1.0e-4f);
+        lane_reach(env, e->lane_node);
+        lane_blocks(env, i);
+        int open = 0;
+        for (int k = 0; k < npts; k++) {
+            if (env->lane_x[k] != e->goal_position_x
+                    || env->lane_y[k] != e->goal_position_y) {
+                continue;
+            }
+            float path = env->lane_dist[k];
+            if (path > 0.0f && path <= open_path_limit(env->lane_block[k])) {
+                open = 1;
+                break;
+            }
+        }
+        assert(open);
         for (int j = i + 1; j < n; j++) {
             assert(!check_aabb_collision(e, &env->entities[j]));
         }
+        e->goals_sampled = 1;
     }
 }
 
@@ -1381,7 +1537,7 @@ void puf_reset(Drive* env) {
     compute_observations(env);
 }
 
-static void drive_human_controls(Drive* env) {
+static void human_controls(Drive* env) {
     if (!IsWindowReady() || !IsKeyDown(KEY_LEFT_SHIFT)) {
         return;
     }
@@ -1425,114 +1581,21 @@ static void drive_human_controls(Drive* env) {
     }
 }
 
-static int spot_taken(Drive* env, int self) {
-    Entity* a = &env->entities[self];
-    int n = env->active_agent_count;
-    for (int j = 0; j < n; j++) {
-        if (j == self) {
-            continue;
-        }
-        Entity* o = &env->entities[j];
-        if (o->x == INVALID_POSITION || o->y == INVALID_POSITION) {
-            continue;
-        }
-        if (check_aabb_collision(a, o)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int point_early(Drive* env, float x) {
-    if (!env->map_corners) {
-        return 1;
-    }
-    return x <= env->map_corners[0] + EARLY_ROAD;
-}
-
-static void write_goal(Entity* e, float gx, float gy) {
-    e->goal_position_x = gx;
-    e->goal_position_y = gy;
-    e->goal_position_z = 0.0f;
-    e->reached_goal = 0;
-}
-
-// Uniform among lane points in front of (x, y) whose squared distance
-// is in [lo2, hi2]. Returns 1 and writes the goal when one matches.
-static int pick_lane_goal(Drive* env, Entity* e, float x, float y,
-        float hx, float hy, float lo2, float hi2) {
-    int npts = lane_point_count(env);
-    float pick_x = 0.0f;
-    float pick_y = 0.0f;
-    int seen = 0;
-    for (int gk = 0; gk < npts; gk++) {
-        float gx, gy;
-        lane_point(env, gk, &gx, &gy, NULL);
-        float dx = gx - x;
-        float dy = gy - y;
-        float d2 = dx * dx + dy * dy;
-        if (d2 < lo2 || d2 > hi2) {
-            continue;
-        }
-        if (!goal_in_front(x, y, hx, hy, gx, gy)) {
-            continue;
-        }
-        seen++;
-        if ((int)(rand_r(&env->rng) % (unsigned)seen) == 0) {
-            pick_x = gx;
-            pick_y = gy;
-        }
-    }
-    if (seen > 0) {
-        write_goal(e, pick_x, pick_y);
-        return 1;
-    }
-    return 0;
-}
-
-// Another lane point in front. The distance band first, then any point
-// outside the arrival disk. Returns 0 when nothing is ahead.
-static int sample_goal(Drive* env, Entity* e, float x, float y) {
-    float lo2 = env->goal_distance_min * env->goal_distance_min;
-    float hi2 = env->goal_distance_max * env->goal_distance_max;
-    float hx = e->heading_x;
-    float hy = e->heading_y;
-    if (pick_lane_goal(env, e, x, y, hx, hy, lo2, hi2)) {
-        return 1;
-    }
-    float min2 = MIN_DISTANCE_TO_GOAL * MIN_DISTANCE_TO_GOAL;
-    return pick_lane_goal(env, e, x, y, hx, hy, min2, 1.0e30f);
-}
-
-// Early lane points first. Any free lane point if the entrance is full.
-// A pose counts only when it has a goal in front.
-static int try_respawn_pose(Drive* env, int agent_idx, int early_only) {
+static int try_respawn_pose(Drive* env, int agent_idx, int want_new_goal,
+        float gx, float gy) {
     Entity* e = &env->entities[agent_idx];
-    int npts = lane_point_count(env);
-    int tries = npts;
+    int npts = env->lane_n;
+    int tries = npts * 2;
     if (tries < 64) {
         tries = 64;
     }
+    float keep2 = MIN_DISTANCE_TO_GOAL * MIN_DISTANCE_TO_GOAL;
     for (int attempt = 0; attempt < tries; attempt++) {
         int k = (int)(rand_r(&env->rng) % (unsigned)npts);
-        float x, y, h;
-        lane_point(env, k, &x, &y, &h);
-        if (early_only && !point_early(env, x)) {
+        if (env->lane_hx[k] == 0.0f && env->lane_hy[k] == 0.0f) {
             continue;
         }
-        h = normalize_heading(h);
-        e->x = x;
-        e->y = y;
-        e->z = 0.0f;
-        e->heading = h;
-        e->heading_x = cosf(h);
-        e->heading_y = sinf(h);
-        e->vx = 0.0f;
-        e->vy = 0.0f;
-        e->vz = 0.0f;
-        e->prev_accel = 0.0f;
-        e->prev_steer = 0.0f;
-        e->collision_state = NO_COLLISION;
+        sit_on_lane(env, e, k);
         if (spot_taken(env, agent_idx)) {
             continue;
         }
@@ -1541,27 +1604,26 @@ static int try_respawn_pose(Drive* env, int agent_idx, int early_only) {
             e->collision_state = NO_COLLISION;
             continue;
         }
-        if (!sample_goal(env, e, e->x, e->y)) {
-            continue;
+        e->lane_node = k;
+        if (want_new_goal) {
+            if (!pick_forward_goal(env, e, agent_idx)) {
+                continue;
+            }
+        } else {
+            float dx = e->x - gx;
+            float dy = e->y - gy;
+            if (dx * dx + dy * dy < keep2) {
+                continue;
+            }
+            write_goal(e, gx, gy);
         }
+        e->goals_sampled++;
+        e->collided_this_goal = 0;
         return 1;
     }
     return 0;
 }
 
-static void restore_pose(Entity* e, float ox, float oy, float oh,
-        float ohx, float ohy, float ovx, float ovy) {
-    e->x = ox;
-    e->y = oy;
-    e->heading = oh;
-    e->heading_x = ohx;
-    e->heading_y = ohy;
-    e->vx = ovx;
-    e->vy = ovy;
-}
-
-// Back to an early lane point, then a new goal in front. A full entrance
-// keeps the arrival pose when that pose still has a goal ahead.
 static void respawn_agent(Drive* env, int agent_idx) {
     Entity* e = &env->entities[agent_idx];
     float ox = e->x;
@@ -1571,21 +1633,51 @@ static void respawn_agent(Drive* env, int agent_idx) {
     float ohy = e->heading_y;
     float ovx = e->vx;
     float ovy = e->vy;
-    if (try_respawn_pose(env, agent_idx, 1)) {
+    float gx = e->goal_position_x;
+    float gy = e->goal_position_y;
+    int onode = e->lane_node;
+    int node = -1;
+    float best_d = LANE_NODE_SNAP * LANE_NODE_SNAP;
+    for (int i = 0; i < env->lane_n; i++) {
+        float dot = ohx * env->lane_hx[i] + ohy * env->lane_hy[i];
+        if (dot <= LANE_HEADING_DOT) {
+            continue;
+        }
+        float dx = env->lane_x[i] - ox;
+        float dy = env->lane_y[i] - oy;
+        float d2 = dx * dx + dy * dy;
+        if (d2 <= best_d) {
+            best_d = d2;
+            node = i;
+        }
+    }
+    if (node >= 0) {
+        e->lane_node = node;
+        if (pick_forward_goal(env, e, agent_idx)) {
+            e->goals_sampled++;
+            e->collided_this_goal = 0;
+            return;
+        }
+    }
+    if (try_respawn_pose(env, agent_idx, 1, gx, gy)
+            || try_respawn_pose(env, agent_idx, 0, gx, gy)) {
         return;
     }
-    restore_pose(e, ox, oy, oh, ohx, ohy, ovx, ovy);
-    if (sample_goal(env, e, e->x, e->y)) {
-        return;
-    }
-    if (try_respawn_pose(env, agent_idx, 0)) {
-        return;
-    }
-    restore_pose(e, ox, oy, oh, ohx, ohy, ovx, ovy);
+    e->x = ox;
+    e->y = oy;
+    e->heading = oh;
+    e->heading_x = ohx;
+    e->heading_y = ohy;
+    e->vx = ovx;
+    e->vy = ovy;
+    e->lane_node = onode;
+    e->goal_position_x = gx;
+    e->goal_position_y = gy;
+    e->reached_goal = 1;
 }
 
 void puf_step(Drive* env) {
-    drive_human_controls(env);
+    human_controls(env);
     if (!env->entities || env->active_agent_count <= 0) {
         return;
     }
@@ -1600,11 +1692,24 @@ void puf_step(Drive* env) {
 
     if (env->timestep == env->episode_length) {
         for (int i = 0; i < env->active_agent_count; i++) {
+            float full = 0.0f;
+            if (env->entities[i].goals_sampled > 0) {
+                full = (float)env->entities[i].goals_clean
+                    / (float)env->entities[i].goals_sampled;
+            }
+            env->logs[i].score_full_horizon = full;
             env->log.completion_rate += env->logs[i].completion_rate;
             env->log.offroad_rate += env->logs[i].offroad_rate;
             env->log.collision_rate += env->logs[i].collision_rate;
             env->log.collision_count += env->logs[i].collision_count;
             env->log.score += env->logs[i].score;
+            env->log.score_full_horizon += full;
+            // Agents that never score stay at 0. exp(jerk) is 1 with no
+            // velocity change and falls as the penalty adds up.
+            float quality = env->logs[i].score * expf(env->logs[i].jerk);
+            env->logs[i].score_quality = quality;
+            env->log.score_quality += quality;
+            env->log.jerk += env->logs[i].jerk;
             env->log.perf += env->logs[i].perf;
             env->log.episode_length += env->logs[i].episode_length;
             env->log.episode_return += env->logs[i].episode_return;
@@ -1614,6 +1719,7 @@ void puf_step(Drive* env) {
         return;
     }
 
+    float step_jerk[DRIVE_AGENT_MAX] = {0};
     for (int i = 0; i < env->active_agent_count; i++) {
         Entity* agent = &env->entities[i];
         if (agent->x == INVALID_POSITION) {
@@ -1621,7 +1727,15 @@ void puf_step(Drive* env) {
         }
         env->logs[i].episode_length += 1;
         agent->collision_state = NO_COLLISION;
+        // |Δv| / dt, same term as PufferDrive classic dynamics. The
+        // coefficient is reward_jerk (that code uses -0.0002).
+        float prev_vx = agent->vx;
+        float prev_vy = agent->vy;
         move_dynamics(env, i);
+        float dvx = agent->vx - prev_vx;
+        float dvy = agent->vy - prev_vy;
+        step_jerk[i] = env->reward_jerk
+            * sqrtf(dvx * dvx + dvy * dvy) / SIM_DT;
     }
 
     // Collision detection and rewards
@@ -1643,21 +1757,28 @@ void puf_step(Drive* env) {
             env->logs[i].offroad_rate = 1.0f;
             env->logs[i].episode_return += env->reward_offroad_collision;
         }
-        if (collision_state > NO_COLLISION
-                && env->logs[i].completion_rate == 0.0f) {
-            agent->collided_before_goal = 1;
+        if (collision_state > NO_COLLISION) {
+            agent->collided_this_goal = 1;
+            if (env->logs[i].completion_rate == 0.0f) {
+                agent->collided_before_goal = 1;
+            }
         }
 
         float distance_to_goal = relative_distance_2d(
             agent->x, agent->y,
             agent->goal_position_x, agent->goal_position_y);
 
-        // Inside 2 m: pay reward_goal, then respawn with a new goal.
-        int at_goal = distance_to_goal < MIN_DISTANCE_TO_GOAL;
-        if (at_goal) {
+        // Inside 5 m, once per goal. Respawn samples the next one.
+        // Staying on the same point does not pay again.
+        int arrived = distance_to_goal < MIN_DISTANCE_TO_GOAL
+            && !agent->reached_goal;
+        if (arrived) {
             env->agents[i].rewards[0] += env->reward_goal;
             env->logs[i].episode_return += env->reward_goal;
             agent->reached_goal = 1;
+            if (!agent->collided_this_goal) {
+                agent->goals_clean++;
+            }
             if (env->logs[i].completion_rate == 0.0f) {
                 env->logs[i].completion_rate = 1.0f;
                 if (!agent->collided_before_goal) {
@@ -1667,23 +1788,12 @@ void puf_step(Drive* env) {
             }
         }
 
-        // Squared bin-steps of accel and steer. One adjacent-bin flip costs
-        // reward_jerk. The first step of an episode compares against 0.
-        float* atn = env->agents[i].actions;
-        if (atn) {
-            float accel = ACCELERATION_VALUES[(int)atn[0]];
-            float steer = STEERING_VALUES[(int)atn[1]];
-            float accel_step = ACCELERATION_VALUES[1] - ACCELERATION_VALUES[0];
-            float steer_step = STEERING_VALUES[1] - STEERING_VALUES[0];
-            float da = (accel - agent->prev_accel) / accel_step;
-            float ds = (steer - agent->prev_steer) / steer_step;
-            float jerk_penalty = env->reward_jerk * (da * da + ds * ds);
-            env->agents[i].rewards[0] += jerk_penalty;
-            env->logs[i].episode_return += jerk_penalty;
-            agent->prev_accel = accel;
-            agent->prev_steer = steer;
-        }
-        if (at_goal) {
+        // After the collision assignment, which writes rewards[0].
+        float jerk_penalty = step_jerk[i];
+        env->agents[i].rewards[0] += jerk_penalty;
+        env->logs[i].episode_return += jerk_penalty;
+        env->logs[i].jerk += jerk_penalty;
+        if (arrived) {
             respawn_agent(env, i);
         }
     }
@@ -1724,7 +1834,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->goal_distance_max = (float)dict_get(kwargs, "goal_distance_max");
     env->timestep = 0;
     env->episode_length = (int)dict_get(kwargs, "episode_length");
-    drive_load_world(env);
+    load_world(env);
     for (int i = 0; i < env->num_agents; i++) {
         env->agents[i].policy = 0;
         env->agents[i].action_mask = NULL;
@@ -1734,6 +1844,9 @@ void puf_init(Env* env, Dict* kwargs) {
 void puf_log(Log* log, Dict* out) {
     dict_set(out, "perf", log->perf);
     dict_set(out, "score", log->score);
+    dict_set(out, "score_full_horizon", log->score_full_horizon);
+    dict_set(out, "score_quality", log->score_quality);
+    dict_set(out, "jerk", log->jerk);
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
     dict_set(out, "offroad_rate", log->offroad_rate);

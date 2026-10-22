@@ -40,8 +40,9 @@
 #define COLLISION_BUMP 0
 #define COLLISION_THROUGH 1
 
-// Grid map
-#define GRID_CELL_SIZE 2.0f
+// Grid map. 5 m cells: the vision spiral is about 50 m and collision
+// looks ±2 cells, which covers one bottleneck segment.
+#define GRID_CELL_SIZE 5.0f
 #define MAX_ENTITIES_PER_CELL 10
 #define SLOTS_PER_CELL (MAX_ENTITIES_PER_CELL * 2 + 1)
 #define VISION_RANGE 21
@@ -73,10 +74,8 @@
 #define OBS_POSITION_SCALE 0.02f
 
 // Distance thresholds
-// Arrival radius. Inside this, the goal is counted and a new one is sampled.
-#define MIN_DISTANCE_TO_GOAL 2.0f
-// Respawn pose stays within this of the upstream map edge.
-#define EARLY_ROAD 100.0f
+// Arrival radius. A 5 m disk covers a 5 m centerline segment.
+#define MIN_DISTANCE_TO_GOAL 5.0f
 #define COLLISION_DIST_SQ 225.0f
 // Closing-speed bounce. 0 stops at the contact, 1 sends it back at full speed.
 #define BUMP_BOUNCE 0.4f
@@ -89,6 +88,8 @@
 #define CAR_LENGTH 4.3f
 #define CAR_WIDTH 1.8f
 #define CAR_HEIGHT 1.5f
+// Episode reset draws a speed along the lane, uniform on [0, 50] mph.
+#define SPAWN_SPEED_MAX_MPS (50.0f * 1609.344f / 3600.0f)
 
 // Action space
 #define NUM_ACCEL_BINS 7
@@ -123,3 +124,13 @@ static const int collision_offsets[25][2] = {
     {-2,  1}, {-1,  1}, {0,  1}, {1,  1}, {2,  1},
     {-2,  2}, {-1,  2}, {0,  2}, {1,  2}, {2,  2}
 };
+
+// A goal is a later point on this road. Joins are another polyline
+// that starts within 1 m and keeps the same direction. The gore is
+// wider than that, so it is not a way through.
+#define LANE_STITCH 1.0f
+#define LANE_HEADING_DOT 0.5f
+#define LANE_CAR_RADIUS 2.5f
+#define GOAL_FOLLOW_GAP 8.0f
+#define LANE_NODE_SNAP 4.0f
+#define LANE_SUCC_MAX 16
