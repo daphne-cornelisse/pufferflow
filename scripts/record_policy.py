@@ -5,7 +5,8 @@ The frame is split. The left panel is a bird's-eye view of the scene. The
 right panel is one agent's point of view (env.selected_agent_idx, or --agent).
 The top right is that agent's observation: road points colored by type,
 its blue bounding box and heading arrow, and partner boxes in view.
-The clip is one episode of 200 steps at the training step size of 0.1 s.
+The clip is one episode. Its length is env.episode_length from the run
+ini (500 in the current drive config), at the training step size of 0.1 s.
 
 Uses ./drive, the CPU player, so the recording does not take the training GPU.
 The trainer calls this when it saves a checkpoint and base.record_rollout_every
@@ -79,14 +80,33 @@ def resolve(path):
     return ROOT / path
 
 
+def episode_steps(raw):
+    """Ini values are floats. A missing or bad value stays at 500."""
+    if raw is None or raw == "":
+        return 500
+    try:
+        steps = int(float(raw))
+    except ValueError:
+        return 500
+    if steps < 1:
+        return 500
+    return steps
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ini", type=Path, help="run log ini from the end of training")
     parser.add_argument("--checkpoint", type=Path, help="weights .bin")
     parser.add_argument("--out", type=Path, help="mp4 path; default is next to the ini")
     parser.add_argument("--agent", type=int, default=None, help="selected_agent_idx")
-    parser.add_argument("--frames", type=int, default=200)
-    parser.add_argument("--episode-length", type=int, default=200)
+    parser.add_argument(
+        "--frames", type=int, default=None,
+        help="frames to store; default is one episode",
+    )
+    parser.add_argument(
+        "--episode-length", type=int, default=None,
+        help="override env.episode_length from the ini",
+    )
     parser.add_argument("--drive", type=Path, default=ROOT / "drive")
     args = parser.parse_args()
 
@@ -125,15 +145,19 @@ def main():
         )
         return 1
 
+    env_section = sections.get("env", {})
+    episode_length = args.episode_length
+    if episode_length is None:
+        episode_length = episode_steps(env_section.get("episode_length"))
+    frames = args.frames if args.frames is not None else episode_length
     command = [
         str(drive),
         str(checkpoint),
         "--record",
         str(out),
         "--record-frames",
-        str(args.frames),
+        str(frames),
     ]
-    env_section = sections.get("env", {})
     for key in ENV_KEYS:
         if key in env_section:
             command.append(f"--env.{key}={env_section[key]}")
@@ -143,7 +167,7 @@ def main():
     for key in POLICY_KEYS:
         if key in policy:
             command.append(f"--policy.{key}={policy[key]}")
-    command.append(f"--env.episode_length={args.episode_length}")
+    command.append(f"--env.episode_length={episode_length}")
 
     env = os.environ.copy()
     env.pop("DISPLAY", None)
