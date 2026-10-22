@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Plot a protein sweep from its log and per-run metrics.
 
-The figure is three rows. Score quality against sweep index is the first
+The figure is four rows. Score quality against sweep index is the first
 panel, colored by run. Completion rate against jerk is next. Every panel
 colors runs with ColorBrewer Set1, except episode return against sweep
 index, which is colored by trial wall clock. The other panels are return
 curves, goal score, collision rate, score against jerk when those series
-exist (otherwise collision count), and parameter count. The bottom row is
-a boxplot of the swept hyperparameters with one swarm point per run. Each
-hyperparameter is scaled to its own min and max.
+exist (otherwise collision count), and parameter count. Under that, the
+rate-like hyperparameters share one boxplot, each scaled to its own min
+and max. Hidden size, layer count, horizon, minibatch size, agent count,
+and timestep budget each have their own panel, in the units they were
+swept, with one swarm point per run.
 
     python scripts/plot_sweep.py logs/drive/sweep.log -o logs/drive/sweep-panels.png
 
@@ -33,7 +35,8 @@ RUN_LINE = re.compile(
 # Drive observation is 8 ego + 64*7 partners + 75*7 road. Decoder is
 # 7 accel logits, 13 steer logits, and one value output.
 POLICY_PARAMS_PER_HIDDEN = 8 + 7 * 64 + 7 * 75 + 7 + 13 + 1
-# Swept settings shown on the bottom row. gae_lambda is the GAE discount.
+# Swept settings. gae_lambda is the GAE discount. The rate-like fields share
+# a scaled axis. The count fields are drawn one panel each, unscaled.
 HYPER_FIELDS = (
     ("gamma", "train", "gamma"),
     ("gae_lambda", "train", "gae_lambda"),
@@ -51,6 +54,26 @@ HYPER_FIELDS = (
     ("minibatch_size", "train", "minibatch_size"),
     ("total_agents", "vec", "total_agents"),
     ("total_timesteps", "train", "total_timesteps"),
+)
+SCALED_HYPERS = (
+    "gamma",
+    "gae_lambda",
+    "learning_rate",
+    "ent_coef",
+    "replay_ratio",
+    "clip_coef",
+    "vf_coef",
+    "vf_clip_coef",
+    "momentum",
+    "max_grad_norm",
+)
+SIZE_HYPERS = (
+    "hidden_size",
+    "num_layers",
+    "minibatch_size",
+    "total_agents",
+    "horizon",
+    "total_timesteps",
 )
 
 
@@ -204,25 +227,37 @@ def style_steps(ax):
 
 
 def figure_axes():
-    """Two rows of result panels and a full-width hyperparameter row."""
-    fig = plt.figure(figsize=(22.4, 12.6), dpi=150)
-    grid = fig.add_gridspec(3, 4, height_ratios=[1.0, 1.0, 1.2])
-    axes = [fig.add_subplot(grid[row, col]) for row in range(2) for col in range(4)]
-    return fig, axes, fig.add_subplot(grid[2, :])
+    """Result panels, one scaled coefficient row, then one panel per size."""
+    fig = plt.figure(figsize=(22.4, 16.4), dpi=150, layout="constrained")
+    outer = fig.add_gridspec(
+        4, 1, height_ratios=[1.0, 1.0, 1.05, 1.15],
+    )
+    top = outer[0].subgridspec(1, 4, wspace=0.28)
+    mid = outer[1].subgridspec(1, 4, wspace=0.28)
+    axes = [fig.add_subplot(top[0, col]) for col in range(4)]
+    axes += [fig.add_subplot(mid[0, col]) for col in range(4)]
+    coef_ax = fig.add_subplot(outer[2])
+    size_grid = outer[3].subgridspec(1, len(SIZE_HYPERS), wspace=0.42)
+    size_axes = [
+        fig.add_subplot(size_grid[0, i]) for i in range(len(SIZE_HYPERS))
+    ]
+    return fig, axes, coef_ax, size_axes
 
 
-def draw_hypers(ax, summary, palette):
-    """Boxplot of each swept hyperparameter, with one swarm point per run.
+def draw_hypers(ax, summary, palette, fields):
+    """Boxplot of rate-like hyperparameters, one swarm point per run.
 
     Values are scaled to the min and max of that hyperparameter in this figure.
     """
     rows = []
     for record in summary.to_dict("records"):
-        for label, _section, _key in HYPER_FIELDS:
+        for label in fields:
             value = record.get(label)
             if value is None or value != value:
                 continue
-            rows.append({"series": record["series"], "hyper": label, "value": float(value)})
+            rows.append({
+                "series": record["series"], "hyper": label, "value": float(value),
+            })
     frame = pd.DataFrame(rows)
     if frame.empty:
         ax.set_axis_off()
@@ -235,7 +270,7 @@ def draw_hypers(ax, summary, palette):
             return pd.Series(0.5, index=values.index)
         return (values - lo) / (hi - lo)
     frame["scaled"] = frame.groupby("hyper", sort=False)["value"].transform(scale)
-    order = [label for label, _section, _key in HYPER_FIELDS if label in set(frame["hyper"])]
+    order = [label for label in fields if label in set(frame["hyper"])]
     sns.boxplot(
         data=frame, x="hyper", y="scaled", order=order, ax=ax,
         color="#d0d0d0", fliersize=0, width=0.62, linewidth=0.8,
@@ -246,11 +281,44 @@ def draw_hypers(ax, summary, palette):
     )
     ax.set_xlabel("")
     ax.set_ylabel("scaled value")
-    ax.set_title("Hyperparameters")
+    ax.set_title("Coefficients")
     ax.set_ylim(-0.08, 1.08)
     ax.tick_params(axis="x", labelrotation=32)
     for label in ax.get_xticklabels():
         label.set_ha("right")
+
+
+def draw_size_panel(ax, summary, palette, label):
+    """One size hyperparameter in the units it was swept, not rescaled."""
+    if label not in summary.columns or not summary[label].notna().any():
+        ax.set_axis_off()
+        return
+    part = summary.loc[summary[label].notna(), ["series", label]].copy()
+    part = part.rename(columns={label: "value"})
+    part["hyper"] = label
+    sns.boxplot(
+        data=part, x="hyper", y="value", ax=ax,
+        color="#d0d0d0", fliersize=0, width=0.55, linewidth=0.8,
+    )
+    sns.swarmplot(
+        data=part, x="hyper", y="value", hue="series",
+        palette=palette, ax=ax, legend=False, size=4.0,
+    )
+    lo = float(part["value"].min())
+    hi = float(part["value"].max())
+    span = hi - lo
+    pad = span * 0.22 if span > 0 else max(abs(lo) * 0.08, 0.5)
+    ax.set_ylim(lo - pad, hi + pad)
+    if max(abs(lo), abs(hi)) >= 1.0e4:
+        # Tick text is the value itself. The default sci offset sits on the title.
+        ax.yaxis.set_major_formatter(
+            plt.FuncFormatter(lambda value, _pos: f"{value:.2e}")
+        )
+        ax.yaxis.get_offset_text().set_visible(False)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.set_title(label.replace("_", " "))
+    ax.tick_params(axis="x", labelbottom=False)
 
 
 def draw(returns, collisions, counts, summary, out):
@@ -262,7 +330,7 @@ def draw(returns, collisions, counts, summary, out):
     if len(counts):
         counts = with_series(counts)
 
-    fig, axes, hyper_ax = figure_axes()
+    fig, axes, hyper_ax, size_axes = figure_axes()
 
     if summary["score_quality"].notna().any():
         sns.scatterplot(
@@ -375,10 +443,11 @@ def draw(returns, collisions, counts, summary, out):
     axes[7].set_ylabel("parameters")
     axes[7].set_title("Network parameters")
 
-    draw_hypers(hyper_ax, summary, palette)
-    for ax in list(axes) + [hyper_ax]:
+    draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
+    for ax, label in zip(size_axes, SIZE_HYPERS):
+        draw_size_panel(ax, summary, palette, label)
+    for ax in list(axes) + [hyper_ax] + list(size_axes):
         sns.despine(ax=ax)
-    fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out)
     plt.close(fig)
@@ -421,7 +490,7 @@ def draw_overview(returns, collisions, counts, summary, out):
     """
     sns.set_theme(style="whitegrid", context="notebook")
     palette = series_palette(summary["series"])
-    fig, axes, hyper_ax = figure_axes()
+    fig, axes, hyper_ax, size_axes = figure_axes()
     markers = {"through": "o", "bump": "s"}
 
     if summary["score_quality"].notna().any():
@@ -537,7 +606,9 @@ def draw_overview(returns, collisions, counts, summary, out):
     axes[7].set_ylabel("parameters")
     axes[7].set_title("Network parameters")
 
-    draw_hypers(hyper_ax, summary, palette)
+    draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
+    for ax, label in zip(size_axes, SIZE_HYPERS):
+        draw_size_panel(ax, summary, palette, label)
     from matplotlib.lines import Line2D
     fig.legend(
         handles=[
@@ -546,9 +617,8 @@ def draw_overview(returns, collisions, counts, summary, out):
         ],
         loc="upper right", frameon=False,
     )
-    for ax in list(axes) + [hyper_ax]:
+    for ax in list(axes) + [hyper_ax] + list(size_axes):
         sns.despine(ax=ax)
-    fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out)
     plt.close(fig)
