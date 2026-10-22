@@ -117,6 +117,7 @@ struct Env {
     float world_mean_y;
     float reward_goal;
     float reward_jerk;
+    int collision_physics;
     unsigned int rng;
     // 1 after ./drive loads a checkpoint that matches this network.
     int checkpoint_ok;
@@ -861,13 +862,17 @@ static void bump_agents(Drive* env) {
         prev_x[i] = e->x - e->vx * SIM_DT;
         prev_y[i] = e->y - e->vy * SIM_DT;
     }
+    // through leaves overlapping cars where they are. Curbs still push.
+    int through = env->collision_physics == COLLISION_THROUGH;
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < n; i++) {
-            for (int j = i + 1; j < n; j++) {
-                bump_pair(env,
-                    &env->entities[i], &env->entities[j],
-                    prev_x[i], prev_y[i], prev_x[j], prev_y[j],
-                    pass == 0);
+            if (!through) {
+                for (int j = i + 1; j < n; j++) {
+                    bump_pair(env,
+                        &env->entities[i], &env->entities[j],
+                        prev_x[i], prev_y[i], prev_x[j], prev_y[j],
+                        pass == 0);
+                }
             }
             bump_curb(env, &env->entities[i], prev_x[i], prev_y[i]);
         }
@@ -1688,8 +1693,21 @@ void puf_step(Drive* env) {
     compute_observations(env);
 }
 
+static int collision_physics_mode(const char* name) {
+    if (strcmp(name, "bump") == 0) {
+        return COLLISION_BUMP;
+    }
+    if (strcmp(name, "through") == 0) {
+        return COLLISION_THROUGH;
+    }
+    fprintf(stderr, "collision_physics must be bump or through, got %s\n", name);
+    exit(1);
+}
+
 void puf_init(Env* env, Dict* kwargs) {
     env->selected_agent_idx = dict_get(kwargs, "selected_agent_idx");
+    env->collision_physics = collision_physics_mode(
+        dict_get_str(kwargs, "collision_physics"));
     env->reward_vehicle_collision = dict_get(kwargs, "reward_vehicle_collision");
     env->reward_offroad_collision = dict_get(kwargs, "reward_offroad_collision");
     env->reward_goal = dict_get(kwargs, "reward_goal");

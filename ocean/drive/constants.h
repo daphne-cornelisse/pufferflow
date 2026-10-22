@@ -36,6 +36,10 @@
 #define AGENT_COLLISION 1
 #define OFFROAD 2
 
+// Agent-agent response. bump separates the cars. through leaves the overlap.
+#define COLLISION_BUMP 0
+#define COLLISION_THROUGH 1
+
 // Grid map
 #define GRID_CELL_SIZE 2.0f
 #define MAX_ENTITIES_PER_CELL 10
