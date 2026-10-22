@@ -38,7 +38,10 @@ Client* make_client(Drive* env) {
     client->height = 704;
     int recording = puf_record_enabled();
     if (recording) {
-        puf_record_ensure_display();
+        // 1.25x the interactive frame. Both axes stay even for yuv420.
+        client->width = 1600;
+        client->height = 880;
+        puf_record_ensure_display((int)client->width, (int)client->height);
     }
     unsigned int flags = FLAG_MSAA_4X_HINT;
     if (recording) {
@@ -295,6 +298,7 @@ static void sim_obs_arrow(float cx, float cy, float ppm,
 }
 
 // Box in the ego frame. (c, s) is the car's heading, forward then left.
+// The fill is drawn with the outline so the car covers road points.
 static void sim_obs_box(float cx, float cy, float ppm,
         float f, float l, float hl, float hw,
         float c, float s, float thick, Color color) {
@@ -308,6 +312,12 @@ static void sim_obs_box(float cx, float cy, float ppm,
     float l2 = l - hl * s - hw * ll;
     float f3 = f - hl * c + hw * lf;
     float l3 = l - hl * s + hw * ll;
+    Vector2 p0 = {cx - l0 * ppm, cy - f0 * ppm};
+    Vector2 p1 = {cx - l1 * ppm, cy - f1 * ppm};
+    Vector2 p2 = {cx - l2 * ppm, cy - f2 * ppm};
+    Vector2 p3 = {cx - l3 * ppm, cy - f3 * ppm};
+    DrawTriangle(p0, p1, p2, color);
+    DrawTriangle(p0, p2, p3, color);
     sim_obs_seg(cx, cy, ppm, f0, l0, f1, l1, thick, color);
     sim_obs_seg(cx, cy, ppm, f1, l1, f2, l2, thick, color);
     sim_obs_seg(cx, cy, ppm, f2, l2, f3, l3, thick, color);
@@ -854,18 +864,30 @@ static Camera3D pov_camera(Drive* env) {
 // Top-right of a recorded frame. The selected agent's observation, in
 // that car's frame. Forward is up and left is left. The crop is a fixed
 // 20 m half-width centered on the car, so it does not zoom. Lane points
-// are muted, edges are amber. Road lines are not drawn. The blue box and
-// the arrow are the ego car. Partner boxes are the cars in view.
+// are muted, edges are amber. Road lines are not drawn. Boxes are filled
+// after the points so the cars cover them. Speed and destination sit
+// under the crop.
+static float record_scale(Drive* env) {
+    float h = 704.0f;
+    if (env->client && env->client->height > 1.0f) {
+        h = env->client->height;
+    }
+    return h / 704.0f;
+}
+
 static Rectangle record_agent_view(Drive* env) {
-    const float box_w = 300.0f;
-    const float box_h = 348.0f;
-    float screen_w = 1280.0f;
-    if (env->client && env->client->width > box_w + 24.0f) {
+    float ui = record_scale(env);
+    const float box_w = 300.0f * ui;
+    const float box_h = 348.0f * ui;
+    float screen_w = 1600.0f;
+    if (env->client && env->client->width > box_w + 24.0f * ui) {
         screen_w = env->client->width;
     }
-    Rectangle rect = {screen_w - 12.0f - box_w, 12.0f, box_w, box_h};
+    Rectangle rect = {
+        screen_w - 12.0f * ui - box_w, 12.0f * ui, box_w, box_h
+    };
     DrawRectangleRec(rect, CARD);
-    DrawRectangleLinesEx(rect, 1.0f, LINE);
+    DrawRectangleLinesEx(rect, ui, LINE);
 
     int slot = 0;
     if (env->active_agent_count > 0) {
@@ -876,38 +898,23 @@ static Rectangle record_agent_view(Drive* env) {
         obs = env->agents[slot].observations;
     }
     if (!obs) {
-        sim_sans(env, "no view", rect.x + 10.0f, rect.y + 12.0f, 16, MUTED);
+        sim_sans(env, "no view", rect.x + 10.0f * ui, rect.y + 12.0f * ui,
+            16.0f * ui, MUTED);
         return rect;
     }
 
-    float spd = obs[2] / OBS_SPEED_SCALE;
-    int hit = obs[5] > 0.5f;
-    float gf = obs[0] / OBS_GOAL_SCALE;
-    float gl = obs[1] / OBS_GOAL_SCALE;
-    float gd = sqrtf(gf * gf + gl * gl);
-    char cap[64];
-    snprintf(cap, sizeof(cap), "v %.1f%s", spd, hit ? "  hit" : "");
-    sim_sans(env, cap, rect.x + 10.0f, rect.y + 8.0f, 16,
-        hit ? CRIMSON : INK);
-    char goal_txt[64];
-    if (gd >= 10.0f) {
-        snprintf(goal_txt, sizeof(goal_txt),
-            "distance to next destination %.0f m", gd);
-    } else {
-        snprintf(goal_txt, sizeof(goal_txt),
-            "distance to next destination %.1f m", gd);
-    }
-    sim_sans(env, goal_txt, rect.x + 10.0f, rect.y + 26.0f, 13, SAGE_INK);
-    char step_txt[32];
-    snprintf(step_txt, sizeof(step_txt), "t %d", env->timestep);
-    sim_sans(env, step_txt, rect.x + 10.0f, rect.y + 44.0f, 16, INK);
+    char title[64];
+    snprintf(title, sizeof(title), "Observation of agent %d", slot);
+    sim_sans(env, title, rect.x + 10.0f * ui, rect.y + 8.0f * ui,
+        15.0f * ui, INK);
 
     int road0 = EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS;
     const float range = 20.0f;
-
+    // Title on top. Speed, destination, and timestep sit under the crop.
+    const float foot = 62.0f * ui;
     Rectangle plot = {
-        rect.x + 8.0f, rect.y + 66.0f,
-        rect.width - 16.0f, rect.height - 74.0f
+        rect.x + 8.0f * ui, rect.y + 30.0f * ui,
+        rect.width - 16.0f * ui, rect.height - 38.0f * ui - foot
     };
     float side = plot.width;
     if (plot.height < side) {
@@ -940,7 +947,7 @@ static Rectangle record_agent_view(Drive* env) {
                 col = AMBER;
             }
             DrawCircleV((Vector2){cx - mid_l * ppm, cy - mid_f * ppm},
-                3.4f, col);
+                3.4f * ui, col);
         }
     }
     for (int j = 0; j < MAX_AGENTS; j++) {
@@ -961,7 +968,7 @@ static Rectangle record_agent_view(Drive* env) {
         }
         float ang = atan2f(p[5], p[4]);
         sim_obs_box(cx, cy, ppm, f, l, hl, hw,
-            cosf(ang), sinf(ang), 1.6f, CORAL);
+            cosf(ang), sinf(ang), 1.6f * ui, CORAL);
     }
     float ego_hw = obs[3] * MAX_VEH_WIDTH * 0.5f;
     float ego_hl = obs[4] * MAX_VEH_LEN * 0.5f;
@@ -972,11 +979,32 @@ static Rectangle record_agent_view(Drive* env) {
         ego_hl = 0.6f;
     }
     sim_obs_box(cx, cy, ppm, 0.0f, 0.0f, ego_hl, ego_hw,
-        1.0f, 0.0f, 2.0f, STEEL);
+        1.0f, 0.0f, 2.0f * ui, STEEL);
     sim_obs_arrow(cx, cy, ppm, 0.0f, 0.0f, 1.0f, 0.0f,
-        22.0f / ppm, STEEL_INK);
+        22.0f * ui / ppm, STEEL_INK);
     EndScissorMode();
-    DrawRectangleLinesEx(plot, 1.0f, LINE);
+    DrawRectangleLinesEx(plot, ui, LINE);
+
+    float spd = obs[2] / OBS_SPEED_SCALE;
+    int hit = obs[5] > 0.5f;
+    float gf = obs[0] / OBS_GOAL_SCALE;
+    float gl = obs[1] / OBS_GOAL_SCALE;
+    float gd = sqrtf(gf * gf + gl * gl);
+    float tx = rect.x + 10.0f * ui;
+    float ty = plot.y + plot.height + 6.0f * ui;
+    char cap[64];
+    snprintf(cap, sizeof(cap), "v %.1f%s", spd, hit ? "  hit" : "");
+    sim_sans(env, cap, tx, ty, 15.0f * ui, hit ? CRIMSON : INK);
+    char goal_txt[64];
+    if (gd >= 10.0f) {
+        snprintf(goal_txt, sizeof(goal_txt), "distance to dest. [%.0f m]", gd);
+    } else {
+        snprintf(goal_txt, sizeof(goal_txt), "distance to dest. [%.1f m]", gd);
+    }
+    sim_sans(env, goal_txt, tx, ty + 18.0f * ui, 13.0f * ui, SAGE_INK);
+    char step_txt[32];
+    snprintf(step_txt, sizeof(step_txt), "t %d", env->timestep);
+    sim_sans(env, step_txt, tx, ty + 36.0f * ui, 15.0f * ui, INK);
     return rect;
 }
 
@@ -1023,12 +1051,10 @@ static void record_views(Drive* env) {
         (Rectangle){0, 0, (float)right_w, (float)-h},
         (Rectangle){(float)left_w, 0, (float)right_w, (float)h},
         (Vector2){0, 0}, 0.0f, WHITE);
-    DrawRectangle(left_w - 1, 0, 2, h, INK);
-    Rectangle obs_box = record_agent_view(env);
-    sim_sans(env, "Full simulator state", 16.0f, 14.0f, 20, INK);
-    const char* who = TextFormat("Selected agent %d", selected_slot(env));
-    Vector2 who_sz = MeasureTextEx(sim_font(env), who, 20, 0.4f);
-    sim_sans(env, who, obs_box.x - who_sz.x - 12.0f, 14.0f, 20, INK);
+    float ui = record_scale(env);
+    DrawRectangle(left_w - (int)ui, 0, (int)(2.0f * ui), h, INK);
+    record_agent_view(env);
+    sim_sans(env, "Full simulator state", 16.0f * ui, 14.0f * ui, 20.0f * ui, INK);
     EndDrawing();
     puf_record_capture(w, h);
 }

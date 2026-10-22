@@ -61,7 +61,7 @@ static void puf_record_request(const char* path, int frames, int fps) {
 
 // A hidden GLFW window still needs an X server. Start one when the machine
 // has no DISPLAY, and use llvmpipe so the context does not need a GPU screen.
-static void puf_record_ensure_display(void) {
+static void puf_record_ensure_display(int width, int height) {
     PufRecord* rec = puf_record_state();
     const char* display = getenv("DISPLAY");
     if (display && display[0]) {
@@ -93,7 +93,9 @@ static void puf_record_ensure_display(void) {
             dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
-        execlp("Xvfb", "Xvfb", disp, "-screen", "0", "1280x704x24",
+        char screen[32];
+        snprintf(screen, sizeof(screen), "%dx%dx24", width, height);
+        execlp("Xvfb", "Xvfb", disp, "-screen", "0", screen,
             "+extension", "GLX", (char*)NULL);
         _exit(127);
     }

@@ -32,6 +32,9 @@ struct Log {
     float offroad_rate;
     float collision_rate;
     float collision_count;
+    // Goals reached / goals sampled this episode. The goal still open
+    // at the end counts as sampled. In [0, 1]. A collision on the way
+    // still counts as reached; score_full_horizon is the clean share.
     float completion_rate;
     float n;
 };
@@ -61,6 +64,7 @@ typedef struct Entity {
     int reached_goal;
     int collided_before_goal;
     int goals_sampled;
+    int goals_completed;
     int goals_clean;
     int collided_this_goal;
     int active_agent;
@@ -1460,6 +1464,7 @@ void initialize_env(Drive* env) {
         env->entities[i].collided_before_goal = 0;
         env->entities[i].reached_goal = 0;
         env->entities[i].goals_sampled = 0;
+        env->entities[i].goals_completed = 0;
         env->entities[i].goals_clean = 0;
         env->entities[i].collided_this_goal = 0;
     }
@@ -1693,12 +1698,15 @@ void puf_step(Drive* env) {
     if (env->timestep == env->episode_length) {
         for (int i = 0; i < env->active_agent_count; i++) {
             float full = 0.0f;
+            float completion = 0.0f;
             if (env->entities[i].goals_sampled > 0) {
-                full = (float)env->entities[i].goals_clean
-                    / (float)env->entities[i].goals_sampled;
+                float sampled = (float)env->entities[i].goals_sampled;
+                full = (float)env->entities[i].goals_clean / sampled;
+                completion = (float)env->entities[i].goals_completed / sampled;
             }
             env->logs[i].score_full_horizon = full;
-            env->log.completion_rate += env->logs[i].completion_rate;
+            env->logs[i].completion_rate = completion;
+            env->log.completion_rate += completion;
             env->log.offroad_rate += env->logs[i].offroad_rate;
             env->log.collision_rate += env->logs[i].collision_rate;
             env->log.collision_count += env->logs[i].collision_count;
@@ -1759,7 +1767,7 @@ void puf_step(Drive* env) {
         }
         if (collision_state > NO_COLLISION) {
             agent->collided_this_goal = 1;
-            if (env->logs[i].completion_rate == 0.0f) {
+            if (agent->goals_completed == 0) {
                 agent->collided_before_goal = 1;
             }
         }
@@ -1776,15 +1784,14 @@ void puf_step(Drive* env) {
             env->agents[i].rewards[0] += env->reward_goal;
             env->logs[i].episode_return += env->reward_goal;
             agent->reached_goal = 1;
+            agent->goals_completed++;
             if (!agent->collided_this_goal) {
                 agent->goals_clean++;
             }
-            if (env->logs[i].completion_rate == 0.0f) {
-                env->logs[i].completion_rate = 1.0f;
-                if (!agent->collided_before_goal) {
-                    env->logs[i].score = 1.0f;
-                    env->logs[i].perf = 1.0f;
-                }
+            // First arrival only. Later goals do not raise score.
+            if (agent->goals_completed == 1 && !agent->collided_before_goal) {
+                env->logs[i].score = 1.0f;
+                env->logs[i].perf = 1.0f;
             }
         }
 

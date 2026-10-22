@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Plot a protein sweep from its log and per-run metrics.
 
-The figure is three rows. Episode return against sweep index is colored by
-trial wall clock. Every other panel colors runs with ColorBrewer Set1.
-Panels are return curves, goal score, collision rate, score against
-jerk when those series exist (otherwise collision count), and parameter count. The bottom row is a boxplot of the swept
-hyperparameters with one swarm point per run. Each hyperparameter is scaled
-to its own min and max.
+The figure is three rows. Score quality against sweep index is the first
+panel, colored by run. Completion rate against jerk is next. Every panel
+colors runs with ColorBrewer Set1, except episode return against sweep
+index, which is colored by trial wall clock. The other panels are return
+curves, goal score, collision rate, score against jerk when those series
+exist (otherwise collision count), and parameter count. The bottom row is
+a boxplot of the swept hyperparameters with one swarm point per run. Each
+hyperparameter is scaled to its own min and max.
 
     python scripts/plot_sweep.py logs/drive/sweep.log -o logs/drive/sweep-panels.png
 
@@ -122,6 +124,8 @@ def load_frames(log_path, metrics_dir):
         collision_vals = metric_series(text, "env/collision_rate")
         jerk_vals = metric_series(text, "env/jerk")
         smooth_vals = metric_series(text, "env/smooth")
+        quality_vals = metric_series(text, "env/score_quality")
+        completion_vals = metric_series(text, "env/completion_rate")
         count_vals = metric_series(text, "env/collision_count")
         steps = metric_series(text, "agent_steps")
         hidden = section_value(text, "policy", "hidden_size")
@@ -141,6 +145,10 @@ def load_frames(log_path, metrics_dir):
         summary.append({
             "run": run,
             "score": score_vals[-1],
+            "score_quality": quality_vals[-1] if quality_vals else float("nan"),
+            "completion_rate": (
+                completion_vals[-1] if completion_vals else float("nan")
+            ),
             "episode_return": return_vals[-1],
             "jerk": jerk_vals[-1] if jerk_vals else float("nan"),
             "smooth": smooth_vals[-1] if smooth_vals else float("nan"),
@@ -197,9 +205,9 @@ def style_steps(ax):
 
 def figure_axes():
     """Two rows of result panels and a full-width hyperparameter row."""
-    fig = plt.figure(figsize=(16.8, 12.4), dpi=150)
-    grid = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.0, 1.2])
-    axes = [fig.add_subplot(grid[row, col]) for row in range(2) for col in range(3)]
+    fig = plt.figure(figsize=(22.4, 12.6), dpi=150)
+    grid = fig.add_gridspec(3, 4, height_ratios=[1.0, 1.0, 1.2])
+    axes = [fig.add_subplot(grid[row, col]) for row in range(2) for col in range(4)]
     return fig, axes, fig.add_subplot(grid[2, :])
 
 
@@ -256,6 +264,32 @@ def draw(returns, collisions, counts, summary, out):
 
     fig, axes, hyper_ax = figure_axes()
 
+    if summary["score_quality"].notna().any():
+        sns.scatterplot(
+            data=summary, x="run", y="score_quality", hue="series",
+            palette=palette, s=58, ax=axes[0], legend=False,
+            edgecolor="white", linewidth=0.6,
+        )
+        axes[0].set_ylim(-0.03, 1.03)
+    else:
+        axes[0].set_axis_off()
+    axes[0].set_xlabel("sweep index")
+    axes[0].set_ylabel("score quality")
+    axes[0].set_title("Score quality")
+
+    if summary["completion_rate"].notna().any() and summary["jerk"].notna().any():
+        sns.scatterplot(
+            data=summary, x="jerk", y="completion_rate", hue="series",
+            palette=palette, s=58, ax=axes[1], legend=False,
+            edgecolor="white", linewidth=0.6,
+        )
+        axes[1].set_ylim(-0.03, 1.03)
+    else:
+        axes[1].set_axis_off()
+    axes[1].set_xlabel("jerk")
+    axes[1].set_ylabel("completion rate")
+    axes[1].set_title("Completion rate vs jerk")
+
     lo = float(summary["wall_min"].min())
     hi = float(summary["wall_min"].max())
     if lo == hi:
@@ -263,83 +297,83 @@ def draw(returns, collisions, counts, summary, out):
     norm = plt.Normalize(lo, hi)
     sns.scatterplot(
         data=summary, x="run", y="episode_return", hue="wall_min",
-        hue_norm=norm, palette="viridis", s=58, ax=axes[0],
+        hue_norm=norm, palette="viridis", s=58, ax=axes[2],
         legend=False, edgecolor="white", linewidth=0.6,
     )
     colorbar = fig.colorbar(
-        plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[0], pad=0.02,
+        plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[2], pad=0.02,
     )
     colorbar.set_label("wall clock (min)")
-    axes[0].set_xscale("linear")
-    axes[0].set_yscale("linear")
-    axes[0].set_xlabel("sweep index")
-    axes[0].set_ylabel("episode return")
-    axes[0].set_title("Episode return vs sweep index")
+    axes[2].set_xscale("linear")
+    axes[2].set_yscale("linear")
+    axes[2].set_xlabel("sweep index")
+    axes[2].set_ylabel("episode return")
+    axes[2].set_title("Episode return vs sweep index")
 
     sns.lineplot(
         data=returns, x="steps", y="episode_return", hue="series",
-        palette=palette, estimator=None, linewidth=1.3, ax=axes[1], legend=False,
+        palette=palette, estimator=None, linewidth=1.3, ax=axes[3], legend=False,
     )
-    axes[1].set_xscale("linear")
-    axes[1].set_yscale("linear")
-    axes[1].ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
-    axes[1].ticklabel_format(axis="y", style="plain")
-    axes[1].set_xlabel("steps")
-    axes[1].set_ylabel("episode return")
-    axes[1].set_title("Episode return vs steps")
+    axes[3].set_xscale("linear")
+    axes[3].set_yscale("linear")
+    axes[3].ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+    axes[3].ticklabel_format(axis="y", style="plain")
+    axes[3].set_xlabel("steps")
+    axes[3].set_ylabel("episode return")
+    axes[3].set_title("Episode return vs steps")
 
     sns.scatterplot(
         data=summary, x="run", y="score", hue="series",
-        palette=palette, s=58, ax=axes[2], legend=False,
+        palette=palette, s=58, ax=axes[4], legend=False,
         edgecolor="white", linewidth=0.6,
     )
-    axes[2].set_xlabel("sweep index")
-    axes[2].set_ylabel("score")
-    axes[2].set_title("Score")
-    axes[2].set_ylim(-0.03, 1.03)
+    axes[4].set_xlabel("sweep index")
+    axes[4].set_ylabel("score")
+    axes[4].set_title("Score")
+    axes[4].set_ylim(-0.03, 1.03)
 
     sns.lineplot(
         data=collisions, x="steps", y="collision_rate", hue="series",
-        palette=palette, estimator=None, linewidth=1.3, ax=axes[3], legend=False,
+        palette=palette, estimator=None, linewidth=1.3, ax=axes[5], legend=False,
     )
-    style_steps(axes[3])
-    axes[3].set_ylabel("collision rate")
-    axes[3].set_title("Collision rate")
-    axes[3].set_ylim(-0.03, 1.03)
+    style_steps(axes[5])
+    axes[5].set_ylabel("collision rate")
+    axes[5].set_title("Collision rate")
+    axes[5].set_ylim(-0.03, 1.03)
 
     has_jerk = bool(summary["jerk"].notna().all() and summary["smooth"].notna().all())
     if has_jerk:
         sns.scatterplot(
             data=summary, x="jerk", y="score", hue="series",
-            palette=palette, s=58, ax=axes[4], legend=False,
+            palette=palette, s=58, ax=axes[6], legend=False,
             edgecolor="white", linewidth=0.6,
         )
-        axes[4].set_xlabel("jerk")
-        axes[4].set_ylabel("score")
-        axes[4].set_title("Score vs jerk")
-        axes[4].set_ylim(-0.03, 1.03)
+        axes[6].set_xlabel("jerk")
+        axes[6].set_ylabel("score")
+        axes[6].set_title("Score vs jerk")
+        axes[6].set_ylim(-0.03, 1.03)
     elif len(counts):
         sns.lineplot(
             data=counts, x="steps", y="collision_count", hue="series",
-            palette=palette, estimator=None, linewidth=1.3, ax=axes[4], legend=False,
+            palette=palette, estimator=None, linewidth=1.3, ax=axes[6], legend=False,
         )
-        style_steps(axes[4])
-        axes[4].set_ylabel("collision count")
-        axes[4].set_title("Collision count")
+        style_steps(axes[6])
+        axes[6].set_ylabel("collision count")
+        axes[6].set_title("Collision count")
     else:
-        axes[4].set_axis_off()
-        axes[4].set_title("No jerk or collision count")
+        axes[6].set_axis_off()
+        axes[6].set_title("No jerk or collision count")
 
     sns.scatterplot(
         data=summary, x="run", y="parameters", hue="series",
-        palette=palette, s=58, ax=axes[5], legend=False,
+        palette=palette, s=58, ax=axes[7], legend=False,
         edgecolor="white", linewidth=0.6,
     )
-    axes[5].set_yscale("log")
-    axes[5].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
-    axes[5].set_xlabel("sweep index")
-    axes[5].set_ylabel("parameters")
-    axes[5].set_title("Network parameters")
+    axes[7].set_yscale("log")
+    axes[7].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
+    axes[7].set_xlabel("sweep index")
+    axes[7].set_ylabel("parameters")
+    axes[7].set_title("Network parameters")
 
     draw_hypers(hyper_ax, summary, palette)
     for ax in list(axes) + [hyper_ax]:
@@ -366,42 +400,74 @@ def series_palette(keys):
     return {key: colors[i] for i, key in enumerate(ordered)}
 
 
-def draw_overview(returns, collisions, counts, summary, out):
-    """Both physics phases. Return vs run order is colored by wall clock.
+def scatter_phases(summary, x, y, ax, palette, markers):
+    for phase, marker in markers.items():
+        part = summary[summary["phase"] == phase]
+        if len(part) == 0:
+            continue
+        sns.scatterplot(
+            data=part, x=x, y=y, hue="series",
+            palette=palette, marker=marker, s=58, ax=ax, legend=False,
+            edgecolor="white", linewidth=0.6,
+        )
 
-    Through runs come first, then bump. Other panels use Set1, one color per
-    run. Circles and solid lines are through. Squares and dashed lines are bump.
+
+def draw_overview(returns, collisions, counts, summary, out):
+    """Both physics phases. Score quality is colored by sweep index.
+
+    Through runs come first, then bump. Panels use Set1, one color per run,
+    except episode return against run order, which is colored by wall clock.
+    Circles and solid lines are through. Squares and dashed lines are bump.
     """
     sns.set_theme(style="whitegrid", context="notebook")
     palette = series_palette(summary["series"])
     fig, axes, hyper_ax = figure_axes()
+    markers = {"through": "o", "bump": "s"}
+
+    if summary["score_quality"].notna().any():
+        scatter_phases(summary, "idx", "score_quality", axes[0], palette, markers)
+        axes[0].set_ylim(-0.03, 1.03)
+    else:
+        axes[0].set_axis_off()
+    axes[0].set_xlabel("run order")
+    axes[0].set_ylabel("score quality")
+    axes[0].set_title("Score quality")
+
+    if summary["completion_rate"].notna().any() and summary["jerk"].notna().any():
+        scatter_phases(summary, "jerk", "completion_rate", axes[1], palette, markers)
+        axes[1].set_ylim(-0.03, 1.03)
+    else:
+        axes[1].set_axis_off()
+    axes[1].set_xlabel("jerk")
+    axes[1].set_ylabel("completion rate")
+    axes[1].set_title("Completion rate vs jerk")
+
     lo = float(summary["wall_min"].min())
     hi = float(summary["wall_min"].max())
     if lo == hi:
         lo, hi = lo - 1.0, hi + 1.0
     norm = plt.Normalize(lo, hi)
-    markers = {"through": "o", "bump": "s"}
     for phase, marker in markers.items():
         part = summary[summary["phase"] == phase]
         if len(part) == 0:
             continue
         sns.scatterplot(
             data=part, x="idx", y="episode_return", hue="wall_min",
-            hue_norm=norm, palette="viridis", marker=marker, s=58, ax=axes[0],
+            hue_norm=norm, palette="viridis", marker=marker, s=58, ax=axes[2],
             legend=False, edgecolor="white", linewidth=0.6,
         )
     colorbar = fig.colorbar(
-        plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[0], pad=0.02,
+        plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[2], pad=0.02,
     )
     colorbar.set_label("wall clock (min)")
     bump_idx = summary.loc[summary["phase"] == "bump", "idx"]
     if len(bump_idx):
-        axes[0].axvline(float(bump_idx.min()) - 0.5, color="0.4", linestyle=":", linewidth=0.9)
-    axes[0].set_xscale("linear")
-    axes[0].set_yscale("linear")
-    axes[0].set_xlabel("run order")
-    axes[0].set_ylabel("episode return")
-    axes[0].set_title("Episode return vs sweep index")
+        axes[2].axvline(float(bump_idx.min()) - 0.5, color="0.4", linestyle=":", linewidth=0.9)
+    axes[2].set_xscale("linear")
+    axes[2].set_yscale("linear")
+    axes[2].set_xlabel("run order")
+    axes[2].set_ylabel("episode return")
+    axes[2].set_title("Episode return vs sweep index")
 
     for phase, linestyle in (("through", "solid"), ("bump", "dashed")):
         part = returns[returns["phase"] == phase] if len(returns) else returns
@@ -410,29 +476,21 @@ def draw_overview(returns, collisions, counts, summary, out):
         sns.lineplot(
             data=part, x="steps", y="episode_return", hue="series",
             palette=palette, estimator=None, linewidth=1.3, linestyle=linestyle,
-            ax=axes[1], legend=False,
+            ax=axes[3], legend=False,
         )
-    axes[1].set_xscale("linear")
-    axes[1].set_yscale("linear")
-    axes[1].ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
-    axes[1].ticklabel_format(axis="y", style="plain")
-    axes[1].set_xlabel("steps")
-    axes[1].set_ylabel("episode return")
-    axes[1].set_title("Episode return vs steps")
+    axes[3].set_xscale("linear")
+    axes[3].set_yscale("linear")
+    axes[3].ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+    axes[3].ticklabel_format(axis="y", style="plain")
+    axes[3].set_xlabel("steps")
+    axes[3].set_ylabel("episode return")
+    axes[3].set_title("Episode return vs steps")
 
-    for phase, marker in markers.items():
-        part = summary[summary["phase"] == phase]
-        if len(part) == 0:
-            continue
-        sns.scatterplot(
-            data=part, x="idx", y="score", hue="series",
-            palette=palette, marker=marker, s=58, ax=axes[2], legend=False,
-            edgecolor="white", linewidth=0.6,
-        )
-    axes[2].set_xlabel("run order")
-    axes[2].set_ylabel("score")
-    axes[2].set_title("Score")
-    axes[2].set_ylim(-0.03, 1.03)
+    scatter_phases(summary, "idx", "score", axes[4], palette, markers)
+    axes[4].set_xlabel("run order")
+    axes[4].set_ylabel("score")
+    axes[4].set_title("Score")
+    axes[4].set_ylim(-0.03, 1.03)
 
     for phase, linestyle in (("through", "solid"), ("bump", "dashed")):
         part = collisions[collisions["phase"] == phase] if len(collisions) else collisions
@@ -441,28 +499,20 @@ def draw_overview(returns, collisions, counts, summary, out):
         sns.lineplot(
             data=part, x="steps", y="collision_rate", hue="series",
             palette=palette, estimator=None, linewidth=1.3, linestyle=linestyle,
-            ax=axes[3], legend=False,
+            ax=axes[5], legend=False,
         )
-    style_steps(axes[3])
-    axes[3].set_ylabel("collision rate")
-    axes[3].set_title("Collision rate")
-    axes[3].set_ylim(-0.03, 1.03)
+    style_steps(axes[5])
+    axes[5].set_ylabel("collision rate")
+    axes[5].set_title("Collision rate")
+    axes[5].set_ylim(-0.03, 1.03)
 
     has_jerk = bool(summary["jerk"].notna().all() and summary["smooth"].notna().all())
     if has_jerk:
-        for phase, marker in markers.items():
-            part = summary[summary["phase"] == phase]
-            if len(part) == 0:
-                continue
-            sns.scatterplot(
-                data=part, x="jerk", y="score", hue="series",
-                palette=palette, marker=marker, s=58, ax=axes[4], legend=False,
-                edgecolor="white", linewidth=0.6,
-            )
-        axes[4].set_xlabel("jerk")
-        axes[4].set_ylabel("score")
-        axes[4].set_title("Score vs jerk")
-        axes[4].set_ylim(-0.03, 1.03)
+        scatter_phases(summary, "jerk", "score", axes[6], palette, markers)
+        axes[6].set_xlabel("jerk")
+        axes[6].set_ylabel("score")
+        axes[6].set_title("Score vs jerk")
+        axes[6].set_ylim(-0.03, 1.03)
     elif len(counts):
         for phase, linestyle in (("through", "solid"), ("bump", "dashed")):
             part = counts[counts["phase"] == phase]
@@ -471,29 +521,21 @@ def draw_overview(returns, collisions, counts, summary, out):
             sns.lineplot(
                 data=part, x="steps", y="collision_count", hue="series",
                 palette=palette, estimator=None, linewidth=1.3, linestyle=linestyle,
-                ax=axes[4], legend=False,
+                ax=axes[6], legend=False,
             )
-        style_steps(axes[4])
-        axes[4].set_ylabel("collision count")
-        axes[4].set_title("Collision count")
+        style_steps(axes[6])
+        axes[6].set_ylabel("collision count")
+        axes[6].set_title("Collision count")
     else:
-        axes[4].set_axis_off()
-        axes[4].set_title("No jerk or collision count")
+        axes[6].set_axis_off()
+        axes[6].set_title("No jerk or collision count")
 
-    for phase, marker in markers.items():
-        part = summary[summary["phase"] == phase]
-        if len(part) == 0:
-            continue
-        sns.scatterplot(
-            data=part, x="idx", y="parameters", hue="series",
-            palette=palette, marker=marker, s=58, ax=axes[5], legend=False,
-            edgecolor="white", linewidth=0.6,
-        )
-    axes[5].set_yscale("log")
-    axes[5].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
-    axes[5].set_xlabel("run order")
-    axes[5].set_ylabel("parameters")
-    axes[5].set_title("Network parameters")
+    scatter_phases(summary, "idx", "parameters", axes[7], palette, markers)
+    axes[7].set_yscale("log")
+    axes[7].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
+    axes[7].set_xlabel("run order")
+    axes[7].set_ylabel("parameters")
+    axes[7].set_title("Network parameters")
 
     draw_hypers(hyper_ax, summary, palette)
     from matplotlib.lines import Line2D
