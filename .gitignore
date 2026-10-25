@@ -159,14 +159,16 @@ dmypy.json
 # Run directories stay local. The kept policies are the 512x5 trial 17
 # weights, the 256x4 trial 29 weights (about 1M parameters), the
 # 512x3 trial 37 weights (2,872,320 parameters), the 256x5 run 89
-# weights (1,239,552 parameters), and the 256x3 run 229 weights
-# (846,336 parameters).
+# weights (1,239,552 parameters), the 256x3 run 229 weights
+# (846,336 parameters), and the Town01 run 173 weights (512x3,
+# 2,872,320 parameters).
 checkpoints/*
 !checkpoints/bottleneck.bin
 !checkpoints/bottleneck_1m.bin
 !checkpoints/bottleneck_0p8m.bin
 !checkpoints/bottleneck_1p2m.bin
 !checkpoints/bottleneck_2m.bin
+!checkpoints/town01.bin
 experiments/
 wandb/
 .neptune/

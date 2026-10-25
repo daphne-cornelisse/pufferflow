@@ -45,3 +45,10 @@ The ini net is 256 wide and 4 layers. Pass the checkpoint's width and depth when
 ./drive checkpoints/bottleneck_0p8m.bin --policy.hidden_size=256 --policy.num_layers=3
 ./drive --headless --eval_episodes=1 checkpoints/bottleneck_0p8m.bin --policy.hidden_size=256 --policy.num_layers=3
 ```
+
+`checkpoints/town01.bin` is the Town01 demo policy (run 173, 512×3, score 0.792):
+
+```
+./drive checkpoints/town01.bin --policy.hidden_size=512 --policy.num_layers=3
+./drive --headless --eval_episodes=1 checkpoints/town01.bin --policy.hidden_size=512 --policy.num_layers=3
+```
