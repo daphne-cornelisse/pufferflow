@@ -228,7 +228,7 @@ def style_steps(ax):
 
 def figure_axes():
     """Result panels, one scaled coefficient row, then one panel per size."""
-    fig = plt.figure(figsize=(22.4, 16.4), dpi=150, layout="constrained")
+    fig = plt.figure(figsize=(22.4, 16.4), dpi=200, layout="constrained")
     outer = fig.add_gridspec(
         4, 1, height_ratios=[1.0, 1.0, 1.05, 1.15],
     )

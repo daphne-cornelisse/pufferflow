@@ -5,8 +5,10 @@ The frame is split. The left panel is a bird's-eye view of the scene. The
 right panel is one agent's point of view (env.selected_agent_idx, or --agent).
 The top right is that agent's observation: road points colored by type,
 its blue bounding box and heading arrow, and partner boxes in view.
-The clip is one episode. Its length is env.episode_length from the run
-ini (500 in the current drive config), at the training step size of 0.1 s.
+The clip length is base.record_frames when that key is set, otherwise
+one training episode (env.episode_length). Drive recordings are 200
+steps. The training episode length is left unchanged. The step size
+is 0.1 s.
 
 Uses ./drive, the CPU player, so the recording does not take the training GPU.
 The trainer calls this when it saves a checkpoint and base.record_rollout_every
@@ -149,7 +151,15 @@ def main():
     episode_length = args.episode_length
     if episode_length is None:
         episode_length = episode_steps(env_section.get("episode_length"))
-    frames = args.frames if args.frames is not None else episode_length
+    # --frames wins. Otherwise base.record_frames, so a clip can be
+    # shorter than the training episode.
+    raw_frames = sections.get("base", {}).get("record_frames")
+    if args.frames is not None:
+        frames = args.frames
+    elif raw_frames not in (None, ""):
+        frames = episode_steps(raw_frames)
+    else:
+        frames = episode_length
     command = [
         str(drive),
         str(checkpoint),
