@@ -3034,9 +3034,10 @@ static void record_rollout_video(Ini* ini, const char* checkpoint_dir,
     }
 }
 
-// record_rollout_every: 0 never. Otherwise epoch 0 is always recorded,
-// then every Nth checkpoint saved after that (1 records each save).
-// Only the artifact owner calls this.
+// record_rollout_every: 0 never. Otherwise every Nth checkpoint saved
+// during training (1 records each save), including the final epoch.
+// The untrained initial policy is not recorded. Only the artifact owner
+// calls this.
 static void maybe_record_rollout(Ini* ini, int every, int* saved,
         const char* checkpoint_dir, const char* checkpoint) {
     if (!checkpoint || !checkpoint[0]) {
@@ -3093,15 +3094,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     PuffeRL* pufferl = create_pufferl(ini, ctx);
     int record_every = (int)puf_ini_get(ini, "base", "record_rollout_every");
     int checkpoints_saved = 0;
-    // Epoch 0 is the initial policy, before any update. Not part of the
-    // every-Nth checkpoint count.
-    if (ctx->artifact_owner && record_every > 0) {
-        char initial_checkpoint[4096];
-        snprintf(initial_checkpoint, sizeof(initial_checkpoint),
-            "%s/%016ld.bin", checkpoint_dir, pufferl->global_step);
-        puf_save_weights(pufferl, initial_checkpoint);
-        record_rollout_video(ini, checkpoint_dir, initial_checkpoint);
-    }
     Selfplay selfplay = {0};
     if (use_selfplay) {
         char initial_checkpoint[4096];
