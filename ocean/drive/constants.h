@@ -29,7 +29,11 @@
 #define MAX_AGENTS 64
 #endif
 // Cars one map copy may hold. config num_agents must be in 1..this.
+// A throughput binary may raise this with -DDRIVE_AGENT_MAX without
+// changing the observation width.
+#ifndef DRIVE_AGENT_MAX
 #define DRIVE_AGENT_MAX 128
+#endif
 
 // Collision state
 #define NO_COLLISION 0
@@ -76,7 +80,6 @@
 // Distance thresholds
 // Arrival radius. A 5 m disk covers a 5 m centerline segment.
 #define MIN_DISTANCE_TO_GOAL 5.0f
-#define COLLISION_DIST_SQ 225.0f
 // Closing-speed bounce. 0 stops at the contact, 1 sends it back at full speed.
 #define BUMP_BOUNCE 0.4f
 // Extra gap so the next step does not start already overlapping.
@@ -84,6 +87,9 @@
 // Cap on one shove, in meters. A bad normal cannot throw a car across the map.
 #define BUMP_MAX 4.0f
 #define OBS_DIST_SQ 2500.0f
+// Center distance in meters. Farther pairs skip the box test.
+#define COLLISION_NEAR 20.0f
+#define COLLISION_NEAR_SQ (COLLISION_NEAR * COLLISION_NEAR)
 #define COLLISION_BOX_SCALE 0.7f
 #define CAR_LENGTH 4.3f
 #define CAR_WIDTH 1.8f

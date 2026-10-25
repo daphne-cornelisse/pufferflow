@@ -155,6 +155,11 @@ struct Env {
     int sim_follow;
     // One frame after Reset, so that click draws timestep 0.
     int sim_hold_step;
+    int near_cols;
+    int near_rows;
+    int bins_ready;
+    int* bin_head;
+    int* bin_next;
     Dict* cfg;
 };
 
@@ -755,6 +760,11 @@ static void bump_agents(Drive* env) {
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < n; i++) {
             for (int j = i + 1; j < n; j++) {
+                float dx = env->entities[i].x - env->entities[j].x;
+                float dy = env->entities[i].y - env->entities[j].y;
+                if (dx * dx + dy * dy > COLLISION_NEAR_SQ) {
+                    continue;
+                }
                 bump_pair(env,
                     &env->entities[i], &env->entities[j],
                     prev_x[i], prev_y[i], prev_x[j], prev_y[j],
@@ -762,6 +772,22 @@ static void bump_agents(Drive* env) {
             }
         }
     }
+}
+
+static int agent_cell(Drive* env, float x, float y) {
+    int cx = (int)((x - env->map_corners[0]) / COLLISION_NEAR);
+    int cy = (int)((y - env->map_corners[1]) / COLLISION_NEAR);
+    if (cx < 0) {
+        cx = 0;
+    } else if (cx >= env->near_cols) {
+        cx = env->near_cols - 1;
+    }
+    if (cy < 0) {
+        cy = 0;
+    } else if (cy >= env->near_rows) {
+        cy = env->near_rows - 1;
+    }
+    return cy * env->near_cols + cx;
 }
 
 int collision_check(Drive* env, int agent_idx) {
@@ -817,28 +843,46 @@ int collision_check(Drive* env, int agent_idx) {
         }
     }
 
-    // Check vehicle-vehicle collisions. Agent i is entity i.
-    int nscan = env->active_agent_count;
-    if (nscan > DRIVE_AGENT_MAX) {
-        nscan = DRIVE_AGENT_MAX;
+    // Cells are COLLISION_NEAR meters wide. Center distance is tested
+    // first, and the box test runs only inside that boundary.
+    if (!env->bins_ready) {
+        int cells = env->near_cols * env->near_rows;
+        memset(env->bin_head, 0xff, (size_t)cells * sizeof(int));
+        for (int i = 0; i < env->active_agent_count; i++) {
+            Entity* e = &env->entities[i];
+            if (e->x == INVALID_POSITION || e->y == INVALID_POSITION) {
+                continue;
+            }
+            int cell = agent_cell(env, e->x, e->y);
+            env->bin_next[i] = env->bin_head[cell];
+            env->bin_head[cell] = i;
+        }
+        env->bins_ready = 1;
     }
-    for (int index = 0; index < nscan; index++) {
-        if (index == agent_idx) {
-            continue;
-        }
-        Entity* entity = &env->entities[index];
-        if (entity->x == INVALID_POSITION || entity->y == INVALID_POSITION) {
-            continue;
-        }
-        float dx = entity->x - agent->x;
-        float dy = entity->y - agent->y;
-        if ((dx * dx + dy * dy) > COLLISION_DIST_SQ) {
-            continue;
-        }
-        if (check_aabb_collision(agent, entity)) {
-            collided = AGENT_COLLISION;
-            car_collided_with_index = index;
-            break;
+    int home = agent_cell(env, agent->x, agent->y);
+    int gx = home % env->near_cols;
+    int gy = home / env->near_cols;
+    int x0 = gx > 0 ? gx - 1 : gx;
+    int y0 = gy > 0 ? gy - 1 : gy;
+    int x1 = gx + 1 < env->near_cols ? gx + 1 : gx;
+    int y1 = gy + 1 < env->near_rows ? gy + 1 : gy;
+    for (int cy = y0; cy <= y1 && collided != AGENT_COLLISION; cy++) {
+        int row = cy * env->near_cols;
+        for (int cx = x0; cx <= x1 && collided != AGENT_COLLISION; cx++) {
+            int other = env->bin_head[row + cx];
+            while (other >= 0 && collided != AGENT_COLLISION) {
+                int next = env->bin_next[other];
+                Entity* b = &env->entities[other];
+                float dx = b->x - agent->x;
+                float dy = b->y - agent->y;
+                if (other != agent_idx
+                    && dx * dx + dy * dy <= COLLISION_NEAR_SQ
+                    && check_aabb_collision(agent, b)) {
+                    collided = AGENT_COLLISION;
+                    car_collided_with_index = other;
+                }
+                other = next;
+            }
         }
     }
 
@@ -978,6 +1022,11 @@ static void release_world(Drive* env) {
     env->neighbor_cache_indices = NULL;
     free(env->lane_x);
     env->lane_x = NULL;
+    free(env->bin_head);
+    env->bin_head = NULL;
+    free(env->bin_next);
+    env->bin_next = NULL;
+    env->bins_ready = 0;
 }
 
 static void load_world(Drive* env) {
@@ -1024,6 +1073,19 @@ static void load_world(Drive* env) {
     free(env->logs);
     env->logs = (Log*)calloc((size_t)n, sizeof(Log));
     assert(env->logs);
+    float span_x = env->map_corners[2] - env->map_corners[0];
+    float span_y = env->map_corners[3] - env->map_corners[1];
+    int cols = (int)ceilf(span_x / COLLISION_NEAR);
+    int rows = (int)ceilf(span_y / COLLISION_NEAR);
+    assert(cols >= 1 && rows >= 1);
+    env->near_cols = cols;
+    env->near_rows = rows;
+    free(env->bin_head);
+    free(env->bin_next);
+    env->bin_head = (int*)malloc((size_t)cols * rows * sizeof(int));
+    env->bin_next = (int*)malloc((size_t)DRIVE_AGENT_MAX * sizeof(int));
+    assert(env->bin_head && env->bin_next);
+    env->bins_ready = 0;
 }
 
 void puf_close(Drive* env) {
@@ -1068,6 +1130,7 @@ void move_dynamics(Drive* env, int agent_idx) {
     agent->heading_y = sinf(heading);
     agent->vx = new_vx;
     agent->vy = new_vy;
+    env->bins_ready = 0;
 }
 
 // Observations
@@ -1236,6 +1299,7 @@ static void sit_on_lane(Drive* env, Entity* e, int k) {
     e->vy = 0.0f;
     e->vz = 0.0f;
     e->collision_state = NO_COLLISION;
+    env->bins_ready = 0;
 }
 
 // Shortest forward path. lane_dist stays negative off the walked road.
