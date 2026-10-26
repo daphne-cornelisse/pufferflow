@@ -1,0 +1,216 @@
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=0 score=0.5941 cost=955.62 steps=578813952 random=0 gp_obs=0 pareto=0
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=1 score=0.0491 cost=449.54 steps=328204288 random=1 gp_obs=0 pareto=0
+memory fit: horizon 256->128
+maps 3: 5504 5504 5376 cars, 128 per copy
+maps 3: 5504 5504 5376 cars, 128 per copy
+alloc_create needs 12.02 GiB, 9.09 GiB free of 23.49 GiB
+puffer: src/pufferl.cu:267: void alloc_create(Allocator*): Assertion `cudaMalloc(&alloc->mem, alloc->total_bytes) == cudaSuccess && "alloc_create: cudaMalloc failed"' failed.
+sweep worker run=2 failed; marking sample bad
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=3 score=0.1222 cost=351.36 steps=340787200 random=1 gp_obs=0 pareto=0
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=4 score=0.4099 cost=390.40 steps=341835776 random=1 gp_obs=0 pareto=0
+maps 3: 5504 5504 5376 cars, 128 per copy
+maps 3: 5504 5504 5376 cars, 128 per copy
+alloc_create needs 11.96 GiB, 8.79 GiB free of 23.49 GiB
+puffer: src/pufferl.cu:267: void alloc_create(Allocator*): Assertion `cudaMalloc(&alloc->mem, alloc->total_bytes) == cudaSuccess && "alloc_create: cudaMalloc failed"' failed.
+sweep worker run=5 failed; marking sample bad
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=6 score=0.0491 cost=428.54 steps=321388544 random=1 gp_obs=0 pareto=0
+memory fit: horizon 256->128
+maps 3: 5504 5504 5376 cars, 128 per copy
+maps 3: 5504 5504 5376 cars, 128 per copy
+alloc_create needs 12.49 GiB, 8.83 GiB free of 23.49 GiB
+puffer: src/pufferl.cu:267: void alloc_create(Allocator*): Assertion `cudaMalloc(&alloc->mem, alloc->total_bytes) == cudaSuccess && "alloc_create: cudaMalloc failed"' failed.
+sweep worker run=7 failed; marking sample bad
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=8 score=0.0491 cost=504.40 steps=343932928 random=1 gp_obs=0 pareto=0
+memory fit: horizon 256->128
+maps 3: 5504 5504 5376 cars, 128 per copy
+maps 3: 5504 5504 5376 cars, 128 per copy
+alloc_create needs 11.96 GiB, 9.37 GiB free of 23.49 GiB
+puffer: src/pufferl.cu:267: void alloc_create(Allocator*): Assertion `cudaMalloc(&alloc->mem, alloc->total_bytes) == cudaSuccess && "alloc_create: cudaMalloc failed"' failed.
+sweep worker run=9 failed; marking sample bad
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=10 score=0.2186 cost=332.01 steps=308281344 random=1 gp_obs=0 pareto=0
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=11 score=0.5416 cost=1057.46 steps=654835712 random=0 gp_obs=11 pareto=3
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=12 score=0.5609 cost=1039.70 steps=655097856 random=0 gp_obs=12 pareto=3
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=13 score=0.5016 cost=1039.96 steps=718536704 random=0 gp_obs=13 pareto=3
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=14 score=0.5034 cost=482.12 steps=359137280 random=0 gp_obs=14 pareto=3
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=15 score=0.4694 cost=435.84 steps=382468096 random=0 gp_obs=15 pareto=4
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=16 score=0.2504 cost=481.50 steps=441712640 random=0 gp_obs=16 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=17 score=0.5458 cost=866.09 steps=621281280 random=0 gp_obs=17 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=18 score=0.3996 cost=620.96 steps=489684992 random=0 gp_obs=18 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=19 score=0.4700 cost=529.95 steps=493092864 random=0 gp_obs=19 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=20 score=0.5014 cost=711.49 steps=515637248 random=0 gp_obs=20 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=21 score=0.5624 cost=1031.56 steps=646971392 random=0 gp_obs=21 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=22 score=0.3843 cost=953.31 steps=738197504 random=0 gp_obs=22 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=23 score=0.3920 cost=323.22 steps=300941312 random=0 gp_obs=23 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=24 score=0.4681 cost=460.57 steps=299892736 random=0 gp_obs=24 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=25 score=0.5560 cost=750.98 steps=476053504 random=0 gp_obs=24 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=26 score=0.5172 cost=669.34 steps=409993216 random=0 gp_obs=25 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=27 score=0.5094 cost=849.99 steps=533725184 random=0 gp_obs=26 pareto=7
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=28 score=0.5655 cost=943.78 steps=555220992 random=0 gp_obs=27 pareto=7
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=29 score=0.5729 cost=964.83 steps=546308096 random=0 gp_obs=28 pareto=8
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=30 score=0.6089 cost=707.82 steps=399769600 random=0 gp_obs=29 pareto=8
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=31 score=0.5557 cost=652.00 steps=447217664 random=0 gp_obs=30 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=32 score=0.5235 cost=422.92 steps=310640640 random=0 gp_obs=31 pareto=6
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=33 score=0.6104 cost=567.42 steps=346816512 random=0 gp_obs=32 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=34 score=0.5679 cost=965.05 steps=604766208 random=0 gp_obs=33 pareto=4
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=35 score=0.4597 cost=413.17 steps=316669952 random=0 gp_obs=34 pareto=4
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=36 score=0.2841 cost=451.08 steps=338690048 random=0 gp_obs=35 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=37 score=0.5687 cost=906.83 steps=575668224 random=0 gp_obs=36 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=38 score=0.5709 cost=793.45 steps=501219328 random=0 gp_obs=37 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=39 score=0.5631 cost=892.94 steps=546832384 random=0 gp_obs=38 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=40 score=0.6066 cost=631.42 steps=357302272 random=0 gp_obs=39 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=41 score=0.5705 cost=1060.57 steps=650117120 random=0 gp_obs=40 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=42 score=0.5664 cost=824.42 steps=543686656 random=0 gp_obs=41 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=43 score=0.5754 cost=589.71 steps=364118016 random=0 gp_obs=42 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=44 score=0.5491 cost=415.61 steps=301203456 random=0 gp_obs=43 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=45 score=0.4783 cost=420.56 steps=302514176 random=0 gp_obs=44 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=46 score=0.5342 cost=919.56 steps=567541760 random=0 gp_obs=45 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=47 score=0.5624 cost=624.44 steps=417595392 random=0 gp_obs=46 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=48 score=0.6019 cost=518.86 steps=320339968 random=0 gp_obs=47 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=49 score=0.4854 cost=334.05 steps=299892736 random=0 gp_obs=48 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=50 score=0.6047 cost=1005.04 steps=546832384 random=0 gp_obs=48 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=51 score=0.5657 cost=1061.87 steps=660078592 random=0 gp_obs=49 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=52 score=0.5814 cost=839.53 steps=503578624 random=0 gp_obs=50 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=53 score=0.5790 cost=911.48 steps=566755328 random=0 gp_obs=51 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=54 score=0.5175 cost=446.28 steps=301203456 random=0 gp_obs=52 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=55 score=0.5989 cost=558.97 steps=370147328 random=0 gp_obs=53 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=56 score=0.5503 cost=587.09 steps=363069440 random=0 gp_obs=54 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=57 score=0.5544 cost=1027.46 steps=662175744 random=0 gp_obs=55 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=58 score=0.5631 cost=800.25 steps=489684992 random=0 gp_obs=56 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=59 score=0.5724 cost=669.98 steps=388497408 random=0 gp_obs=57 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=60 score=0.5566 cost=1079.35 steps=661127168 random=0 gp_obs=58 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=61 score=0.5442 cost=484.39 steps=299892736 random=0 gp_obs=59 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=62 score=0.4641 cost=961.90 steps=667418624 random=0 gp_obs=59 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=63 score=0.5856 cost=661.97 steps=425459712 random=0 gp_obs=60 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=64 score=0.5737 cost=989.59 steps=584581120 random=0 gp_obs=61 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=65 score=0.4987 cost=869.97 steps=585105408 random=0 gp_obs=62 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=66 score=0.5906 cost=455.23 steps=299892736 random=0 gp_obs=63 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
+maps 3: 2816 2688 2688 cars, 128 per copy
+sweep run=67 score=0.5679 cost=1078.68 steps=638320640 random=0 gp_obs=63 pareto=5
+maps 3: 2816 2688 2688 cars, 128 per copy
