@@ -314,7 +314,7 @@ def build():
     made, next_id = road_features(edges, "road_edge", ROAD_EDGE_BOUNDARY, next_id)
     roads.extend(made)
 
-    # Last object is the primary agent (the env treats num_objects - 1 as the SDC).
+    # Preview cars. The binary stores roads only. Reset places agents.
     specs = [
         (right, 70.0, 20.0, 150.0),
         (right, 180.0, 20.0, 150.0),
@@ -479,9 +479,8 @@ PARTNER_FEATURES = 7
 EGO_FEATURES = 8
 # Index 6 stays 0 (old ego block). Index 7 is max_speed / MAX_SPEED.
 ROAD_FEATURES = 7
+# Partners one observation lists. The map may hold more cars.
 MAX_AGENTS = 64
-# Partners in one observation, even when the map has more cars.
-MAX_OBS_AGENTS = 64
 OBS_GOAL_SCALE = 0.005
 OBS_SPEED_SCALE = 0.01
 OBS_POSITION_SCALE = 0.02

@@ -24,8 +24,6 @@ from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from tqdm import tqdm
 
-TRAJECTORY_LENGTH = 91
-
 # Waymo roadgraph_samples/type, stored as roads[].map_element_id.
 # https://waymo.com/open/data/motion/tfexample/
 # The drive env collapses these to the classes in ocean/drive/drive.h:
@@ -129,78 +127,12 @@ def simplify_polyline(geometry, polyline_reduction_threshold, max_segment_length
 
 
 def save_map_binary(map_data, output_file, unique_map_id):
-    """Save map data in a binary format readable by C."""
+    """Save road polylines. The binary has no vehicle records."""
     with open(output_file, "wb") as f:
-        num_objects = len(map_data.get("objects", []))
-        num_roads = len(map_data.get("roads", []))
-        f.write(struct.pack("i", num_objects))
-        f.write(struct.pack("i", num_roads))
+        roads = map_data.get("roads", [])
+        f.write(struct.pack("i", len(roads)))
 
-        # Write objects
-        for obj in map_data.get("objects", []):
-            obj_type = obj.get("type", 1)
-            if obj_type == "vehicle":
-                obj_type = 1
-            elif obj_type == "pedestrian":
-                obj_type = 2
-            elif obj_type == "cyclist":
-                obj_type = 3
-            f.write(struct.pack("i", obj_type))
-            f.write(struct.pack("i", TRAJECTORY_LENGTH))
-
-            positions = obj.get("position", [])
-            for coord in ["x", "y", "z"]:
-                for i in range(TRAJECTORY_LENGTH):
-                    pos = (
-                        positions[i]
-                        if i < len(positions)
-                        else {"x": 0.0, "y": 0.0, "z": 0.0}
-                    )
-                    f.write(struct.pack("f", float(pos.get(coord, 0.0))))
-
-            velocities = obj.get("velocity", [])
-            for coord in ["x", "y", "z"]:
-                for i in range(TRAJECTORY_LENGTH):
-                    vel = (
-                        velocities[i]
-                        if i < len(velocities)
-                        else {"x": 0.0, "y": 0.0, "z": 0.0}
-                    )
-                    f.write(struct.pack("f", float(vel.get(coord, 0.0))))
-
-            headings = obj.get("heading", [])
-            f.write(
-                struct.pack(
-                    f"{TRAJECTORY_LENGTH}f",
-                    *[
-                        float(headings[i]) if i < len(headings) else 0.0
-                        for i in range(TRAJECTORY_LENGTH)
-                    ],
-                )
-            )
-
-            valids = obj.get("valid", [])
-            f.write(
-                struct.pack(
-                    f"{TRAJECTORY_LENGTH}i",
-                    *[
-                        int(valids[i]) if i < len(valids) else 0
-                        for i in range(TRAJECTORY_LENGTH)
-                    ],
-                )
-            )
-
-            f.write(struct.pack("f", float(obj.get("width", 0.0))))
-            f.write(struct.pack("f", float(obj.get("length", 0.0))))
-            f.write(struct.pack("f", float(obj.get("height", 0.0))))
-            goal_pos = obj.get("goalPosition", {"x": 0, "y": 0, "z": 0})
-            f.write(struct.pack("f", float(goal_pos.get("x", 0.0))))
-            f.write(struct.pack("f", float(goal_pos.get("y", 0.0))))
-            f.write(struct.pack("f", float(goal_pos.get("z", 0.0))))
-            f.write(struct.pack("i", obj.get("mark_as_expert", 0)))
-
-        # Write roads
-        for road in map_data.get("roads", []):
+        for road in roads:
             geometry = road.get("geometry", [])
             # Class id is the Waymo roadgraph type. Do not rewrite lanes to
             # surface-street or edges to boundary; freeway and median must

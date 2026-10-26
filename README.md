@@ -4,44 +4,19 @@
 
 ## Commands
 
-Score `checkpoints/bottleneck_1m.bin` (256 wide, 4 layers) on `data/bottleneck/binaries/map_000.bin`:
+`checkpoints/town01.bin` is the Town01 demo policy (run 173, 512×3, score 0.792). `config/drive.ini` is 512 wide and 3 layers, matching this file, so neither command needs extra network flags. Both play Town01 (`data/mixed/binaries/map_001.bin`). Training also uses Town02 (`map_002.bin`) and the bottleneck (`map_000.bin`), 128 cars per copy. Those three binaries have to be present or the player exits before the window opens.
+
+Open it on the local display:
 
 ```
-./drive --headless --eval_episodes=1 checkpoints/bottleneck_1m.bin
+./puffer eval checkpoints/town01.bin
+./drive checkpoints/town01.bin
 ```
 
-Open it in the GUI window:
+`./puffer eval` is the trainer and draws one map copy. `./drive` is the CPU player.
+
+Score one headless episode:
 
 ```
-./drive checkpoints/bottleneck_1m.bin
-```
-
-The ini net is 256 wide and 4 layers. Pass the checkpoint's width and depth when they differ.
-
-`checkpoints/bottleneck.bin` is the 512×5 policy:
-
-```
-./drive checkpoints/bottleneck.bin --policy.hidden_size=512 --policy.num_layers=5
-./drive --headless --eval_episodes=1 checkpoints/bottleneck.bin --policy.hidden_size=512 --policy.num_layers=5
-```
-
-`checkpoints/bottleneck_2m.bin` is the 512×3 policy (trial 37, goal score 0.761):
-
-```
-./drive checkpoints/bottleneck_2m.bin --policy.hidden_size=512 --policy.num_layers=3
-./drive --headless --eval_episodes=1 checkpoints/bottleneck_2m.bin --policy.hidden_size=512 --policy.num_layers=3
-```
-
-`checkpoints/bottleneck_1p2m.bin` is the 256×5 policy (run 89, goal score 0.789):
-
-```
-./drive checkpoints/bottleneck_1p2m.bin --policy.hidden_size=256 --policy.num_layers=5
-./drive --headless --eval_episodes=1 checkpoints/bottleneck_1p2m.bin --policy.hidden_size=256 --policy.num_layers=5
-```
-
-`checkpoints/bottleneck_0p8m.bin` is the 256×3 policy (run 229, goal score 0.873):
-
-```
-./drive checkpoints/bottleneck_0p8m.bin --policy.hidden_size=256 --policy.num_layers=3
-./drive --headless --eval_episodes=1 checkpoints/bottleneck_0p8m.bin --policy.hidden_size=256 --policy.num_layers=3
+./drive --headless --eval_episodes=1 checkpoints/town01.bin
 ```

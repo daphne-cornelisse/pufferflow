@@ -101,6 +101,15 @@ void cublas_init_handle() {
     cudaEventCreateWithFlags(&g_main_ready, cudaEventDisableTiming);
 }
 
+// Worker threads need their own thread-local handle. Gemm still sets the
+// stream on each call; this binds the stream that thread will train on.
+void cublas_init_stream(cudaStream_t stream) {
+    if (!g_cublas_handle) {
+        cublas_init_handle();
+    }
+    cublasSetStream(g_cublas_handle, stream);
+}
+
 // Dense row-major GEMM: C = alpha * op_a(A) @ op_b(B) + beta * C
 static void cublasGemmExDense(cublasHandle_t handle,
         cublasOperation_t op_a, cublasOperation_t op_b,
