@@ -62,7 +62,7 @@
 
 #define OBS_SIZE (EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS \
     + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS)
-#define ACT_SIZES {7, 13}
+#define ACT_SIZES {21, 31}
 #define NUM_ATNS 2
 
 // Observation normalization
@@ -97,9 +97,17 @@
 // Episode reset draws a speed along the lane, uniform on [0, 50] mph.
 #define SPAWN_SPEED_MAX_MPS (50.0f * 1609.344f / 3600.0f)
 
-// Action space
-#define NUM_ACCEL_BINS 7
-#define NUM_STEER_BINS 13
+// Action space. Uniform bins so a logged step can be labeled tightly.
+// 21 accelerations on [-4, 4] m/s^2, 31 steering angles on [-1, 1] rad.
+// Both counts are odd, so one bin is exactly zero.
+#define NUM_ACCEL_BINS 21
+#define NUM_STEER_BINS 31
+#define ACCEL_MIN -4.0f
+#define ACCEL_MAX 4.0f
+#define STEER_MIN -1.0f
+#define STEER_MAX 1.0f
+#define ACCEL_COAST_BIN ((NUM_ACCEL_BINS - 1) / 2)
+#define STEER_COAST_BIN ((NUM_STEER_BINS - 1) / 2)
 
 // Right-hand column: playback and follow.
 #define SIM_COL_W 132.0f
@@ -107,14 +115,26 @@
 #define SIM_OBS_H 264.0f
 #define SIM_OBS_RANGE 12.0f
 
-static const float ACCELERATION_VALUES[NUM_ACCEL_BINS] = {
-    -4.0000f, -2.6670f, -1.3330f, -0.0000f, 1.3330f, 2.6670f, 4.0000f
-};
+static float ACCELERATION_VALUES[NUM_ACCEL_BINS];
+static float STEERING_VALUES[NUM_STEER_BINS];
+static int action_space_ready;
 
-static const float STEERING_VALUES[NUM_STEER_BINS] = {
-    -1.000f, -0.833f, -0.667f, -0.500f, -0.333f, -0.167f, 0.000f,
-     0.167f,  0.333f,  0.500f,  0.667f,  0.833f,  1.000f
-};
+static void init_action_space(void) {
+    if (action_space_ready) {
+        return;
+    }
+    float accel_step = (ACCEL_MAX - ACCEL_MIN) / (float)(NUM_ACCEL_BINS - 1);
+    for (int i = 0; i < NUM_ACCEL_BINS; i++) {
+        ACCELERATION_VALUES[i] = ACCEL_MIN + i * accel_step;
+    }
+    float steer_step = (STEER_MAX - STEER_MIN) / (float)(NUM_STEER_BINS - 1);
+    for (int i = 0; i < NUM_STEER_BINS; i++) {
+        STEERING_VALUES[i] = STEER_MIN + i * steer_step;
+    }
+    ACCELERATION_VALUES[ACCEL_COAST_BIN] = 0.0f;
+    STEERING_VALUES[STEER_COAST_BIN] = 0.0f;
+    action_space_ready = 1;
+}
 
 static const float offsets[4][2] = {
     {-1,  1},
