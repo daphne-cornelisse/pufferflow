@@ -2951,6 +2951,7 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode, int render) {
         puf_ini_put(ini, "train.horizon", "1");
     }
     PuffeRL* p = create_pufferl(ini, ctx);
+    int loaded = 0;
     if (match) {
         char a_buf[4096], b_buf[4096];
         const char* a = puf_checkpoint_path_key(ini, "load_model_path", a_buf, sizeof(a_buf));
@@ -2959,13 +2960,21 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode, int render) {
         assert(a && b && "match requires load_model_path and load_enemy_model_path");
         pufferl_load_policy(p, 0, a);
         pufferl_load_policy(p, 1, b);
+        loaded = 1;
     } else {
         char buf[4096];
         const char* path = puf_checkpoint_path_key(ini, "load_model_path", buf, sizeof(buf));
         if (path) {
             pufferl_load_policy(p, 0, path);
+            loaded = 1;
         }
     }
+    // The HUD treats 0 as a rejected file. Eval loaded the weights itself.
+#ifdef PUF_HAS_SIM_CONTROL
+    if (loaded) {
+        p->vec->envs[0].checkpoint_ok = 1;
+    }
+#endif
     return p;
 }
 

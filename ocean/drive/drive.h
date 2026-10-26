@@ -129,7 +129,7 @@ struct Env {
     float reward_jerk;
     int collision_physics;
     unsigned int rng;
-    // 1 after ./drive loads a checkpoint that matches this network.
+    // 1 when a loaded checkpoint is driving. 0 draws the rejection line.
     int checkpoint_ok;
     char checkpoint_error[256];
     // Euclidean goal band, meters. The point is on the forward centerline.
