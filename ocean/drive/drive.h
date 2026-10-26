@@ -1619,31 +1619,33 @@ static void human_controls(Drive* env) {
     }
     int idx = env->selected_agent_idx;
     float* atn = env->agents[idx].actions;
-    atn[0] = 3;
-    atn[1] = 6;
+    int accel_kick = (NUM_ACCEL_BINS - 1) / 3;
+    int steer_kick = (NUM_STEER_BINS - 1) / 3;
+    atn[0] = ACCEL_COAST_BIN;
+    atn[1] = STEER_COAST_BIN;
     if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W)) {
-        atn[0] += 2;
-        if (atn[0] > 6) {
-            atn[0] = 6;
-        }
+        atn[0] += accel_kick;
     }
     if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S)) {
-        atn[0] -= 2;
-        if (atn[0] < 0) {
-            atn[0] = 0;
-        }
+        atn[0] -= accel_kick;
+    }
+    if (atn[0] < 0) {
+        atn[0] = 0;
+    }
+    if (atn[0] > NUM_ACCEL_BINS - 1) {
+        atn[0] = NUM_ACCEL_BINS - 1;
     }
     if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) {
-        atn[1] += 4;
-        if (atn[1] < 0) {
-            atn[1] = 0;
-        }
+        atn[1] += steer_kick;
     }
     if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) {
-        atn[1] -= 4;
-        if (atn[1] > 12) {
-            atn[1] = 12;
-        }
+        atn[1] -= steer_kick;
+    }
+    if (atn[1] < 0) {
+        atn[1] = 0;
+    }
+    if (atn[1] > NUM_STEER_BINS - 1) {
+        atn[1] = NUM_STEER_BINS - 1;
     }
     if (IsKeyPressed(KEY_TAB)) {
         env->selected_agent_idx = (env->selected_agent_idx + 1) % env->active_agent_count;
@@ -1886,6 +1888,7 @@ static int collision_physics_mode(const char* name) {
 }
 
 void puf_init(Env* env, Dict* kwargs) {
+    init_action_space();
     env->selected_agent_idx = dict_get(kwargs, "selected_agent_idx");
     env->collision_physics = collision_physics_mode(
         dict_get_str(kwargs, "collision_physics"));
