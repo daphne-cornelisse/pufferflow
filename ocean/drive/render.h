@@ -36,6 +36,9 @@ Client* make_client(Drive* env) {
     Client* client = (Client*)calloc(1, sizeof(Client));
     client->width = 1280;
     client->height = 704;
+    if (env->sim_user_size) {
+        client->height = 880;
+    }
     int recording = puf_record_enabled();
     if (recording) {
         // 1.25x the interactive frame. Both axes stay even for yuv420.
@@ -47,12 +50,18 @@ Client* make_client(Drive* env) {
     if (recording) {
         flags |= FLAG_WINDOW_HIDDEN;
     }
+    if (env->sim_user_size) {
+        flags |= FLAG_WINDOW_RESIZABLE;
+    }
     SetConfigFlags(flags);
     InitWindow(client->width, client->height, "Pufferflow");
     if (!recording) {
+        if (env->sim_user_size) {
+            SetWindowMinSize(1080, 720);
+        }
         int mw = GetMonitorWidth(GetCurrentMonitor());
         int mh = GetMonitorHeight(GetCurrentMonitor());
-        if (mw >= 1400 && mh >= 900) {
+        if (!env->sim_user_size && mw >= 1400 && mh >= 900) {
             int w = mw - 40;
             int h = mh - 160;
             if (w > mw - 16) {
@@ -88,10 +97,16 @@ Client* make_client(Drive* env) {
         map_center_y = (env->map_corners[1] + env->map_corners[3]) / 2.0f;
     }
     Vector3 target_pos = { map_center_x, map_center_y, 1.0f };
+    float cam_back = 120.0f;
+    float cam_up = 175.0f;
+    if (env->sim_user_size) {
+        cam_back = 48.0f;
+        cam_up = 72.0f;
+    }
     client->default_camera_position = (Vector3){
         map_center_x,
-        map_center_y + 120.0f,
-        175.0f
+        map_center_y + cam_back,
+        cam_up
     };
     client->default_camera_target = target_pos;
     client->camera.position = client->default_camera_position;
@@ -131,12 +146,24 @@ enum {
     SIM_NBTN = 4
 };
 
-static void sim_rects(float width, Rectangle r[SIM_NBTN]) {
+static Rectangle sim_scene_rect(Drive* env) {
+    float width = env->client->width;
+    float col_x = width - 8.0f - SIM_COL_W;
+    float x = col_x + 8.0f;
+    float bw = SIM_COL_W - 16.0f;
+    return (Rectangle){x, 16.0f, bw, 26.0f};
+}
+
+static void sim_rects(Drive* env, Rectangle r[SIM_NBTN]) {
+    float width = env->client->width;
     float col_x = width - 8.0f - SIM_COL_W;
     float x = col_x + 8.0f;
     float bw = SIM_COL_W - 16.0f;
     float bh = 26.0f;
     float y = 16.0f;
+    if (env->sim_scene) {
+        y += bh + 6.0f;
+    }
     float gap = 6.0f;
     float grp = 18.0f;
     r[SIM_PLAY] = (Rectangle){x, y, bw, bh};
@@ -151,7 +178,7 @@ static void sim_rects(float width, Rectangle r[SIM_NBTN]) {
 static Rectangle sim_col_rect(Drive* env) {
     float width = env->client->width;
     Rectangle r[SIM_NBTN];
-    sim_rects(width, r);
+    sim_rects(env, r);
     float x = width - 8.0f - SIM_COL_W;
     float bot = r[SIM_FOLLOW].y + r[SIM_FOLLOW].height + 8.0f;
     return (Rectangle){x, 8.0f, SIM_COL_W, bot - 8.0f};
@@ -178,6 +205,9 @@ static int sim_ui_hot(Drive* env) {
     }
     if (!puf_record_enabled()
         && CheckCollisionPointRec(mouse, sim_obs_rect(client->width))) {
+        return 1;
+    }
+    if (env->ui_hot && env->ui_hot(env)) {
         return 1;
     }
     return 0;
@@ -499,7 +529,7 @@ static void sim_transport_draw(Drive* env) {
         return;
     }
     Rectangle r[SIM_NBTN];
-    sim_rects(env->client->width, r);
+    sim_rects(env, r);
     const char* labels[SIM_NBTN] = {
         "Play", "Pause", "Reset", "Follow"
     };
@@ -519,6 +549,11 @@ static void sim_transport_draw(Drive* env) {
     int x0 = (int)r[SIM_PLAY].x;
     int x1 = (int)(r[SIM_PLAY].x + r[SIM_PLAY].width);
     DrawLine(x0, y1, x1, y1, sep);
+    if (env->sim_scene) {
+        Rectangle scene = sim_scene_rect(env);
+        int scene_hot = CheckCollisionPointRec(mouse, scene);
+        sim_choice(scene, "New scene", 0, scene_hot, 0);
+    }
     for (int i = 0; i < SIM_NBTN; i++) {
         int hot = CheckCollisionPointRec(mouse, r[i]);
         sim_choice(r[i], labels[i], on[i], hot, i == SIM_PAUSE);
@@ -552,14 +587,26 @@ static inline void puf_sim_poll(Drive* env) {
     }
     Vector2 mouse = GetMousePosition();
     Rectangle r[SIM_NBTN];
-    sim_rects(env->client->width, r);
+    sim_rects(env, r);
+    if (env->sim_scene) {
+        Rectangle scene = sim_scene_rect(env);
+        if (CheckCollisionPointRec(mouse, scene)) {
+            env->sim_scene(env);
+            env->sim_hold_step = 1;
+            return;
+        }
+    }
     if (CheckCollisionPointRec(mouse, r[SIM_PLAY])) {
         env->sim_paused = 0;
     } else if (CheckCollisionPointRec(mouse, r[SIM_PAUSE])) {
         env->sim_paused = 1;
     } else if (CheckCollisionPointRec(mouse, r[SIM_RESET])) {
         // Manual reset is not a logged episode.
-        puf_reset(env);
+        if (env->sim_reset) {
+            env->sim_reset(env);
+        } else {
+            puf_reset(env);
+        }
         env->sim_hold_step = 1;
     } else if (CheckCollisionPointRec(mouse, r[SIM_FOLLOW])) {
         env->sim_follow = !env->sim_follow;
@@ -1110,6 +1157,14 @@ void puf_render(Drive* env) {
     if (env->client == NULL) {
         env->client = make_client(env);
     }
+    if (env->sim_user_size && IsWindowReady()) {
+        int sw = GetScreenWidth();
+        int sh = GetScreenHeight();
+        if (sw >= 100 && sh >= 100) {
+            env->client->width = (float)sw;
+            env->client->height = (float)sh;
+        }
+    }
     if (puf_record_enabled()) {
         record_views(env);
         return;
@@ -1271,43 +1326,16 @@ static void draw_world(Drive* env, Client* client) {
 }
 
 static void puf_render_hud(Drive* env, Client* client) {
-    // Draw debug info
-    DrawText(TextFormat("Camera Position: (%.2f, %.2f, %.2f)",
-        client->camera.position.x, client->camera.position.y, client->camera.position.z), 10, 10, 20, INK);
-    DrawText(TextFormat("Camera Target: (%.2f, %.2f, %.2f)",
-        client->camera.target.x, client->camera.target.y, client->camera.target.z), 10, 30, 20, INK);
-    const char* paused_mark = "";
-    if (!puf_record_enabled() && env->sim_paused) {
-        paused_mark = "   paused";
-    }
-    DrawText(TextFormat("Time: %.1f s%s", env->timestep * SIM_DT, paused_mark),
-        10, 50, 20, INK);
     if (!puf_record_enabled() && !env->checkpoint_ok) {
         DrawText("Checkpoint cannot be loaded, showing random behavior",
-            10, 190, 20, CRIMSON);
+            10, 10, 20, CRIMSON);
     }
-    int human_idx = -1;
-    int accel = 0;
-    int steer = 0;
-    if (env->active_agent_count > 0
-        && env->selected_agent_idx >= 0
-        && env->selected_agent_idx < env->active_agent_count) {
-        human_idx = env->selected_agent_idx;
-        float* atn = env->agents[env->selected_agent_idx].actions;
-        if (atn) {
-            accel = (int)atn[0];
-            steer = (int)atn[1];
-        }
-    }
-    DrawText(TextFormat("Controlling Agent: %d", env->selected_agent_idx), 10, 70, 20, INK);
-    DrawText(TextFormat("Agent Index: %d", human_idx), 10, 90, 20, INK);
     if (!puf_record_enabled()) {
         sim_transport_draw(env);
     }
-    DrawText(TextFormat("Acceleration: %d", accel), 10, 110, 20, INK);
-    DrawText(TextFormat("Steering: %d", steer), 10, 130, 20, INK);
-    DrawText(TextFormat("Grid Rows: %d", env->grid_rows), 10, 150, 20, INK);
-    DrawText(TextFormat("Grid Cols: %d", env->grid_cols), 10, 170, 20, INK);
+    if (env->hud_extra) {
+        env->hud_extra(env);
+    }
     EndDrawing();
     if (puf_record_enabled()) {
         puf_record_capture((int)client->width, (int)client->height);

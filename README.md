@@ -20,3 +20,11 @@ Score one headless episode:
 ```
 ./drive --headless --eval_episodes=1 checkpoints/town01.bin
 ```
+
+Drive the Waymo self-driving car against a frozen behavioral-cloning anchor. WASD or the arrow keys hold an acceleration bin and a steering bin. The other cars replay the log, and the scene returns to the first frame every 90 steps. The panel shows the anchor distribution for the SDC observation, then KL(anchor || act), KL(act || anchor), and the 1-Wasserstein distance. "Let anchor take control" rolls out the checkpoint. "New scene" at the top right loads another intersection.
+
+```
+./drive --anchor checkpoints/bc_womd_100.npz
+```
+
+That loads a dense intersection from `data/womd`. `--env.map_id` picks one of the ten curated maps when the id is one of them.

@@ -611,6 +611,15 @@ void free_puffernet(PufferNet* net) {
 
 #include ENV_HEADER
 
+#ifdef PUFFER_DRIVE
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+#include "cJSON.c"
+#include "offline.h"
+#pragma clang diagnostic pop
+#include "anchor_interactive.h"
+#endif
+
 #if !defined(PUF_NMMO3_NET) && !defined(PUF_ASTEROIDS_NET) && !defined(PUF_MINIMAL_NET) && !defined(PUF_CRAFTAX_NET)
 static int puf_align8(int n) {
     return (n + 7) & ~7;
@@ -778,10 +787,35 @@ int main(int argc, char** argv) {
     const char* record_path = NULL;
     const char* cli_path = NULL;
     int cli_latest = 0;
+    const char* anchor_path = NULL;
+    int saw_data_dir = 0;
+    int saw_map_id = 0;
+    int saw_episode = 0;
 
     char* ini_argv[argc > 0 ? argc : 1];
     int ini_argc = 0;
     for (int i = argi; i < argc; i++) {
+        if (strstr(argv[i], "data_dir") != NULL) {
+            saw_data_dir = 1;
+        }
+        if (strstr(argv[i], "map_id") != NULL) {
+            saw_map_id = 1;
+        }
+        if (strstr(argv[i], "episode_length") != NULL) {
+            saw_episode = 1;
+        }
+        if (strcmp(argv[i], "--anchor") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--anchor needs a checkpoint path\n");
+                return 1;
+            }
+            anchor_path = argv[++i];
+            continue;
+        }
+        if (strncmp(argv[i], "--anchor=", 9) == 0) {
+            anchor_path = argv[i] + 9;
+            continue;
+        }
         if (strcmp(argv[i], "--headless") == 0) {
             headless = 1;
             continue;
@@ -808,6 +842,17 @@ int main(int argc, char** argv) {
         }
         ini_argv[ini_argc++] = argv[i];
     }
+#ifndef PUFFER_DRIVE
+    if (anchor_path) {
+        fprintf(stderr, "--anchor is the drive player\n");
+        return 1;
+    }
+#else
+    if (anchor_path) {
+        cli_path = NULL;
+        cli_latest = 0;
+    }
+#endif
     puf_ini_load_env(&ini, env_name, ini_argc, ini_argv);
     if (record) {
         char default_path[256];
@@ -882,9 +927,58 @@ int main(int argc, char** argv) {
     frameskip = 1;
 #endif
 
+#ifdef PUFFER_DRIVE
+    if (anchor_path) {
+        if (!saw_data_dir) {
+            dict_set_str(env_sec, "data_dir", "data/womd");
+        }
+        if (!saw_episode) {
+            dict_set(env_sec, "episode_length", 100000);
+        }
+        dict_set_str(env_sec, "collision_physics", "bump");
+        if (headless || record) {
+            fprintf(stderr, "--anchor opens a window\n");
+            return 1;
+        }
+        Env env = {0};
+        env.checkpoint_ok = 1;
+        env.checkpoint_error[0] = 0;
+        env.sim_follow = 1;
+        env.sim_lock_actions = 1;
+        env.sim_user_size = 1;
+        int start = 0;
+        if (saw_map_id) {
+            start = ademo_scene_index((int)dict_get(env_sec, "map_id"));
+        }
+        ademo_open(anchor_path);
+        ademo_boot(&env, env_sec, start);
+        env.hud_extra = ademo_hud;
+        env.ui_hot = ademo_hot;
+        env.sim_reset = ademo_on_reset;
+        env.sim_scene = ademo_on_scene;
+        ademo_run(&env);
+        ademo_close();
+        ademo_shutdown();
+        puf_close(&env);
+        free(env.map_name);
+        env.map_name = NULL;
+        puf_ini_free(&ini);
+        return 0;
+    }
+#endif
     Env env = {0};
     puf_init(&env, env_sec);
 #ifdef PUF_HAS_SIM_CONTROL
+#ifdef PUFFER_DRIVE
+    if (anchor_path) {
+        env.checkpoint_ok = 1;
+        env.checkpoint_error[0] = 0;
+        env.sim_follow = 1;
+        env.sim_lock_actions = 1;
+        env.sim_user_size = 1;
+    } else
+#endif
+    {
     env.checkpoint_ok = have_net;
     if (!have_net) {
         if (!path) {
@@ -900,6 +994,7 @@ int main(int argc, char** argv) {
                 path, raw_floats, need);
         }
         sim_checkpoint_rejected(&env);
+    }
     }
 #endif
 
@@ -930,6 +1025,8 @@ int main(int argc, char** argv) {
         env.agents[i].policy = 0;
     }
     puf_reset(&env);
+
+
 
 #ifdef PUF_NMMO3_NET
     MMONet* net = NULL;

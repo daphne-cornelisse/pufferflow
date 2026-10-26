@@ -155,6 +155,16 @@ struct Env {
     int sim_follow;
     // One frame after Reset, so that click draws timestep 0.
     int sim_hold_step;
+    // Anchor demo owns the selected car. Shift does not overwrite it.
+    int sim_lock_actions;
+    // Anchor demo. Do not grow to the monitor. The user can resize.
+    int sim_user_size;
+    void (*hud_extra)(struct Env* env);
+    int (*ui_hot)(struct Env* env);
+    // Anchor demo. Log rewind instead of a random spawn.
+    void (*sim_reset)(struct Env* env);
+    // Anchor demo. Top-right button loads another scenario.
+    void (*sim_scene)(struct Env* env);
     int near_cols;
     int near_rows;
     int bins_ready;
@@ -1607,6 +1617,9 @@ void puf_reset(Drive* env) {
 }
 
 static void human_controls(Drive* env) {
+    if (env->sim_lock_actions) {
+        return;
+    }
     if (!IsWindowReady() || !IsKeyDown(KEY_LEFT_SHIFT)) {
         return;
     }
