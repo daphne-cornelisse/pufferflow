@@ -215,4 +215,5 @@ resources/trailer/shots/*.mp4
 .refactor-snapshots/
 
 vendor/fast-nle/
-analysis/ 
+analysis/
+analysis/offline/
