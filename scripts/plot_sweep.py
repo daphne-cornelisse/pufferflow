@@ -2,7 +2,7 @@
 """Plot a protein sweep from its log and per-run metrics.
 
 The figure is four rows. Score quality against sweep index is the first
-panel, colored by run. Completion rate against jerk is next. Every panel
+panel, colored by run. Score against collision count is next. Every panel
 colors runs with ColorBrewer Set1, except episode return against sweep
 index, which is colored by trial wall clock. The other panels are return
 curves, goal score, collision rate, score against jerk when those series
@@ -345,18 +345,18 @@ def draw(returns, collisions, counts, summary, out):
     axes[0].set_ylabel("score quality")
     axes[0].set_title("Score quality")
 
-    if summary["completion_rate"].notna().any() and summary["jerk"].notna().any():
+    if summary["score"].notna().any() and summary["collision_count"].notna().any():
         sns.scatterplot(
-            data=summary, x="jerk", y="completion_rate", hue="series",
+            data=summary, x="collision_count", y="score", hue="series",
             palette=palette, s=58, ax=axes[1], legend=False,
             edgecolor="white", linewidth=0.6,
         )
         axes[1].set_ylim(-0.03, 1.03)
     else:
         axes[1].set_axis_off()
-    axes[1].set_xlabel("jerk")
-    axes[1].set_ylabel("completion rate")
-    axes[1].set_title("Completion rate vs jerk")
+    axes[1].set_xlabel("collision count")
+    axes[1].set_ylabel("score")
+    axes[1].set_title("Score vs collision count")
 
     lo = float(summary["wall_min"].min())
     hi = float(summary["wall_min"].max())
@@ -502,14 +502,14 @@ def draw_overview(returns, collisions, counts, summary, out):
     axes[0].set_ylabel("score quality")
     axes[0].set_title("Score quality")
 
-    if summary["completion_rate"].notna().any() and summary["jerk"].notna().any():
-        scatter_phases(summary, "jerk", "completion_rate", axes[1], palette, markers)
+    if summary["score"].notna().any() and summary["collision_count"].notna().any():
+        scatter_phases(summary, "collision_count", "score", axes[1], palette, markers)
         axes[1].set_ylim(-0.03, 1.03)
     else:
         axes[1].set_axis_off()
-    axes[1].set_xlabel("jerk")
-    axes[1].set_ylabel("completion rate")
-    axes[1].set_title("Completion rate vs jerk")
+    axes[1].set_xlabel("collision count")
+    axes[1].set_ylabel("score")
+    axes[1].set_title("Score vs collision count")
 
     lo = float(summary["wall_min"].min())
     hi = float(summary["wall_min"].max())
