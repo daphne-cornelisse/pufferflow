@@ -55,14 +55,15 @@
 #define MAX_ROAD_SEGMENT_OBSERVATIONS 75
 
 #define PARTNER_FEATURES 7
-// Index 6 stays 0 so an old checkpoint keeps that weight. Index 7
-// stays 0. It is open.
+// Index 6 is the previous step's signed acceleration, clamped to the
+// action bounds. Index 7 is the previous step's yaw rate, clamped to
+// ±OBS_YAW_ABS. Both are 0 on the first step of a life.
 #define EGO_FEATURES 8
 #define ROAD_FEATURES 7
 
 #define OBS_SIZE (EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS \
     + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS)
-#define ACT_SIZES {21, 31}
+#define ACT_SIZES {257, 257}
 #define NUM_ATNS 2
 
 // Observation normalization
@@ -76,6 +77,9 @@
 #define OBS_GOAL_SCALE 0.005f
 #define OBS_SPEED_SCALE 0.01f
 #define OBS_POSITION_SCALE 0.02f
+#define OBS_ACCEL_SCALE 0.05f
+#define OBS_YAW_SCALE 0.5f
+#define OBS_YAW_ABS 5.0f
 
 // Distance thresholds
 // Arrival radius. A 5 m disk covers a 5 m centerline segment.
@@ -97,15 +101,13 @@
 // Episode reset draws a speed along the lane, uniform on [0, 50] mph.
 #define SPAWN_SPEED_MAX_MPS (50.0f * 1609.344f / 3600.0f)
 
-// Action space. Uniform bins so a logged step can be labeled tightly.
-// 21 accelerations on [-4, 4] m/s^2, 31 steering angles on [-1, 1] rad.
-// Both counts are odd, so one bin is exactly zero.
-#define NUM_ACCEL_BINS 21
-#define NUM_STEER_BINS 31
-#define ACCEL_MIN -4.0f
-#define ACCEL_MAX 4.0f
-#define STEER_MIN -1.0f
-#define STEER_MAX 1.0f
+// Odd counts, so the center bin is 0. move_dynamics steps this table.
+#define NUM_ACCEL_BINS 257
+#define NUM_STEER_BINS 257
+#define ACCEL_MIN -8.0f
+#define ACCEL_MAX 8.0f
+#define STEER_MIN -1.5f
+#define STEER_MAX 1.5f
 #define ACCEL_COAST_BIN ((NUM_ACCEL_BINS - 1) / 2)
 #define STEER_COAST_BIN ((NUM_STEER_BINS - 1) / 2)
 
@@ -123,6 +125,9 @@ static void init_action_space(void) {
     if (action_space_ready) {
         return;
     }
+    // An even count has no center bin, so coast would be a nonzero command.
+    assert(NUM_ACCEL_BINS % 2 == 1);
+    assert(NUM_STEER_BINS % 2 == 1);
     float accel_step = (ACCEL_MAX - ACCEL_MIN) / (float)(NUM_ACCEL_BINS - 1);
     for (int i = 0; i < NUM_ACCEL_BINS; i++) {
         ACCELERATION_VALUES[i] = ACCEL_MIN + i * accel_step;

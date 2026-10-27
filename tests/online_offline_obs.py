@@ -1,9 +1,4 @@
-"""Observation and action checks for the offline Waymo env.
-
-The sim handle and the drive handle both call drive.h. The scenario checks
-compare logged poses, after the world-mean shift, against that same
-observation function.
-"""
+"""Observation and action checks for the offline Waymo env."""
 
 import math
 import sys
@@ -25,13 +20,33 @@ def require(cond, msg):
 
 
 def bicycle(x, y, heading, vx, vy, accel, steer, length, dt=0.1):
-    speed = math.hypot(vx, vy) + 0.5 * accel * dt
-    speed = max(-100.0, min(100.0, speed))
-    beta = math.tanh(0.5 * math.tan(steer))
-    yaw = (speed * math.cos(beta) * math.tan(steer)) / length
-    nvx = speed * math.cos(heading + beta)
-    nvy = speed * math.sin(heading + beta)
-    return x + nvx * dt, y + nvy * dt, heading + yaw * dt, nvx, nvy
+    # Same step as bicycle_integrate: new speed, then the circular arc.
+    c = math.cos(heading)
+    s = math.sin(heading)
+    v = vx * c + vy * s + accel * dt
+    v = max(-100.0, min(100.0, v))
+    wheelbase = 0.6 * length
+    if wheelbase < 1.0:
+        wheelbase = 1.0
+    tsteer = math.tan(steer)
+    if tsteer > 1.0e6 or tsteer < -1.0e6:
+        tsteer = 0.0
+    dth = v * tsteer / wheelbase * dt
+    if abs(dth) < 1.0e-4:
+        dx_b = v * dt
+        dy_b = 0.0
+    else:
+        radius = v * dt / dth
+        dx_b = radius * math.sin(dth)
+        dy_b = radius * (1.0 - math.cos(dth))
+    x = x + dx_b * c - dy_b * s
+    y = y + dx_b * s + dy_b * c
+    heading = heading + dth
+    if heading > math.pi:
+        heading -= 2.0 * math.pi
+    if heading < -math.pi:
+        heading += 2.0 * math.pi
+    return x, y, heading, v * math.cos(heading), v * math.sin(heading)
 
 
 def test_bins(lib):
@@ -284,9 +299,8 @@ def test_collect_and_inverse(lib):
                 x1, y1 = drv.log_xy(lib, scenario, i, t + 1)
                 err = math.hypot(float(st[0]) - x1, float(st[1]) - y1)
                 errs.append(err)
-                steer = lib.pf_steer_value(sb)
-                beta = math.tanh(0.5 * math.tan(steer))
-                if abs(beta) < 0.6 and abs(lib.pf_accel_value(ab)) < 3.9:
+                # Endpoint bins are the clamp of the labeling grid.
+                if abs(lib.pf_steer_value(sb)) < 0.95 and abs(lib.pf_accel_value(ab)) < 3.9:
                     in_range.append(err)
         mean_err = float(np.mean(errs))
         mean_in = float(np.mean(in_range)) if in_range else mean_err

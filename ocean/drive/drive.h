@@ -69,6 +69,11 @@ typedef struct Entity {
     int collided_this_goal;
     int active_agent;
     int lane_node;
+    // Signed speed and heading at the previous observation. dyn_ready
+    // is 0 until that pair exists, so a fresh spawn reports no lag.
+    float dyn_speed;
+    float dyn_heading;
+    int dyn_ready;
 } Entity;
 
 void free_entity(Entity* entity) {
@@ -92,6 +97,53 @@ float normalize_heading(float heading) {
         heading += 2 * M_PI;
     }
     return heading;
+}
+
+// The logged body is longer than the wheelbase.
+static float bicycle_wheelbase(float length) {
+    float wheelbase = 0.6f * length;
+    if (wheelbase < 1.0f) {
+        wheelbase = 1.0f;
+    }
+    return wheelbase;
+}
+
+// Kinematic bicycle. New speed, then a circular arc. No side slip.
+static void bicycle_integrate(float* x, float* y, float* heading,
+        float* vx, float* vy, float length, float acceleration, float steering) {
+    float c = cosf(*heading);
+    float s = sinf(*heading);
+    float v = (*vx) * c + (*vy) * s + acceleration * SIM_DT;
+    float wheelbase = bicycle_wheelbase(length);
+    float tsteer = tanf(steering);
+    float dth;
+    float dx_b;
+    float dy_b;
+    if (v > MAX_SPEED) {
+        v = MAX_SPEED;
+    }
+    if (v < -MAX_SPEED) {
+        v = -MAX_SPEED;
+    }
+    // tan diverges at ±pi/2. A command that close is a divide-by-zero in
+    // the steer inverse, not a turn the log can contain.
+    if (tsteer > 1.0e6f || tsteer < -1.0e6f) {
+        tsteer = 0.0f;
+    }
+    dth = v * tsteer / wheelbase * SIM_DT;
+    if (fabsf(dth) < 1.0e-4f) {
+        dx_b = v * SIM_DT;
+        dy_b = 0.0f;
+    } else {
+        float radius = v * SIM_DT / dth;
+        dx_b = radius * sinf(dth);
+        dy_b = radius * (1.0f - cosf(dth));
+    }
+    *x += dx_b * c - dy_b * s;
+    *y += dx_b * s + dy_b * c;
+    *heading = normalize_heading(*heading + dth);
+    *vx = v * cosf(*heading);
+    *vy = v * sinf(*heading);
 }
 
 struct Env {
@@ -168,6 +220,11 @@ struct Env {
     int near_cols;
     int near_rows;
     int bins_ready;
+    // When set, move_dynamics reads these floats instead of the bin tables.
+    // Both paths go through bicycle_integrate. Default off.
+    int use_action_values;
+    float action_accel[DRIVE_AGENT_MAX];
+    float action_steer[DRIVE_AGENT_MAX];
     int* bin_head;
     int* bin_next;
     Dict* cfg;
@@ -1105,41 +1162,33 @@ void puf_close(Drive* env) {
 // Dynamics
 void move_dynamics(Drive* env, int agent_idx) {
     Entity* agent = &env->entities[agent_idx];
-    float* atn = env->agents[agent_idx].actions;
-    int acceleration_index = (int)atn[0];
-    int steering_index = (int)atn[1];
-    float acceleration = ACCELERATION_VALUES[acceleration_index];
-    float steering = STEERING_VALUES[steering_index];
+    float acceleration;
+    float steering;
+    if (env->use_action_values) {
+        acceleration = env->action_accel[agent_idx];
+        steering = env->action_steer[agent_idx];
+    } else {
+        float* atn = env->agents[agent_idx].actions;
+        int acceleration_index = (int)atn[0];
+        int steering_index = (int)atn[1];
+        acceleration = ACCELERATION_VALUES[acceleration_index];
+        steering = STEERING_VALUES[steering_index];
+    }
 
     float x = agent->x;
     float y = agent->y;
     float heading = agent->heading;
-    float speed = sqrtf(agent->vx * agent->vx + agent->vy * agent->vy);
-
-    speed = speed + 0.5f * acceleration * SIM_DT;
-    if (speed > MAX_SPEED) {
-        speed = MAX_SPEED;
-    }
-    if (speed < -MAX_SPEED) {
-        speed = -MAX_SPEED;
-    }
-
-    float beta = tanh(0.5 * tanf(steering));
-    float yaw_rate = (speed * cosf(beta) * tanf(steering)) / agent->length;
-    float new_vx = speed * cosf(heading + beta);
-    float new_vy = speed * sinf(heading + beta);
-
-    x += new_vx * SIM_DT;
-    y += new_vy * SIM_DT;
-    heading += yaw_rate * SIM_DT;
-
+    float vx = agent->vx;
+    float vy = agent->vy;
+    bicycle_integrate(&x, &y, &heading, &vx, &vy, agent->length,
+        acceleration, steering);
     agent->x = x;
     agent->y = y;
     agent->heading = heading;
     agent->heading_x = cosf(heading);
     agent->heading_y = sinf(heading);
-    agent->vx = new_vx;
-    agent->vy = new_vy;
+    agent->vx = vx;
+    agent->vy = vy;
     env->bins_ready = 0;
 }
 
@@ -1176,7 +1225,30 @@ void compute_observations(Drive* env) {
         obs[3] = ego->width / MAX_VEH_WIDTH;
         obs[4] = ego->length / MAX_VEH_LEN;
         obs[5] = (ego->collision_state > NO_COLLISION) ? 1 : 0;
-        // Index 6 and index 7 stay 0. Index 7 is open.
+        float signed_speed = ego->vx * cos_h + ego->vy * sin_h;
+        float accel_lag = 0.0f;
+        float yaw_lag = 0.0f;
+        if (ego->dyn_ready) {
+            accel_lag = (signed_speed - ego->dyn_speed) / SIM_DT;
+            if (accel_lag > ACCEL_MAX) {
+                accel_lag = ACCEL_MAX;
+            }
+            if (accel_lag < ACCEL_MIN) {
+                accel_lag = ACCEL_MIN;
+            }
+            yaw_lag = normalize_heading(ego->heading - ego->dyn_heading) / SIM_DT;
+            if (yaw_lag > OBS_YAW_ABS) {
+                yaw_lag = OBS_YAW_ABS;
+            }
+            if (yaw_lag < -OBS_YAW_ABS) {
+                yaw_lag = -OBS_YAW_ABS;
+            }
+        }
+        obs[6] = accel_lag * OBS_ACCEL_SCALE;
+        obs[7] = yaw_lag * OBS_YAW_SCALE;
+        ego->dyn_speed = signed_speed;
+        ego->dyn_heading = ego->heading;
+        ego->dyn_ready = 1;
 
         // First MAX_AGENTS partners in index order, inside range.
         int obs_idx = EGO_FEATURES;
@@ -1309,6 +1381,7 @@ static void sit_on_lane(Drive* env, Entity* e, int k) {
     e->vy = 0.0f;
     e->vz = 0.0f;
     e->collision_state = NO_COLLISION;
+    e->dyn_ready = 0;
     env->bins_ready = 0;
 }
 
@@ -1612,6 +1685,7 @@ void puf_reset(Drive* env) {
     initialize_env(env);
     for (int i = 0; i < env->active_agent_count; i++) {
         env->logs[i] = (Log){0};
+        env->entities[i].dyn_ready = 0;
     }
     compute_observations(env);
 }
@@ -1910,6 +1984,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->reward_goal = dict_get(kwargs, "reward_goal");
     env->reward_jerk = dict_get(kwargs, "reward_jerk");
     env->cfg = kwargs;
+    env->use_action_values = 0;
     int map_id = dict_get(kwargs, "map_id");
     char bin_dir[480];
     char map_file[512];

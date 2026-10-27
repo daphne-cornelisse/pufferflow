@@ -45,6 +45,13 @@ def load():
     fn("pf_traj", ctypes.c_int, [])
     fn("pf_obs", c_float_p, [handle])
     fn("pf_set_action", None, [handle, ctypes.c_int, ctypes.c_float, ctypes.c_float])
+    fn("pf_relabel_grid", None, [
+        handle, ctypes.c_float, ctypes.c_float, ctypes.c_int,
+        ctypes.c_float, ctypes.c_float, ctypes.c_int,
+    ])
+    fn("pf_set_action_value", None, [
+        handle, ctypes.c_int, ctypes.c_float, ctypes.c_float,
+    ])
     fn("pf_reward", ctypes.c_float, [handle, ctypes.c_int])
     fn("pf_timestep", ctypes.c_int, [handle])
     fn("pf_agent", None, [handle, ctypes.c_int, c_float_p])
@@ -70,6 +77,24 @@ def load():
     fn("pf_steer_bin", ctypes.c_int, [ctypes.c_float])
     fn("pf_accel_value", ctypes.c_float, [ctypes.c_int])
     fn("pf_steer_value", ctypes.c_float, [ctypes.c_int])
+    fn("pf_quantized_ade", None, [
+        handle, ctypes.c_float, ctypes.c_float, ctypes.c_int,
+        ctypes.c_float, ctypes.c_float, ctypes.c_int,
+        c_float_p, c_int_p, c_float_p, c_float_p,
+    ])
+    fn("pf_delta_ade", None, [
+        handle, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        c_float_p, c_int_p, c_float_p, c_float_p, c_float_p,
+    ])
+    fn("pf_quantized_trace", None, [
+        handle, ctypes.c_float, ctypes.c_float, ctypes.c_int,
+        ctypes.c_float, ctypes.c_float, ctypes.c_int,
+        c_float_p, c_float_p, c_uint8_p,
+    ])
+    fn("pf_delta_trace", None, [
+        handle, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        c_float_p, c_float_p, c_uint8_p,
+    ])
     fn("pf_road_counts", None, [handle, c_int_p, c_int_p])
     fn("pf_roads", None, [handle, c_int_p, c_int_p, c_float_p, c_float_p])
     return lib

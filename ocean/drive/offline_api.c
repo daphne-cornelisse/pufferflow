@@ -1,15 +1,10 @@
-// Shared library for the offline Waymo env and the drive.h sim.
-// Build from the repo root:
-//   clang -O2 -fPIC -shared -I. -Isrc -Iocean/drive -Ivendor \
-//     -Iraylib-5.5_linux_amd64/include -DPLATFORM_DESKTOP -D_GNU_SOURCE \
-//     -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable \
-//     ocean/drive/offline_api.c vendor/cJSON.c \
-//     raylib-5.5_linux_amd64/lib/libraylib.a \
-//     -lGL -lm -lpthread -ldl -lrt -lX11 \
-//     -o build/libdrive_offline.so
-//
-// Sim handles call puf_init / puf_reset / puf_step. Scenario handles load one
-// WOMD json on top of that map and never call puf_reset.
+// clang -O2 -fPIC -shared -I. -Isrc -Iocean/drive -Ivendor \
+//   -Iraylib-5.5_linux_amd64/include -DPLATFORM_DESKTOP -D_GNU_SOURCE \
+//   -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable \
+//   ocean/drive/offline_api.c vendor/cJSON.c \
+//   raylib-5.5_linux_amd64/lib/libraylib.a \
+//   -lGL -lm -lpthread -ldl -lrt -lX11 \
+//   -o build/libdrive_offline.so
 
 #include "drive.h"
 #include "offline.h"
@@ -92,6 +87,7 @@ PfHandle* pf_create_scenario(const char* data_dir, int map_id,
     for (int i = 0; i < h->off.log_n; i++) {
         offline_label_agent(&h->off.logs[i]);
     }
+    offline_mark_offroad(&h->off);
     offline_clear_episode(&h->off);
     offline_place(&h->off, 0);
     compute_observations(&h->off.drive);
@@ -191,6 +187,21 @@ void pf_set_action(PfHandle* h, int i, float accel_bin, float steer_bin) {
     assert(i >= 0 && i < h->off.drive.num_agents);
     h->off.drive.agents[i].actions[0] = accel_bin;
     h->off.drive.agents[i].actions[1] = steer_bin;
+}
+
+// Re-bin logged commands. Does not change which agents are fit.
+void pf_relabel_grid(PfHandle* h, float amin, float amax, int na,
+        float smin, float smax, int ns) {
+    assert(h->kind == PF_SCENARIO);
+    offline_relabel_grid(&h->off, amin, amax, na, smin, smax, ns);
+}
+
+// Float command. Later integrates of this handle use the value path.
+void pf_set_action_value(PfHandle* h, int i, float accel, float steer) {
+    assert(i >= 0 && i < h->off.drive.num_agents);
+    h->off.drive.use_action_values = 1;
+    h->off.drive.action_accel[i] = accel;
+    h->off.drive.action_steer[i] = steer;
 }
 
 float pf_reward(PfHandle* h, int i) {
@@ -326,12 +337,12 @@ float pf_invalid(void) {
 
 int pf_accel_bin(float v) {
     init_action_space();
-    return offline_nearest(v, ACCELERATION_VALUES, NUM_ACCEL_BINS);
+    return offline_quantize_bin(v, ACCEL_MIN, ACCEL_MAX, NUM_ACCEL_BINS);
 }
 
 int pf_steer_bin(float v) {
     init_action_space();
-    return offline_nearest(v, STEERING_VALUES, NUM_STEER_BINS);
+    return offline_quantize_bin(v, STEER_MIN, STEER_MAX, NUM_STEER_BINS);
 }
 
 float pf_accel_value(int bin) {
@@ -381,4 +392,268 @@ void pf_roads(PfHandle* h, int* offsets, int* types, float* xs, float* ys) {
         r++;
         offsets[r] = p;
     }
+}
+
+// Agent-major, OFFLINE_TRAJ frames. A null xs skips the store.
+static void trace_store(float* xs, float* ys, unsigned char* on,
+        int i, int t, const Entity* e) {
+    if (!xs) {
+        return;
+    }
+    int k = i * OFFLINE_TRAJ + t;
+    if (e->x == INVALID_POSITION) {
+        xs[k] = 0.0f;
+        ys[k] = 0.0f;
+        on[k] = 0;
+        return;
+    }
+    xs[k] = e->x;
+    ys[k] = e->y;
+    on[k] = 1;
+}
+
+static void trace_frame(float* xs, float* ys, unsigned char* on,
+        int n, int t, const Drive* drive) {
+    if (!xs) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        trace_store(xs, ys, on, i, t, &drive->entities[i]);
+    }
+}
+
+// Frame 0 matches the log by placement and is left out of the ADE.
+static void quantized_replay(PfHandle* h, float amin, float amax, int na,
+        float smin, float smax, int ns, float* ade_mean, int* n_agents,
+        float* clip_accel, float* clip_steer,
+        float* trace_x, float* trace_y, unsigned char* trace_on) {
+    assert(h && h->kind == PF_SCENARIO);
+    assert((na == 0 || na >= 2) && (ns == 0 || ns >= 2));
+    assert(amax > amin && smax > smin);
+    Offline* env = &h->off;
+    Drive* drive = &env->drive;
+    int n = env->log_n;
+    assert(n <= DRIVE_AGENT_MAX);
+    offline_reset_scenario(env);
+    double agent_err[DRIVE_AGENT_MAX];
+    int agent_n[DRIVE_AGENT_MAX];
+    memset(agent_err, 0, sizeof(agent_err));
+    memset(agent_n, 0, sizeof(agent_n));
+    int commands = 0;
+    int clipped_a = 0;
+    int clipped_s = 0;
+    drive->use_action_values = 1;
+    for (int t = 0; t < OFFLINE_TRAJ - 1; t++) {
+        drive->timestep = t;
+        offline_spawn_due(env);
+        trace_frame(trace_x, trace_y, trace_on, n, t, drive);
+        for (int i = 0; i < n; i++) {
+            Entity* e = &drive->entities[i];
+            OfflineAgent* a = &env->logs[i];
+            float accel = 0.0f;
+            float steer = 0.0f;
+            int labeled = !a->base_unfit && a->valid[t] && a->valid[t + 1]
+                && e->x != INVALID_POSITION;
+            if (labeled) {
+                float raw_a = 0.0f;
+                float raw_s = 0.0f;
+                offline_inverse_raw(a->x[t], a->y[t], a->heading[t],
+                    a->vx[t], a->vy[t], a->x[t + 1], a->y[t + 1],
+                    a->heading[t + 1], a->vx[t + 1], a->vy[t + 1],
+                    a->length, &raw_a, &raw_s);
+                commands++;
+                if (raw_a < amin || raw_a > amax) {
+                    clipped_a++;
+                }
+                if (raw_s < smin || raw_s > smax) {
+                    clipped_s++;
+                }
+                if (na >= 2) {
+                    accel = offline_quantize(raw_a, amin, amax, na);
+                } else {
+                    accel = raw_a;
+                    if (accel < amin) {
+                        accel = amin;
+                    }
+                    if (accel > amax) {
+                        accel = amax;
+                    }
+                }
+                if (ns >= 2) {
+                    steer = offline_quantize(raw_s, smin, smax, ns);
+                } else {
+                    steer = raw_s;
+                    if (steer < smin) {
+                        steer = smin;
+                    }
+                    if (steer > smax) {
+                        steer = smax;
+                    }
+                }
+            }
+            drive->action_accel[i] = accel;
+            drive->action_steer[i] = steer;
+            e->reached_goal = 0;
+        }
+        offline_integrate(drive, 0);
+        for (int i = 0; i < n; i++) {
+            OfflineAgent* a = &env->logs[i];
+            Entity* e = &drive->entities[i];
+            if (a->base_unfit || !a->valid[t + 1] || e->x == INVALID_POSITION) {
+                continue;
+            }
+            float dx = e->x - a->x[t + 1];
+            float dy = e->y - a->y[t + 1];
+            agent_err[i] += sqrtf(dx * dx + dy * dy);
+            agent_n[i] += 1;
+        }
+    }
+    trace_frame(trace_x, trace_y, trace_on, n, OFFLINE_TRAJ - 1, drive);
+    drive->use_action_values = 0;
+    int used = 0;
+    double mean = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (agent_n[i] <= 0) {
+            continue;
+        }
+        mean += agent_err[i] / (double)agent_n[i];
+        used++;
+    }
+    *ade_mean = used > 0 ? (float)(mean / (double)used) : 0.0f;
+    *n_agents = used;
+    *clip_accel = commands > 0 ? (float)clipped_a / (float)commands : 0.0f;
+    *clip_steer = commands > 0 ? (float)clipped_s / (float)commands : 0.0f;
+}
+
+void pf_quantized_ade(PfHandle* h, float amin, float amax, int na,
+        float smin, float smax, int ns, float* ade_mean, int* n_agents,
+        float* clip_accel, float* clip_steer) {
+    quantized_replay(h, amin, amax, na, smin, smax, ns,
+        ade_mean, n_agents, clip_accel, clip_steer, NULL, NULL, NULL);
+}
+
+void pf_quantized_trace(PfHandle* h, float amin, float amax, int na,
+        float smin, float smax, int ns,
+        float* xs, float* ys, unsigned char* on) {
+    float ade = 0.0f;
+    int n_agents = 0;
+    float clip_a = 0.0f;
+    float clip_s = 0.0f;
+    assert(xs && ys && on);
+    quantized_replay(h, amin, amax, na, smin, smax, ns,
+        &ade, &n_agents, &clip_a, &clip_s, xs, ys, on);
+}
+
+// n_dx == 0 keeps the clipped float. Otherwise each component is snapped.
+static void delta_replay(PfHandle* h, int n_dx, int n_dy, int n_yaw,
+        float* ade_mean, int* n_agents,
+        float* clip_dx, float* clip_dy, float* clip_yaw,
+        float* trace_x, float* trace_y, unsigned char* trace_on) {
+    assert(h && h->kind == PF_SCENARIO);
+    assert(n_dx == 0 || (n_dx >= 2 && n_dy >= 2 && n_yaw >= 2));
+    Offline* env = &h->off;
+    Drive* drive = &env->drive;
+    int n = env->log_n;
+    assert(n <= DRIVE_AGENT_MAX);
+    offline_reset_scenario(env);
+    double agent_err[DRIVE_AGENT_MAX];
+    int agent_n[DRIVE_AGENT_MAX];
+    float prev_dx[DRIVE_AGENT_MAX];
+    int ready[DRIVE_AGENT_MAX];
+    memset(agent_err, 0, sizeof(agent_err));
+    memset(agent_n, 0, sizeof(agent_n));
+    memset(prev_dx, 0, sizeof(prev_dx));
+    memset(ready, 0, sizeof(ready));
+    int commands = 0;
+    int clipped_x = 0;
+    int clipped_y = 0;
+    int clipped_yaw = 0;
+    for (int t = 0; t < OFFLINE_TRAJ - 1; t++) {
+        drive->timestep = t;
+        offline_spawn_due(env);
+        trace_frame(trace_x, trace_y, trace_on, n, t, drive);
+        for (int i = 0; i < n; i++) {
+            Entity* e = &drive->entities[i];
+            OfflineAgent* a = &env->logs[i];
+            if (a->base_unfit || e->x == INVALID_POSITION) {
+                continue;
+            }
+            if (!ready[i]) {
+                float speed_init = e->vx * e->heading_x + e->vy * e->heading_y;
+                prev_dx[i] = speed_init * SIM_DT;
+                ready[i] = 1;
+            }
+            float dx = 0.0f;
+            float dy = 0.0f;
+            float dyaw = 0.0f;
+            int labeled = a->valid[t] && a->valid[t + 1];
+            if (labeled) {
+                offline_delta_inverse(a->x[t], a->y[t], a->heading[t],
+                    a->x[t + 1], a->y[t + 1], a->heading[t + 1],
+                    &dx, &dy, &dyaw);
+                commands++;
+                if (dx < -DELTA_MAX_DX || dx > DELTA_MAX_DX) {
+                    clipped_x++;
+                }
+                if (dy < -DELTA_MAX_DY || dy > DELTA_MAX_DY) {
+                    clipped_y++;
+                }
+                if (dyaw < -DELTA_MAX_DYAW || dyaw > DELTA_MAX_DYAW) {
+                    clipped_yaw++;
+                }
+                if (n_dx > 0) {
+                    dx = offline_quantize(dx, -DELTA_MAX_DX, DELTA_MAX_DX, n_dx);
+                    dy = offline_quantize(dy, -DELTA_MAX_DY, DELTA_MAX_DY, n_dy);
+                    dyaw = offline_quantize(dyaw, -DELTA_MAX_DYAW, DELTA_MAX_DYAW, n_yaw);
+                }
+            }
+            offline_delta_step(e, dx, dy, dyaw, &prev_dx[i]);
+            e->reached_goal = 0;
+        }
+        for (int i = 0; i < n; i++) {
+            OfflineAgent* a = &env->logs[i];
+            Entity* e = &drive->entities[i];
+            if (a->base_unfit || !a->valid[t + 1] || e->x == INVALID_POSITION) {
+                continue;
+            }
+            float ex = e->x - a->x[t + 1];
+            float ey = e->y - a->y[t + 1];
+            agent_err[i] += sqrtf(ex * ex + ey * ey);
+            agent_n[i] += 1;
+        }
+    }
+    trace_frame(trace_x, trace_y, trace_on, n, OFFLINE_TRAJ - 1, drive);
+    int used = 0;
+    double mean = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (agent_n[i] <= 0) {
+            continue;
+        }
+        mean += agent_err[i] / (double)agent_n[i];
+        used++;
+    }
+    *ade_mean = used > 0 ? (float)(mean / (double)used) : 0.0f;
+    *n_agents = used;
+    *clip_dx = commands > 0 ? (float)clipped_x / (float)commands : 0.0f;
+    *clip_dy = commands > 0 ? (float)clipped_y / (float)commands : 0.0f;
+    *clip_yaw = commands > 0 ? (float)clipped_yaw / (float)commands : 0.0f;
+}
+
+void pf_delta_ade(PfHandle* h, int n_dx, int n_dy, int n_yaw,
+        float* ade_mean, int* n_agents,
+        float* clip_dx, float* clip_dy, float* clip_yaw) {
+    delta_replay(h, n_dx, n_dy, n_yaw, ade_mean, n_agents,
+        clip_dx, clip_dy, clip_yaw, NULL, NULL, NULL);
+}
+
+void pf_delta_trace(PfHandle* h, int n_dx, int n_dy, int n_yaw,
+        float* xs, float* ys, unsigned char* on) {
+    float ade = 0.0f;
+    int n_agents = 0;
+    float clip_x = 0.0f;
+    float clip_y = 0.0f;
+    float clip_yaw = 0.0f;
+    assert(xs && ys && on);
+    delta_replay(h, n_dx, n_dy, n_yaw, &ade, &n_agents,
+        &clip_x, &clip_y, &clip_yaw, xs, ys, on);
 }
