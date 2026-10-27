@@ -500,6 +500,46 @@ const char* PROF_NAMES[] = {
     "train_model",
 };
 
+// Frozen BC MLP from an npz (W*, b*, Wa, ba, Ws, bs, mu, sig). Same obs
+// width and action heads as this env; depth and hidden width may differ.
+#define ANCHOR_MAX_LAYERS 8
+
+struct AnchorLayer {
+    precision_t* W;
+    precision_t* b;
+    int in;
+    int out;
+};
+
+struct Anchor {
+    int on;
+    int dist;
+    float coef;
+    int n_layers;
+    int in_dim;
+    int width;
+    int heads[NUM_ATNS];
+    int a_total;
+    int max_nt;
+    precision_t* mu;
+    precision_t* sig;
+    AnchorLayer layer[ANCHOR_MAX_LAYERS];
+    precision_t* head_w[NUM_ATNS];
+    precision_t* head_b[NUM_ATNS];
+    precision_t* norm;
+    precision_t* hid[2];
+    precision_t* scratch;
+    precision_t* logits;
+    float* partials;
+    // Own stream, not the dW stream: backward reuses that stream and its
+    // events inside this same captured train graph.
+    cudaStream_t stream;
+    cublasHandle_t handle;
+    void* workspace;
+    cudaEvent_t fork_ev;
+    cudaEvent_t done_ev;
+};
+
 // Index must match LossIdx 0..LOSS_N-1 in algo.cu (not LOSS_N counter).
 const char* LOSS_NAMES[] = {
     "loss/policy",
@@ -510,6 +550,7 @@ const char* LOSS_NAMES[] = {
     "loss/kl",
     "loss/clipfrac",
     "importance",
+    "loss/anchor",
 };
 
 typedef struct {
@@ -546,6 +587,7 @@ typedef struct PuffeRL {
     int* act_sizes;        // device ACT_SIZES (NUM_ATNS ints)
     float* losses;         // device loss accumulator (NUM_LOSSES)
     PPOBufs ppo_bufs; // Pre-allocated buffers for ppo_loss_fwd_bwd
+    Anchor anchor;
     Prec actor_param;      // async flat actor params
     Prec grad;
     long* rng_offset;      // device counters (num_buffers+1)
@@ -1457,6 +1499,121 @@ __global__ void puf_stamp(unsigned long long* dst) {
     *dst = t;
 }
 
+// (obs - mu) / sig. BC stores sig < 1e-6 as 1; keep that floor here too.
+__global__ void anchor_norm(precision_t* dst, const precision_t* obs,
+        const precision_t* mu, const precision_t* sig, int nt, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nt * n) {
+        return;
+    }
+    int col = idx % n;
+    float s = to_float(sig[col]);
+    if (s < 1e-6f) {
+        s = 1.0f;
+    }
+    float v = (to_float(obs[idx]) - to_float(mu[col])) / s;
+    dst[idx] = from_float(v);
+}
+
+__global__ void anchor_bias_lrelu(precision_t* x, const precision_t* b,
+        int nt, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nt * n) {
+        return;
+    }
+    float v = to_float(x[idx]) + to_float(b[idx % n]);
+    if (v < 0.0f) {
+        v *= 0.01f;
+    }
+    x[idx] = from_float(v);
+}
+
+// GEMM writes a packed (nt, A) head. Place it at the action offset.
+__global__ void anchor_pack(precision_t* logits, const precision_t* scratch,
+        const precision_t* bias, int nt, int A, int A_total, int offset) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nt * A) {
+        return;
+    }
+    int row = idx / A;
+    int col = idx % A;
+    float v = to_float(scratch[idx]) + to_float(bias[col]);
+    logits[row * A_total + offset + col] = from_float(v);
+}
+
+static void anchor_gemm(precision_t* x, int nt, int k,
+        precision_t* w, int n, precision_t* y, cudaStream_t stream,
+        cublasHandle_t handle) {
+    Prec a = {.data = x, .shape = {nt, k}};
+    Prec b = {.data = w, .shape = {k, n}};
+    Prec c = {.data = y, .shape = {nt, n}};
+    puf_mm_nn(&a, &b, &c, stream, 1.0f, 0.0f, handle);
+}
+
+// obs is flat (nt, in_dim), same order as the squeezed train minibatch.
+static void anchor_forward(Anchor* a, precision_t* obs, int nt,
+        cudaStream_t stream, cublasHandle_t handle) {
+    assert(nt > 0 && nt <= a->max_nt);
+    anchor_norm<<<grid_size(nt * a->in_dim), BLOCK_SIZE, 0, stream>>>(
+        a->norm, obs, a->mu, a->sig, nt, a->in_dim);
+    precision_t* src = a->norm;
+    int src_n = a->in_dim;
+    for (int i = 0; i < a->n_layers; i++) {
+        AnchorLayer* layer = &a->layer[i];
+        precision_t* dst = a->hid[i & 1];
+        anchor_gemm(src, nt, src_n, layer->W, layer->out, dst,
+            stream, handle);
+        int n = layer->out;
+        anchor_bias_lrelu<<<grid_size(nt * n), BLOCK_SIZE, 0, stream>>>(
+            dst, layer->b, nt, n);
+        src = dst;
+        src_n = n;
+    }
+    int offset = 0;
+    for (int h = 0; h < NUM_ATNS; h++) {
+        int A = a->heads[h];
+        anchor_gemm(src, nt, src_n, a->head_w[h], A, a->scratch,
+            stream, handle);
+        anchor_pack<<<grid_size(nt * A), BLOCK_SIZE, 0, stream>>>(
+            a->logits, a->scratch, a->head_b[h],
+            nt, A, a->a_total, offset);
+        offset += A;
+    }
+}
+
+struct AnchorFork {
+    Anchor* anchor;
+    precision_t* obs;
+    int nt;
+};
+
+// Recorded on the train stream just after the encoder GEMM, so minGRU and
+// PPO overlap this MLP. Joined before the distance kernel. Not the dW
+// stream: backward reuses that stream and its events in this same graph.
+static void anchor_fork(void* ctx, cudaStream_t main) {
+    AnchorFork* f = (AnchorFork*)ctx;
+    Anchor* a = f->anchor;
+    cudaEventRecord(a->fork_ev, main);
+    cudaStreamWaitEvent(a->stream, a->fork_ev, 0);
+    anchor_forward(a, f->obs, f->nt, a->stream, a->handle);
+    cudaEventRecord(a->done_ev, a->stream);
+}
+
+static void anchor_join(Anchor* a, cudaStream_t main) {
+    cudaStreamWaitEvent(main, a->done_ev, 0);
+}
+
+static void anchor_open_stream(Anchor* a) {
+    cublas_init_one(&a->handle, &a->workspace);
+    assert(cudaStreamCreateWithFlags(
+        &a->stream, cudaStreamNonBlocking) == cudaSuccess);
+    cublasSetStream(a->handle, a->stream);
+    assert(cudaEventCreateWithFlags(
+        &a->fork_ev, cudaEventDisableTiming) == cudaSuccess);
+    assert(cudaEventCreateWithFlags(
+        &a->done_ev, cudaEventDisableTiming) == cudaSuccess);
+}
+
 static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         cudaStream_t stream) {
     Hypers* hypers = &pufferl->hypers;
@@ -1524,11 +1681,20 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         if (dw_train->continuous) {
             p_logstd = dw_train->logstd;
         }
+        ArchHook hook = NULL;
+        AnchorFork fork = {};
+        if (pufferl->anchor.on) {
+            assert((int)graph.mb_obs.shape[2] == pufferl->anchor.in_dim);
+            fork.anchor = &pufferl->anchor;
+            fork.obs = graph.mb_obs.data;
+            fork.nt = Nmb * Tmb;
+            hook = anchor_fork;
+        }
         Prec dec = arch_forward_train(&primary->arch, primary->weights,
             pufferl->train_activs, graph.mb_obs, graph.mb_state,
             graph.mb_terminals, dest_off, graph, p_logstd,
             pufferl->act_sizes, pufferl->ppo_bufs.grad_logits.data,
-            pufferl->ppo_bufs.grad_values.data, stream);
+            pufferl->ppo_bufs.grad_values.data, stream, hook, &fork);
         puff_advantage<<<adv_grid, ADV_THREADS, 0, stream>>>(
             graph.mb_gae_v.data, graph.mb_rewards.data,
             graph.mb_terminals.data,
@@ -1543,6 +1709,20 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             hypers->clip_coef, hypers->vf_clip_coef, hypers->vf_coef,
             pufferl->ppo_bufs.ent_coef,
             pufferl->ppo_bufs, pufferl->is_continuous, stream);
+
+        // Logit grads are PPO's. Wait for the anchor logits, then add
+        // the frozen term before backward reads those grads.
+        if (pufferl->anchor.on) {
+            int nt = Nmb * Tmb;
+            int A_total = (int)dec.shape[2] - 1;
+            assert(A_total == pufferl->anchor.a_total);
+            anchor_join(&pufferl->anchor, stream);
+            anchor_distance(dec.data, pufferl->anchor.logits,
+                pufferl->ppo_bufs.grad_logits.data, pufferl->act_sizes,
+                pufferl->losses, pufferl->anchor.partials,
+                A_total, nt, pufferl->anchor.dist,
+                pufferl->anchor.coef, stream);
+        }
 
         Float grad_logits = pufferl->ppo_bufs.grad_logits;
         Float grad_logstd = pufferl->is_continuous
@@ -1775,6 +1955,555 @@ static void master_weights_setup(Float* mw, Prec* param,
     } else {
         *mw = (Float){.data = (float*)param->data, .shape = {n}};
     }
+}
+
+#define ANCHOR_ZIP_ENTS 32
+#define ANCHOR_NAME 64
+
+struct AnchorZipEnt {
+    char name[ANCHOR_NAME];
+    long data;
+    int nbytes;
+};
+
+struct AnchorZip {
+    unsigned char* buf;
+    long n;
+    AnchorZipEnt ent[ANCHOR_ZIP_ENTS];
+    int nent;
+};
+
+struct AnchorNpy {
+    const unsigned char* data;
+    int rows;
+    int cols;
+    int n;
+    int fortran;
+    char kind;
+};
+
+static uint16_t anchor_u16(const unsigned char* p) {
+    uint16_t v;
+    memcpy(&v, p, 2);
+    return v;
+}
+
+static uint32_t anchor_u32(const unsigned char* p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+static uint64_t anchor_u64(const unsigned char* p) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+}
+
+static void anchor_zip_open(AnchorZip* z, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        printf("anchor npz %s\n", path);
+        assert(0 && "anchor npz open");
+    }
+    assert(fseek(f, 0, SEEK_END) == 0);
+    long n = ftell(f);
+    assert(n > 0 && n < 256L * 1024 * 1024);
+    rewind(f);
+    z->buf = (unsigned char*)malloc((size_t)n);
+    assert(z->buf);
+    assert(fread(z->buf, 1, (size_t)n, f) == (size_t)n);
+    fclose(f);
+    z->n = n;
+    z->nent = 0;
+    long off = 0;
+    while (off + 30 <= n) {
+        if (anchor_u32(z->buf + off) != 0x04034b50u) {
+            break;
+        }
+        int flags = anchor_u16(z->buf + off + 6);
+        int method = anchor_u16(z->buf + off + 8);
+        uint32_t csize32 = anchor_u32(z->buf + off + 18);
+        uint32_t usize32 = anchor_u32(z->buf + off + 22);
+        int namelen = anchor_u16(z->buf + off + 26);
+        int extralen = anchor_u16(z->buf + off + 28);
+        assert(method == 0 && "anchor npz compressed");
+        assert((flags & 8) == 0 && "anchor npz descriptor");
+        assert(z->nent < ANCHOR_ZIP_ENTS);
+        assert(namelen > 0 && namelen < ANCHOR_NAME);
+        uint64_t csize = csize32;
+        if (csize32 == 0xffffffffu || usize32 == 0xffffffffu) {
+            const unsigned char* extra = z->buf + off + 30 + namelen;
+            int left = extralen;
+            int found = 0;
+            while (left >= 4) {
+                int hid = anchor_u16(extra);
+                int hsz = anchor_u16(extra + 2);
+                assert(4 + hsz <= left);
+                if (hid == 1) {
+                    int q = 0;
+                    if (usize32 == 0xffffffffu) {
+                        q += 8;
+                    }
+                    if (csize32 == 0xffffffffu) {
+                        csize = anchor_u64(extra + 4 + q);
+                    }
+                    found = 1;
+                    break;
+                }
+                extra += 4 + hsz;
+                left -= 4 + hsz;
+            }
+            assert(found && "anchor zip64 extra");
+        }
+        assert(csize < 256ull * 1024 * 1024);
+        AnchorZipEnt* e = &z->ent[z->nent++];
+        memcpy(e->name, z->buf + off + 30, namelen);
+        e->name[namelen] = 0;
+        e->data = off + 30 + namelen + extralen;
+        e->nbytes = (int)csize;
+        assert(e->data + e->nbytes <= n);
+        off = e->data + e->nbytes;
+    }
+    assert(z->nent > 0 && "anchor npz empty");
+}
+
+static int anchor_zip_index(AnchorZip* z, const char* key) {
+    char want[ANCHOR_NAME];
+    snprintf(want, sizeof(want), "%s.npy", key);
+    for (int i = 0; i < z->nent; i++) {
+        if (strcmp(z->ent[i].name, want) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void anchor_npz_missing(AnchorZip* z, const char* key) {
+    printf("anchor npz missing %s (%d entries)\n", key, z->nent);
+    for (int k = 0; k < z->nent; k++) {
+        printf("  %s\n", z->ent[k].name);
+    }
+    assert(0 && "anchor npz key");
+}
+
+static AnchorNpy anchor_npy(const unsigned char* p, int nbytes) {
+    assert(nbytes >= 10);
+    assert(p[0] == 0x93 && memcmp(p + 1, "NUMPY", 5) == 0);
+    int major = p[6];
+    int hlen = 0;
+    int hoff = 10;
+    if (major == 1) {
+        hlen = anchor_u16(p + 8);
+    } else if (major == 2) {
+        hlen = (int)anchor_u32(p + 8);
+        hoff = 12;
+    } else {
+        assert(0 && "anchor npy version");
+    }
+    assert(hlen > 0 && hlen < 1024);
+    assert(hoff + hlen <= nbytes);
+    char hdr[1024];
+    memcpy(hdr, p + hoff, hlen);
+    hdr[hlen] = 0;
+    const char* d = strstr(hdr, "'descr': '<");
+    assert(d && "anchor npy descr");
+    d += 11;
+    assert((d[0] == 'f' || d[0] == 'i') && d[1] == '4');
+    const char* s = strstr(hdr, "'shape': (");
+    assert(s);
+    s += 10;
+    int dims[2] = {0, 0};
+    int nd = 0;
+    while (*s && *s != ')') {
+        while (*s == ' ' || *s == ',') {
+            s++;
+        }
+        if (*s == ')') {
+            break;
+        }
+        char* end = NULL;
+        long v = strtol(s, &end, 10);
+        assert(end != s && nd < 2);
+        dims[nd++] = (int)v;
+        s = end;
+    }
+    AnchorNpy o;
+    memset(&o, 0, sizeof(o));
+    o.kind = d[0];
+    o.fortran = strstr(hdr, "fortran_order': True") != NULL;
+    if (nd == 0) {
+        o.rows = 1;
+    } else if (nd == 1) {
+        o.rows = dims[0];
+    } else {
+        o.rows = dims[0];
+        o.cols = dims[1];
+    }
+    o.n = o.cols ? o.rows * o.cols : o.rows;
+    assert(o.n > 0);
+    o.data = p + hoff + hlen;
+    assert(hoff + hlen + o.n * 4 <= nbytes);
+    return o;
+}
+
+static float* anchor_load_f32(AnchorZip* z, const char* key,
+        int* rows, int* cols) {
+    int i = anchor_zip_index(z, key);
+    if (i < 0) {
+        anchor_npz_missing(z, key);
+    }
+    AnchorNpy np = anchor_npy(z->buf + z->ent[i].data, z->ent[i].nbytes);
+    assert(np.kind == 'f');
+    float* src = (float*)malloc((size_t)np.n * sizeof(float));
+    assert(src);
+    memcpy(src, np.data, (size_t)np.n * sizeof(float));
+    *rows = np.rows;
+    *cols = np.cols;
+    if (!(np.fortran && np.cols)) {
+        return src;
+    }
+    float* dst = (float*)malloc((size_t)np.n * sizeof(float));
+    assert(dst);
+    for (int col = 0; col < np.cols; col++) {
+        for (int row = 0; row < np.rows; row++) {
+            size_t f = (size_t)row + (size_t)col * np.rows;
+            dst[(size_t)row * np.cols + col] = src[f];
+        }
+    }
+    free(src);
+    return dst;
+}
+
+static int anchor_load_i32(AnchorZip* z, const char* key) {
+    int i = anchor_zip_index(z, key);
+    if (i < 0) {
+        anchor_npz_missing(z, key);
+    }
+    AnchorNpy np = anchor_npy(z->buf + z->ent[i].data, z->ent[i].nbytes);
+    assert(np.kind == 'i' && np.n == 1);
+    int v = 0;
+    memcpy(&v, np.data, 4);
+    return v;
+}
+
+static void anchor_h2d_into(precision_t* dst, const float* src, int n,
+        cudaStream_t stream) {
+    float* stage = NULL;
+    assert(cudaMalloc(&stage, (size_t)n * sizeof(float)) == cudaSuccess);
+    cudaMemcpyAsync(stage, src, (size_t)n * sizeof(float),
+        cudaMemcpyHostToDevice, stream);
+    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst, stage, n);
+    cudaStreamSynchronize(stream);
+    cudaFree(stage);
+}
+
+static void anchor_h2d(precision_t** dst, const float* src, int n,
+        cudaStream_t stream) {
+    assert(cudaMalloc(dst, (size_t)n * sizeof(precision_t)) == cudaSuccess);
+    anchor_h2d_into(*dst, src, n, stream);
+}
+
+static float anchor_max_abs(const float* x, const float* y, int n) {
+    float m = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(x[i] - y[i]);
+        if (d > m) {
+            m = d;
+        }
+    }
+    return m;
+}
+
+static void anchor_d2h(float* dst, precision_t* src, int n,
+        cudaStream_t stream) {
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        printf("anchor sync %s\n", cudaGetErrorString(err));
+        assert(0 && "anchor sync");
+    }
+    precision_t* tmp = (precision_t*)malloc((size_t)n * sizeof(precision_t));
+    assert(tmp);
+    cudaMemcpy(tmp, src, (size_t)n * sizeof(precision_t),
+        cudaMemcpyDeviceToHost);
+    for (int i = 0; i < n; i++) {
+        dst[i] = to_float(tmp[i]);
+    }
+    free(tmp);
+}
+
+static void anchor_cpu_row(float* dst, const float* obs,
+        float** W, float** b, int* lin, int* lout, int n_layers,
+        float** hw, float** hb, int* heads,
+        const float* mu, const float* sig, int in_dim, int cap) {
+    float* cur = (float*)malloc((size_t)cap * sizeof(float));
+    float* nxt = (float*)malloc((size_t)cap * sizeof(float));
+    assert(cur && nxt);
+    for (int j = 0; j < in_dim; j++) {
+        float s = sig[j];
+        if (s < 1e-6f) {
+            s = 1.0f;
+        }
+        cur[j] = (obs[j] - mu[j]) / s;
+    }
+    int n = in_dim;
+    for (int i = 0; i < n_layers; i++) {
+        int out = lout[i];
+        for (int j = 0; j < out; j++) {
+            float v = b[i][j];
+            for (int k = 0; k < lin[i]; k++) {
+                v += cur[k] * W[i][(size_t)k * out + j];
+            }
+            if (v < 0.0f) {
+                v *= 0.01f;
+            }
+            nxt[j] = v;
+        }
+        float* swap = cur;
+        cur = nxt;
+        nxt = swap;
+        n = out;
+    }
+    int off = 0;
+    for (int h = 0; h < NUM_ATNS; h++) {
+        int A = heads[h];
+        for (int j = 0; j < A; j++) {
+            float v = hb[h][j];
+            for (int k = 0; k < n; k++) {
+                v += cur[k] * hw[h][(size_t)k * A + j];
+            }
+            dst[off + j] = v;
+        }
+        off += A;
+    }
+    free(cur);
+    free(nxt);
+}
+
+static int anchor_dist_id(const char* s) {
+    if (strcmp(s, "kl") == 0) {
+        return ANCHOR_KL;
+    }
+    if (strcmp(s, "reverse_kl") == 0) {
+        return ANCHOR_REVERSE_KL;
+    }
+    if (strcmp(s, "wasserstein") == 0) {
+        return ANCHOR_WASSERSTEIN;
+    }
+    printf("anchor_dist %s\n", s);
+    assert(0 && "anchor_dist");
+    return 0;
+}
+
+static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
+        bool is_continuous) {
+    Anchor* a = &p->anchor;
+    const char* dist_s = puf_ini_get_str(ini, "train", "anchor_dist");
+    const char* path = puf_ini_get_str(ini, "train", "anchor");
+    a->dist = anchor_dist_id(dist_s);
+    a->coef = (float)puf_ini_get(ini, "train", "anchor_coef");
+    a->on = 0;
+    if (path[0] == 0) {
+        return;
+    }
+    assert(!is_continuous && "anchor is discrete only");
+    assert(NUM_ATNS == 2 && "anchor heads are Wa and Ws");
+    size_t stack = 0;
+    cudaDeviceGetLimit(&stack, cudaLimitStackSize);
+    if (stack < 8192) {
+        cudaDeviceSetLimit(cudaLimitStackSize, 8192);
+    }
+    anchor_distance_selfcheck();
+
+    AnchorZip zip;
+    memset(&zip, 0, sizeof(zip));
+    anchor_zip_open(&zip, path);
+
+    float* host_w[ANCHOR_MAX_LAYERS];
+    float* host_b[ANCHOR_MAX_LAYERS];
+    int lin[ANCHOR_MAX_LAYERS];
+    int lout[ANCHOR_MAX_LAYERS];
+    int n_layers = 0;
+    while (n_layers < ANCHOR_MAX_LAYERS) {
+        char wk[16];
+        char bk[16];
+        snprintf(wk, sizeof(wk), "W%d", n_layers);
+        snprintf(bk, sizeof(bk), "b%d", n_layers);
+        if (anchor_zip_index(&zip, wk) < 0) {
+            break;
+        }
+        int wr = 0;
+        int wc = 0;
+        int br = 0;
+        int bc = 0;
+        host_w[n_layers] = anchor_load_f32(&zip, wk, &wr, &wc);
+        host_b[n_layers] = anchor_load_f32(&zip, bk, &br, &bc);
+        assert(wc > 0 && bc == 0 && br == wc);
+        if (n_layers == 0) {
+            assert(wr == OBS_SIZE);
+        } else {
+            assert(wr == lout[n_layers - 1]);
+        }
+        lin[n_layers] = wr;
+        lout[n_layers] = wc;
+        n_layers++;
+    }
+    assert(n_layers > 0 && "anchor npz has no hidden layers");
+    if (n_layers == ANCHOR_MAX_LAYERS) {
+        char wk[16];
+        snprintf(wk, sizeof(wk), "W%d", n_layers);
+        assert(anchor_zip_index(&zip, wk) < 0 && "anchor too many layers");
+    }
+
+    int n_accel = anchor_load_i32(&zip, "n_accel");
+    int n_steer = anchor_load_i32(&zip, "n_steer");
+    assert(n_accel == act_sizes[0] && n_steer == act_sizes[1]);
+    int last = lout[n_layers - 1];
+    int ar = 0;
+    int ac = 0;
+    int sr = 0;
+    int sc = 0;
+    int bar = 0;
+    int bac = 0;
+    int bsr = 0;
+    int bsc = 0;
+    float* Wa = anchor_load_f32(&zip, "Wa", &ar, &ac);
+    float* ba = anchor_load_f32(&zip, "ba", &bar, &bac);
+    float* Ws = anchor_load_f32(&zip, "Ws", &sr, &sc);
+    float* bs = anchor_load_f32(&zip, "bs", &bsr, &bsc);
+    assert(ar == last && ac == n_accel && bac == 0 && bar == n_accel);
+    assert(sr == last && sc == n_steer && bsc == 0 && bsr == n_steer);
+    int mr = 0;
+    int mc = 0;
+    int sgr = 0;
+    int sgc = 0;
+    float* mu = anchor_load_f32(&zip, "mu", &mr, &mc);
+    float* sig = anchor_load_f32(&zip, "sig", &sgr, &sgc);
+    assert(mr == OBS_SIZE && mc == 0);
+    assert(sgr == OBS_SIZE && sgc == 0);
+
+    int max_w = 0;
+    for (int i = 0; i < n_layers; i++) {
+        if (lout[i] > max_w) {
+            max_w = lout[i];
+        }
+    }
+    int heads[2] = {n_accel, n_steer};
+    int max_head = n_accel > n_steer ? n_accel : n_steer;
+    int a_total = n_accel + n_steer;
+    int max_nt = p->hypers.minibatch_size;
+    assert(max_nt >= 2 && max_w > 0);
+
+    a->n_layers = n_layers;
+    a->in_dim = OBS_SIZE;
+    a->width = max_w;
+    a->heads[0] = n_accel;
+    a->heads[1] = n_steer;
+    a->a_total = a_total;
+    a->max_nt = max_nt;
+
+    cudaStream_t stream = p->train_stream;
+    for (int i = 0; i < n_layers; i++) {
+        anchor_h2d(&a->layer[i].W, host_w[i], lin[i] * lout[i], stream);
+        anchor_h2d(&a->layer[i].b, host_b[i], lout[i], stream);
+        a->layer[i].in = lin[i];
+        a->layer[i].out = lout[i];
+    }
+    anchor_h2d(&a->head_w[0], Wa, last * n_accel, stream);
+    anchor_h2d(&a->head_b[0], ba, n_accel, stream);
+    anchor_h2d(&a->head_w[1], Ws, last * n_steer, stream);
+    anchor_h2d(&a->head_b[1], bs, n_steer, stream);
+    anchor_h2d(&a->mu, mu, OBS_SIZE, stream);
+    anchor_h2d(&a->sig, sig, OBS_SIZE, stream);
+    assert(cudaMalloc(&a->norm,
+        (size_t)max_nt * OBS_SIZE * sizeof(precision_t)) == cudaSuccess);
+    assert(cudaMalloc(&a->hid[0],
+        (size_t)max_nt * max_w * sizeof(precision_t)) == cudaSuccess);
+    assert(cudaMalloc(&a->hid[1],
+        (size_t)max_nt * max_w * sizeof(precision_t)) == cudaSuccess);
+    assert(cudaMalloc(&a->scratch,
+        (size_t)max_nt * max_head * sizeof(precision_t)) == cudaSuccess);
+    assert(cudaMalloc(&a->logits,
+        (size_t)max_nt * a_total * sizeof(precision_t)) == cudaSuccess);
+    int blocks = (max_nt + PPO_THREADS - 1) / PPO_THREADS;
+    assert(cudaMalloc(&a->partials,
+        (size_t)blocks * sizeof(float)) == cudaSuccess);
+
+    int cap = OBS_SIZE > max_w ? OBS_SIZE : max_w;
+    if (max_head > cap) {
+        cap = max_head;
+    }
+    // obs = mu is an exact 0 after the norm and does not touch W0.
+    // A constant 0.25 does. mu + 0.25*sig is not that constant in bf16:
+    // tiny sigs cancel against mu, so the quarter row uses mu=0, sig=1.
+    float* raw = (float*)malloc((size_t)OBS_SIZE * sizeof(float));
+    float* cpu = (float*)malloc((size_t)a_total * sizeof(float));
+    float* gpu = (float*)malloc((size_t)a_total * sizeof(float));
+    float* zmu = (float*)calloc((size_t)OBS_SIZE, sizeof(float));
+    float* zsig = (float*)malloc((size_t)OBS_SIZE * sizeof(float));
+    assert(raw && cpu && gpu && zmu && zsig);
+    float* hw[2] = {Wa, Ws};
+    float* hb[2] = {ba, bs};
+    for (int j = 0; j < OBS_SIZE; j++) {
+        raw[j] = mu[j];
+    }
+    anchor_cpu_row(cpu, raw, host_w, host_b, lin, lout, n_layers,
+        hw, hb, heads, mu, sig, OBS_SIZE, cap);
+    precision_t* draw = NULL;
+    anchor_h2d(&draw, raw, OBS_SIZE, stream);
+    // Same handle the train graph will capture. First gemm is here, not
+    // inside the capture (cublas lazy init allocates).
+    anchor_open_stream(a);
+    anchor_forward(a, draw, 1, a->stream, a->handle);
+    anchor_d2h(gpu, a->logits, a_total, a->stream);
+    float max0 = anchor_max_abs(gpu, cpu, a_total);
+
+    for (int j = 0; j < OBS_SIZE; j++) {
+        raw[j] = 0.25f;
+        zsig[j] = 1.0f;
+    }
+    anchor_cpu_row(cpu, raw, host_w, host_b, lin, lout, n_layers,
+        hw, hb, heads, zmu, zsig, OBS_SIZE, cap);
+    anchor_h2d_into(a->mu, zmu, OBS_SIZE, stream);
+    anchor_h2d_into(a->sig, zsig, OBS_SIZE, stream);
+    anchor_h2d_into(draw, raw, OBS_SIZE, stream);
+    anchor_forward(a, draw, 1, a->stream, a->handle);
+    anchor_d2h(gpu, a->logits, a_total, a->stream);
+    float max1 = anchor_max_abs(gpu, cpu, a_total);
+    anchor_h2d_into(a->mu, mu, OBS_SIZE, stream);
+    anchor_h2d_into(a->sig, sig, OBS_SIZE, stream);
+    cudaFree(draw);
+
+    float tol0 = USE_BF16 ? 0.05f : 1e-3f;
+    float tol1 = USE_BF16 ? 0.5f : 1e-3f;
+    if (max0 > tol0 || max1 > tol1) {
+        printf("anchor forward max diff zeros %g quarter %g\n", max0, max1);
+        assert(0 && "anchor forward check");
+    }
+    // Train captures this handle at minibatch_size. cublas allocates on
+    // the first call of that shape, which a graph capture is not allowed to do.
+    anchor_forward(a, a->norm, a->max_nt, a->stream, a->handle);
+    assert(cudaStreamSynchronize(a->stream) == cudaSuccess);
+    a->on = 1;
+    printf("anchor %s  %s  coef %g  %d x %d\n",
+        path, dist_s, a->coef, n_layers, max_w);
+
+    for (int i = 0; i < n_layers; i++) {
+        free(host_w[i]);
+        free(host_b[i]);
+    }
+    free(Wa);
+    free(ba);
+    free(Ws);
+    free(bs);
+    free(mu);
+    free(sig);
+    free(raw);
+    free(cpu);
+    free(gpu);
+    free(zmu);
+    free(zsig);
+    free(zip.buf);
 }
 
 PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
@@ -2052,6 +2781,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemcpy(pufferl->act_sizes, act_sizes,
         num_action_heads*sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
+    anchor_init(pufferl, ini, act_sizes, is_continuous);
     cudaMemcpy(pufferl->muon.lr, &hypers.lr, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemset(pufferl->muon.mb.data, 0, numel(pufferl->muon.mb.shape) * sizeof(float));
 
@@ -2113,7 +2843,7 @@ static int puf_dashboard_last_cols = 0;
 static int puf_dashboard_frame = 0;
 
 #define PUF_DASH_W 80
-#define PUF_DASH_BASE_ROWS 12
+#define PUF_DASH_BASE_ROWS 13
 #define PUF_DASH_MAX_USER_ROWS 15
 
 // Colors no-op when not a TTY.
@@ -2301,6 +3031,7 @@ void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
         {"Epoch", epoch_s, "Train", NULL, train_time, "old_kl", "loss/old_kl"},
         {"Uptime", uptime, "  Model", "perf/train_model", 0, "kl", "loss/kl"},
         {"To go", remaining, "  Misc", "perf/train_misc", 0, "clipfrac", "loss/clipfrac"},
+        {"", "", "", NULL, 0, "anchor", "loss/anchor"},
     };
     for (int i = 0; i < (int)(sizeof(rows) / sizeof(rows[0])); i++) {
         char bt[64], bp[16], cv[32];

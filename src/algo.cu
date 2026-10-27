@@ -146,11 +146,12 @@ void puf_mm_tn(Prec* a, Prec* b, Prec* out, cudaStream_t stream,
 
 // out(...,N) = alpha * a(...,K) @ b(K,N) + beta * out: leading dims folded into M
 void puf_mm_nn(Prec* a, Prec* b, Prec* out, cudaStream_t stream,
-        float alpha = 1.0f, float beta = 0.0f) {
+        float alpha = 1.0f, float beta = 0.0f,
+        cublasHandle_t handle = g_cublas_handle) {
     int M = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
     int K = a->shape[ndim(a->shape)-1];
     int N = b->shape[ndim(b->shape)-1];
-    cublasGemmExDense(g_cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+    cublasGemmExDense(handle, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
         a->data, b->data, out->data, stream, alpha, beta);
 }
 
@@ -1269,8 +1270,17 @@ __device__ __forceinline__ float safe_continuous_logstd(const precision_t* logst
 enum LossIdx {
     LOSS_PG = 0, LOSS_VF = 1, LOSS_ENT = 2, LOSS_TOTAL = 3,
     LOSS_OLD_APPROX_KL = 4, LOSS_APPROX_KL = 5, LOSS_CLIPFRAC = 6,
-    LOSS_IMP = 7,
-    LOSS_N = 8, NUM_LOSSES = 9,
+    LOSS_IMP = 7, LOSS_ANCHOR = 8,
+    LOSS_N = 9, NUM_LOSSES = 10,
+};
+
+// Anchor penalty on the factorized action heads. kl is D_KL(anchor || policy),
+// the paper term. reverse_kl is D_KL(policy || anchor). wasserstein is 1D W1
+// on bin index (unit spacing), summed over heads like the KL.
+enum {
+    ANCHOR_KL = 0,
+    ANCHOR_REVERSE_KL = 1,
+    ANCHOR_WASSERSTEIN = 2,
 };
 
 constexpr int PPO_THREADS = 256;
@@ -1465,14 +1475,22 @@ __global__ void cache_imp_and_v(
     imp_out[idx] = from_float(__expf(new_lp - to_float(old_logprobs[idx])));
 }
 
+// Host hook between the encoder GEMM and minGRU. Used to fork the anchor
+// MLP onto its own stream while this stream keeps the train graph.
+typedef void (*ArchHook)(void* ctx, cudaStream_t stream);
+
 Prec arch_forward_train(Arch* p, Weights& w,
         Activations& activations, Prec x,
         Prec state, Prec terminals, int agent_off,
         TrainGraph& g, Prec logstd, int* act_sizes,
-        float* logps, float* new_lp, cudaStream_t stream) {
+        float* logps, float* new_lp, cudaStream_t stream,
+        ArchHook after_encoder = NULL, void* hook_ctx = NULL) {
     int B = x.shape[0], TT = x.shape[1];
     Prec h = p->encoder.forward(w.encoder,
         activations.encoder, *puf_squeeze(&x, 0), stream);
+    if (after_encoder != NULL) {
+        after_encoder(hook_ctx, stream);
+    }
     h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT),
         state, terminals, activations.network, agent_off, stream);
     Prec dec_out = p->decoder.forward(
@@ -1673,6 +1691,229 @@ void ppo_loss_fwd_bwd(
             bufs.ppo_partials.data, args, graph_args);
     ppo_loss_reduce<<<1, LOSS_N, 0, stream>>>(
         losses_acc, bufs.ppo_partials.data, ppo_grid);
+}
+
+// One sample, one thread. Adds coef/NT * d(distance)/d(policy logits) into grad.
+// Distance partials are the unweighted mean (sum of per-head distances).
+__global__ void anchor_distance_kernel(
+        float* __restrict__ grad,
+        const precision_t* __restrict__ policy,
+        const precision_t* __restrict__ anchor,
+        const int* __restrict__ act_sizes,
+        float* __restrict__ partials,
+        int A_total, int nt, int dist, float coef) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    float inv_nt = 1.0f / (float)nt;
+    float mine = 0.0f;
+    if (idx < nt) {
+        int fused = A_total + 1;
+        const precision_t* prow = policy + idx * fused;
+        const precision_t* arow = anchor + idx * A_total;
+        float* grow = grad + idx * A_total;
+        float scale = coef * inv_nt;
+        int off = 0;
+        float dist_sum = 0.0f;
+        for (int h = 0; h < NUM_ATNS; h++) {
+            int A = act_sizes[h];
+            float pl[PPO_MAX_HEAD_A];
+            float ql[PPO_MAX_HEAD_A];
+            float p[PPO_MAX_HEAD_A];
+            float q[PPO_MAX_HEAD_A];
+            float max_p = -INFINITY;
+            float max_q = -INFINITY;
+            for (int a = 0; a < A; a++) {
+                pl[a] = to_float(prow[off + a]);
+                ql[a] = to_float(arow[off + a]);
+                if (pl[a] > max_p) {
+                    max_p = pl[a];
+                }
+                if (ql[a] > max_q) {
+                    max_q = ql[a];
+                }
+            }
+            float sp = 0.0f;
+            float sq = 0.0f;
+            for (int a = 0; a < A; a++) {
+                p[a] = __expf(pl[a] - max_p);
+                q[a] = __expf(ql[a] - max_q);
+                sp += p[a];
+                sq += q[a];
+            }
+            float log_sp = __logf(sp);
+            float log_sq = __logf(sq);
+            for (int a = 0; a < A; a++) {
+                p[a] /= sp;
+                q[a] /= sq;
+                pl[a] = pl[a] - max_p - log_sp;
+                ql[a] = ql[a] - max_q - log_sq;
+            }
+            if (dist == ANCHOR_KL) {
+                float kl = 0.0f;
+                for (int a = 0; a < A; a++) {
+                    if (q[a] > 0.0f) {
+                        kl += q[a] * (ql[a] - pl[a]);
+                    }
+                }
+                for (int a = 0; a < A; a++) {
+                    grow[off + a] += scale * (p[a] - q[a]);
+                }
+                dist_sum += kl;
+            } else if (dist == ANCHOR_REVERSE_KL) {
+                float kl = 0.0f;
+                for (int a = 0; a < A; a++) {
+                    if (p[a] > 0.0f) {
+                        kl += p[a] * (pl[a] - ql[a]);
+                    }
+                }
+                for (int a = 0; a < A; a++) {
+                    float dlp = 0.0f;
+                    if (p[a] > 0.0f) {
+                        dlp = pl[a] - ql[a] - kl;
+                    }
+                    grow[off + a] += scale * p[a] * dlp;
+                }
+                dist_sum += kl;
+            } else {
+                float dw[PPO_MAX_HEAD_A];
+                for (int a = 0; a < A; a++) {
+                    dw[a] = 0.0f;
+                }
+                float cdf_p = 0.0f;
+                float cdf_q = 0.0f;
+                float w = 0.0f;
+                for (int a = 0; a < A - 1; a++) {
+                    cdf_p += p[a];
+                    cdf_q += q[a];
+                    float diff = cdf_p - cdf_q;
+                    float s = 0.0f;
+                    if (diff > 0.0f) {
+                        s = 1.0f;
+                    } else if (diff < 0.0f) {
+                        s = -1.0f;
+                    }
+                    w += fabsf(diff);
+                    for (int j = 0; j <= a; j++) {
+                        dw[j] += s;
+                    }
+                }
+                float mean_dw = 0.0f;
+                for (int a = 0; a < A; a++) {
+                    mean_dw += p[a] * dw[a];
+                }
+                for (int a = 0; a < A; a++) {
+                    grow[off + a] += scale * p[a] * (dw[a] - mean_dw);
+                }
+                dist_sum += w;
+            }
+            off += A;
+        }
+        mine = dist_sum * inv_nt;
+    }
+    __shared__ float smem[PPO_THREADS];
+    smem[tid] = mine;
+    block_reduce_sum(smem, &partials[blockIdx.x], tid, PPO_THREADS, 1);
+}
+
+__global__ void anchor_loss_reduce(float* __restrict__ losses,
+        const float* __restrict__ partials, int nblocks, float coef) {
+    float sum = 0.0f;
+    for (int b = 0; b < nblocks; b++) {
+        sum += partials[b];
+    }
+    losses[LOSS_ANCHOR] += sum;
+    losses[LOSS_TOTAL] += coef * sum;
+}
+
+void anchor_distance(precision_t* policy, precision_t* anchor, float* grad,
+        int* act_sizes, float* losses, float* partials,
+        int A_total, int nt, int dist, float coef, cudaStream_t stream) {
+    int blocks = (nt + PPO_THREADS - 1) / PPO_THREADS;
+    anchor_distance_kernel<<<blocks, PPO_THREADS, 0, stream>>>(
+        grad, policy, anchor, act_sizes, partials,
+        A_total, nt, dist, coef);
+    anchor_loss_reduce<<<1, 1, 0, stream>>>(losses, partials, blocks, coef);
+}
+
+// Fixture from an independent torch autograd of the three distances.
+// Two heads, logits [1,2,3] vs [0,0,0] and [0,1,0] vs [2,0,1].
+void anchor_distance_selfcheck() {
+#if NUM_ATNS != 2
+    return;
+#else
+    assert(PPO_MAX_HEAD_A >= 3 && "anchor self-check needs a head of width >= 3");
+    const int A = 3;
+    const int A_total = 6;
+    const int fused = A_total + 1;
+    const int nt = 1;
+    float pol_h[fused] = {1, 2, 3, 0, 1, 0, 0};
+    float anc_h[A_total] = {0, 0, 0, 2, 0, 1};
+    int sizes_h[2] = {A, A};
+    double expect_d[3] = {
+        0.9380122346980022,
+        1.0626701692550728,
+        1.06129669419989,
+    };
+    double expect_g[3][6] = {
+        {-0.24330276016295285, -0.08860486227853571, 0.33190762244148847,
+         -0.45329939815773646, 0.4860863115954485, -0.032786913437712194},
+        {-0.14181709360981215, -0.14077035746963007, 0.2825874510794424,
+         -0.41122855362547467, 0.6105155496338637, -0.1992869960083892},
+        {-0.14181709360981215, -0.14077035746963013, 0.2825874510794422,
+         -0.12210310992677276, 0.2442062198535455, -0.12210310992677276},
+    };
+    precision_t* pol;
+    precision_t* anc;
+    float* grad;
+    float* losses;
+    float* partials;
+    int* sizes;
+    float* stage;
+    assert(cudaMalloc(&pol, fused * sizeof(precision_t)) == cudaSuccess);
+    assert(cudaMalloc(&anc, A_total * sizeof(precision_t)) == cudaSuccess);
+    assert(cudaMalloc(&grad, A_total * sizeof(float)) == cudaSuccess);
+    assert(cudaMalloc(&losses, NUM_LOSSES * sizeof(float)) == cudaSuccess);
+    assert(cudaMalloc(&partials, sizeof(float)) == cudaSuccess);
+    assert(cudaMalloc(&sizes, 2 * sizeof(int)) == cudaSuccess);
+    assert(cudaMalloc(&stage, fused * sizeof(float)) == cudaSuccess);
+    cudaMemcpy(sizes, sizes_h, 2 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(stage, pol_h, fused * sizeof(float), cudaMemcpyHostToDevice);
+    cast<<<1, 32>>>(pol, stage, fused);
+    cudaMemcpy(stage, anc_h, A_total * sizeof(float), cudaMemcpyHostToDevice);
+    cast<<<1, 32>>>(anc, stage, A_total);
+    cudaDeviceSynchronize();
+    for (int dist = 0; dist < 3; dist++) {
+        cudaMemset(grad, 0, A_total * sizeof(float));
+        cudaMemset(losses, 0, NUM_LOSSES * sizeof(float));
+        anchor_distance(pol, anc, grad, sizes, losses, partials,
+            A_total, nt, dist, 1.0f, 0);
+        cudaDeviceSynchronize();
+        float got_d;
+        float got_g[6];
+        cudaMemcpy(&got_d, losses + LOSS_ANCHOR, sizeof(float),
+            cudaMemcpyDeviceToHost);
+        cudaMemcpy(got_g, grad, sizeof(got_g), cudaMemcpyDeviceToHost);
+        if (fabsf(got_d - (float)expect_d[dist]) > 1e-4f) {
+            printf("anchor distance %d got %g expected %g\n",
+                dist, got_d, expect_d[dist]);
+            assert(0 && "anchor distance self-check");
+        }
+        for (int i = 0; i < 6; i++) {
+            if (fabsf(got_g[i] - (float)expect_g[dist][i]) > 1e-4f) {
+                printf("anchor grad dist %d i %d got %g expected %g\n",
+                    dist, i, got_g[i], expect_g[dist][i]);
+                assert(0 && "anchor distance self-check");
+            }
+        }
+    }
+    cudaFree(pol);
+    cudaFree(anc);
+    cudaFree(grad);
+    cudaFree(losses);
+    cudaFree(partials);
+    cudaFree(sizes);
+    cudaFree(stage);
+#endif
 }
 
 // Puffer advantage (GAE + V-trace ρ/c clips). One thread per row.
