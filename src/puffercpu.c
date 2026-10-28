@@ -7,6 +7,9 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 const char* __asan_default_options(void) { return "detect_leaks=0"; }
 
@@ -289,12 +292,24 @@ Linear* make_linear(Weights* weights, int batch_size, int input_dim, int output_
 }
 
 void linear(Linear* layer, float* input) {
-    for (int b = 0; b < layer->batch_size; b++) {
-        for (int o = 0; o < layer->output_dim; o++) {
+    int B = layer->batch_size;
+    int Id = layer->input_dim;
+    int O = layer->output_dim;
+    // One car is a small matmul. A fleet of 8 or more covers the fork.
+    int parallel = B >= 8;
+#ifdef _OPENMP
+#pragma omp parallel for if (parallel) schedule(static)
+#endif
+    for (int b = 0; b < B; b++) {
+        const float* in = input + b * Id;
+        float* out = layer->output + b * O;
+        for (int o = 0; o < O; o++) {
+            const float* w = layer->weights + (size_t)o * Id;
             float sum = 0.0f;
-            for (int i = 0; i < layer->input_dim; i++)
-                sum += input[b*layer->input_dim + i] * layer->weights[o*layer->input_dim + i];
-            layer->output[b*layer->output_dim + o] = sum;
+            for (int i = 0; i < Id; i++) {
+                sum += in[i] * w[i];
+            }
+            out[o] = sum;
         }
     }
 }
@@ -483,6 +498,9 @@ void mingru(MinGRU* layer, float* input) {
         float* state_l = layer->state + l * B * H;
         linear(layer->proj[l], x);
         float* combined = layer->proj[l]->output;
+#ifdef _OPENMP
+#pragma omp parallel for if (B >= 8) schedule(static)
+#endif
         for (int b = 0; b < B; b++) {
             float* cb = combined + b * 3 * H;
             float* sb = state_l + b * H;
