@@ -866,9 +866,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 #else
-    if (anchor_path) {
-        cli_path = NULL;
-        cli_latest = 0;
+    // The anchor demo loads the BC anchor and the regularized Town01
+    // policy together. A positional .bin replaces that policy.
+    if (anchor_path && !cli_path && !cli_latest) {
+        cli_path = "checkpoints/drive/town01_bc1000/0000000578813952.bin";
     }
 #endif
     puf_ini_load_env(&ini, env_name, ini_argc, ini_argv);
@@ -968,7 +969,25 @@ int main(int argc, char** argv) {
         if (saw_map_id) {
             start = ademo_scene_index((int)dict_get(env_sec, "map_id"));
         }
+        PufferNet* policy = NULL;
+        if (have_net) {
+            policy = make_puffernet(weights, 1, OBS_SIZE,
+                hidden_size, num_layers, act_sizes, num_actions);
+            printf("policy %s  hidden %d  layers %d\n",
+                path, hidden_size, num_layers);
+            fflush(stdout);
+        } else if (path) {
+            if (!opened) {
+                fprintf(stderr, "policy did not load (%s: file not found)\n",
+                    path);
+            } else {
+                fprintf(stderr,
+                    "policy did not load (%s: %d floats, network wants %d)\n",
+                    path, raw_floats, need);
+            }
+        }
         ademo_open(anchor_path);
+        ademo_link(policy);
         ademo_boot(&env, env_sec, start);
         env.hud_extra = ademo_hud;
         env.ui_hot = ademo_hot;
@@ -976,6 +995,10 @@ int main(int argc, char** argv) {
         env.sim_scene = ademo_on_scene;
         ademo_run(&env);
         ademo_close();
+        if (policy) {
+            free_puffernet(policy);
+        }
+        free(weights);
         ademo_shutdown();
         puf_close(&env);
         free(env.map_name);

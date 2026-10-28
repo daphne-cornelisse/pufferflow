@@ -1,8 +1,9 @@
-// One car, a frozen behavioral-cloning anchor, and the three distances
-// from that anchor to the bin the driver is holding. Included from the
-// drive player after drive.h. The driven bin is a one-hot plus a 1e-6
-// floor. A pure one-hot makes KL(anchor || act) infinite on every frame,
-// because the anchor always puts some mass off the chosen bin.
+// One car and a frozen behavioral-cloning anchor. Included from the drive
+// player after drive.h. The anchor demo also loads the regularized RL
+// policy. A positional .bin replaces it. While that policy drives, the
+// panel reports KL(anchor || policy), KL(policy || anchor), and
+// 1-Wasserstein, the same three distances as the trainer. While a person
+// or the anchor drives, it reports only the entropy of the anchor at o_t.
 
 #ifndef ANCHOR_INTERACTIVE_H
 #define ANCHOR_INTERACTIVE_H
@@ -16,8 +17,10 @@
 #define ADEMO_LAYERS 8
 #define ADEMO_ZENTS 32
 #define ADEMO_NAME 64
-#define ADEMO_EPS 1.0e-6f
 #define ADEMO_HIST 20
+#define ADEMO_YOU 0
+#define ADEMO_ANCHOR 1
+#define ADEMO_POLICY 2
 
 typedef struct {
     char name[ADEMO_NAME];
@@ -44,6 +47,7 @@ typedef struct {
 typedef struct {
     Rectangle card;
     Rectangle button;
+    Rectangle policy;
     Rectangle reset;
     Rectangle accel;
     Rectangle steer;
@@ -67,7 +71,7 @@ static Font g_math_font;
 static int g_math_ready;
 
 typedef struct {
-    int anchor_drives;
+    int who;
     int n_layers;
     int in_dim;
     int lin[ADEMO_LAYERS];
@@ -85,25 +89,41 @@ typedef struct {
     int cap;
     float pa[NUM_ACCEL_BINS];
     float ps[NUM_STEER_BINS];
+    float log_pa[NUM_ACCEL_BINS];
+    float log_ps[NUM_STEER_BINS];
+    float rla[NUM_ACCEL_BINS];
+    float rls[NUM_STEER_BINS];
+    float log_rla[NUM_ACCEL_BINS];
+    float log_rls[NUM_STEER_BINS];
     int act_a;
     int act_s;
     float kl;
     float rkl;
     float w1;
-    float p_act_a;
-    float p_act_s;
+    float ent_a;
+    float ent_s;
     float hist_kl[ADEMO_HIST];
     float hist_rkl[ADEMO_HIST];
     float hist_w1[ADEMO_HIST];
     int hist_n;
     int hist_at;
     int hist_step;
+    PufferNet* net;
+    float* gru_save;
+    int gru_n;
+    int commit;
 } Ademo;
 
 static Ademo g_ademo;
 
+static int ademo_policy_on(void) {
+    return g_ademo.net != NULL && g_ademo.who == ADEMO_POLICY;
+}
+
 // Sorted WOMD index, same order as data/womd/binaries/map_%03d.bin.
-// Each one stays busy on both axes of a junction for the whole clip.
+// The SDC starts outside the 5 m goal disk, on a busy junction.
+// A NULL name is CARLA Town01 (data/mixed/binaries/map_001.bin). That
+// map has no trajectory, so its goals come from pick_forward_goal.
 #define ADEMO_LOOP 90
 
 typedef struct {
@@ -112,16 +132,17 @@ typedef struct {
 } AdemoScene;
 
 static const AdemoScene g_scenes[] = {
-    {892, "tfrecord-00094-of-01000_285.json"},
-    {140, "tfrecord-00013-of-01000_98.json"},
-    {250, "tfrecord-00025-of-01000_250.json"},
-    {632, "tfrecord-00066-of-01000_53.json"},
-    {927, "tfrecord-00098-of-01000_323.json"},
-    {191, "tfrecord-00018-of-01000_98.json"},
-    {371, "tfrecord-00036-of-01000_46.json"},
-    {194, "tfrecord-00019-of-01000_166.json"},
-    {585, "tfrecord-00061-of-01000_454.json"},
-    {302, "tfrecord-00030-of-01000_112.json"},
+    {395, "tfrecord-00040-of-01000_215.json"},
+    {565, "tfrecord-00060-of-01000_141.json"},
+    {457, "tfrecord-00047-of-01000_197.json"},
+    {714, "tfrecord-00076-of-01000_422.json"},
+    {405, "tfrecord-00041-of-01000_176.json"},
+    {712, "tfrecord-00076-of-01000_338.json"},
+    {851, "tfrecord-00089-of-01000_43.json"},
+    {601, "tfrecord-00063-of-01000_238.json"},
+    {500, "tfrecord-00052-of-01000_184.json"},
+    {241, "tfrecord-00024-of-01000_121.json"},
+    {1, NULL},
 };
 
 #define ADEMO_NSCENE ((int)(sizeof(g_scenes) / sizeof(g_scenes[0])))
@@ -130,6 +151,10 @@ static OfflineAgent* g_logs;
 static int g_log_n;
 static int g_sdc;
 static int g_scene_i;
+// Waymo logs stay on this directory. Town01 always loads data/mixed.
+static char g_log_dir[512];
+// Fleet captured at boot, before a Waymo scene overwrites num_agents.
+static int g_fleet;
 static float* g_obs;
 static float* g_act;
 static float* g_rew;
@@ -364,7 +389,9 @@ static void ademo_linear(const float* x, const float* W, const float* b,
     }
 }
 
-static void ademo_softmax(const float* logits, float* p, int n) {
+// log_p is the log probability in log space, so a bin that underflows
+// to probability 0 still has a finite log. Pass NULL to skip it.
+static void ademo_softmax(const float* logits, float* p, float* log_p, int n) {
     float m = logits[0];
     for (int i = 1; i < n; i++) {
         if (logits[i] > m) {
@@ -377,9 +404,13 @@ static void ademo_softmax(const float* logits, float* p, int n) {
         sum += p[i];
     }
     assert(sum > 0.0f);
+    float log_sum = logf(sum);
     float inv = 1.0f / sum;
     for (int i = 0; i < n; i++) {
         p[i] *= inv;
+        if (log_p) {
+            log_p[i] = logits[i] - m - log_sum;
+        }
     }
 }
 
@@ -418,22 +449,8 @@ static void ademo_forward_obs(const float* obs) {
     float ls[NUM_STEER_BINS];
     ademo_linear(cur, a->Wa, a->ba, la, n, NUM_ACCEL_BINS, 0);
     ademo_linear(cur, a->Ws, a->bs, ls, n, NUM_STEER_BINS, 0);
-    ademo_softmax(la, a->pa, NUM_ACCEL_BINS);
-    ademo_softmax(ls, a->ps, NUM_STEER_BINS);
-}
-
-static void ademo_driven(float* p, int n, int bin) {
-    float floor = ADEMO_EPS / (float)n;
-    for (int i = 0; i < n; i++) {
-        p[i] = floor;
-    }
-    if (bin < 0) {
-        bin = 0;
-    }
-    if (bin >= n) {
-        bin = n - 1;
-    }
-    p[bin] = (1.0f - ADEMO_EPS) + floor;
+    ademo_softmax(la, a->pa, a->log_pa, NUM_ACCEL_BINS);
+    ademo_softmax(ls, a->ps, a->log_ps, NUM_STEER_BINS);
 }
 
 static float ademo_kl(const float* q, const float* p, int n) {
@@ -448,6 +465,33 @@ static float ademo_kl(const float* q, const float* p, int n) {
         s += q[i] * (logf(q[i]) - logf(p[i]));
     }
     return s;
+}
+
+// KL(q || p) with log probabilities kept in log space. Matches the
+// trainer anchor term: a zero probability is skipped, and the log of
+// the other side stays finite.
+static float ademo_kl_log(const float* log_q, const float* q,
+        const float* log_p, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) {
+        if (q[i] > 0.0f) {
+            s += q[i] * (log_q[i] - log_p[i]);
+        }
+    }
+    return s;
+}
+
+// Natural log. A zero bin adds nothing.
+static float ademo_entropy(const float* p, int n) {
+    float h = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float x = p[i];
+        if (x <= 0.0f) {
+            continue;
+        }
+        h -= x * logf(x);
+    }
+    return h;
 }
 
 static float ademo_w1(const float* a, const float* b, int n) {
@@ -488,6 +532,33 @@ static void ademo_selfcheck(void) {
         + ademo_w1(g_ademo.ps, g_ademo.ps, NUM_STEER_BINS);
     assert(fabsf(same) < 1.0e-4f);
     assert(fabsf(w0) < 1.0e-4f);
+    float ha = ademo_entropy(g_ademo.pa, NUM_ACCEL_BINS);
+    float hs = ademo_entropy(g_ademo.ps, NUM_STEER_BINS);
+    assert(ha >= -1.0e-4f);
+    assert(hs >= -1.0e-4f);
+    assert(ha <= logf((float)NUM_ACCEL_BINS) + 1.0e-3f);
+    assert(hs <= logf((float)NUM_STEER_BINS) + 1.0e-3f);
+    // Same fixture as anchor_distance_selfcheck: logits [1,2,3] vs
+    // [0,0,0] and [0,1,0] vs [2,0,1]. q is the anchor, p is the policy.
+    float pol0[3] = {1.0f, 2.0f, 3.0f};
+    float pol1[3] = {0.0f, 1.0f, 0.0f};
+    float anc0[3] = {0.0f, 0.0f, 0.0f};
+    float anc1[3] = {2.0f, 0.0f, 1.0f};
+    float p0[3], p1[3], q0[3], q1[3];
+    float lp0[3], lp1[3], lq0[3], lq1[3];
+    ademo_softmax(pol0, p0, lp0, 3);
+    ademo_softmax(pol1, p1, lp1, 3);
+    ademo_softmax(anc0, q0, lq0, 3);
+    ademo_softmax(anc1, q1, lq1, 3);
+    float kl = ademo_kl_log(lq0, q0, lp0, 3) + ademo_kl_log(lq1, q1, lp1, 3);
+    float rkl = ademo_kl_log(lp0, p0, lq0, 3) + ademo_kl_log(lp1, p1, lq1, 3);
+    float w = ademo_w1(q0, p0, 3) + ademo_w1(q1, p1, 3);
+    if (fabsf(kl - 0.9380122346980022f) > 1.0e-4f
+            || fabsf(rkl - 1.0626701692550728f) > 1.0e-4f
+            || fabsf(w - 1.06129669419989f) > 1.0e-4f) {
+        printf("anchor distance fixture kl %g rkl %g w1 %g\n", kl, rkl, w);
+        assert(0 && "anchor distance fixture");
+    }
 }
 
 static void ademo_open(const char* path) {
@@ -599,6 +670,27 @@ static void ademo_open(const char* path) {
     fflush(stdout);
 }
 
+// The caller owns net and frees it after ademo_close. Batch size is 1.
+static void ademo_link(PufferNet* net) {
+    g_ademo.net = net;
+    if (!net) {
+        return;
+    }
+    assert(!net->is_continuous);
+    assert(net->num_agents == 1);
+    assert(net->num_actions == 2);
+    assert(net->multidiscrete);
+    assert(net->multidiscrete->logit_sizes[0] == NUM_ACCEL_BINS);
+    assert(net->multidiscrete->logit_sizes[1] == NUM_STEER_BINS);
+    assert(net->decoder->output_dim == NUM_ACCEL_BINS + NUM_STEER_BINS + 1);
+    int n = net->mingru->num_layers * net->mingru->batch_size
+        * net->mingru->hidden_size;
+    assert(n > 0);
+    g_ademo.gru_n = n;
+    g_ademo.gru_save = (float*)calloc((size_t)n, sizeof(float));
+    assert(g_ademo.gru_save);
+}
+
 static void ademo_close(void) {
     Ademo* a = &g_ademo;
     for (int i = 0; i < a->n_layers; i++) {
@@ -615,6 +707,7 @@ static void ademo_close(void) {
     free(a->sig);
     free(a->cur);
     free(a->nxt);
+    free(a->gru_save);
     memset(a, 0, sizeof(*a));
     if (g_math_ready && IsWindowReady()) {
         UnloadFont(g_math_font);
@@ -622,8 +715,17 @@ static void ademo_close(void) {
     }
 }
 
+static int ademo_town_scene(int which) {
+    return which >= 0 && which < ADEMO_NSCENE
+        && g_scenes[which].name == NULL;
+}
+
+static int ademo_town(void) {
+    return ademo_town_scene(g_scene_i);
+}
+
 static void ademo_forward(Drive* env) {
-    if (g_logs) {
+    if (g_logs || ademo_town()) {
         env->selected_agent_idx = g_sdc;
     }
     int idx = env->selected_agent_idx;
@@ -633,6 +735,38 @@ static void ademo_forward(Drive* env) {
     float* obs = env->agents[idx].observations;
     assert(obs);
     ademo_forward_obs(obs);
+}
+
+static void ademo_policy_zero(void) {
+    PufferNet* net = g_ademo.net;
+    if (!net || !net->mingru || !net->mingru->state || g_ademo.gru_n <= 0) {
+        return;
+    }
+    memset(net->mingru->state, 0, (size_t)g_ademo.gru_n * sizeof(float));
+}
+
+// commit writes the MinGRU state. A redraw while paused restores it,
+// so the same observation is not applied twice.
+static void ademo_policy_dist(const float* obs, int commit) {
+    PufferNet* net = g_ademo.net;
+    assert(net && obs);
+    float* state = net->mingru->state;
+    size_t nbytes = (size_t)g_ademo.gru_n * sizeof(float);
+    if (!commit) {
+        memcpy(g_ademo.gru_save, state, nbytes);
+    }
+    float term = 0.0f;
+    mingru_zero_term(net->mingru, &term);
+    linear(net->encoder, (float*)obs);
+    mingru(net->mingru, net->encoder->output);
+    linear(net->decoder, net->mingru->output);
+    float* logits = net->decoder->output;
+    ademo_softmax(logits, g_ademo.rla, g_ademo.log_rla, NUM_ACCEL_BINS);
+    ademo_softmax(logits + NUM_ACCEL_BINS, g_ademo.rls, g_ademo.log_rls,
+        NUM_STEER_BINS);
+    if (!commit) {
+        memcpy(state, g_ademo.gru_save, nbytes);
+    }
 }
 
 static void ademo_actions(Drive* env) {
@@ -645,19 +779,25 @@ static void ademo_actions(Drive* env) {
         atn[0] = ACCEL_COAST_BIN;
         atn[1] = STEER_COAST_BIN;
     }
-    if (g_logs) {
+    if (g_logs || ademo_town()) {
         env->selected_agent_idx = g_sdc;
     }
     int idx = env->selected_agent_idx;
-    if (!g_logs && (idx < 0 || idx >= n)) {
+    if (!g_logs && !ademo_town() && (idx < 0 || idx >= n)) {
         idx = 0;
         env->selected_agent_idx = 0;
     }
     float* atn = env->agents[idx].actions;
     assert(atn);
-    if (g_ademo.anchor_drives) {
+    if (g_ademo.who == ADEMO_ANCHOR) {
         atn[0] = (float)ademo_argmax(g_ademo.pa, NUM_ACCEL_BINS);
         atn[1] = (float)ademo_argmax(g_ademo.ps, NUM_STEER_BINS);
+    } else if (ademo_policy_on()) {
+        float* obs = env->agents[idx].observations;
+        assert(obs);
+        ademo_policy_dist(obs, g_ademo.commit);
+        atn[0] = (float)ademo_argmax(g_ademo.rla, NUM_ACCEL_BINS);
+        atn[1] = (float)ademo_argmax(g_ademo.rls, NUM_STEER_BINS);
     } else if (IsWindowReady()) {
         int accel_kick = (NUM_ACCEL_BINS - 1) / 3;
         int steer_kick = (NUM_STEER_BINS - 1) / 3;
@@ -689,7 +829,7 @@ static void ademo_actions(Drive* env) {
         }
         atn[0] = (float)accel;
         atn[1] = (float)steer;
-        if (!g_logs && IsKeyPressed(KEY_TAB) && n > 0) {
+        if (!g_logs && !ademo_town() && IsKeyPressed(KEY_TAB) && n > 0) {
             env->selected_agent_idx = (idx + 1) % n;
         }
     }
@@ -697,50 +837,24 @@ static void ademo_actions(Drive* env) {
     g_ademo.act_s = (int)atn[1];
 }
 
-static void ademo_mix(float* p, int n) {
-    float keep = 1.0f - ADEMO_EPS;
-    float floor = ADEMO_EPS / (float)n;
-    for (int i = 0; i < n; i++) {
-        p[i] = keep * p[i] + floor;
-    }
-}
-
 static void ademo_distances(void) {
-    float qa[NUM_ACCEL_BINS];
-    float qs[NUM_STEER_BINS];
-    float da[NUM_ACCEL_BINS];
-    float ds[NUM_STEER_BINS];
-    memcpy(qa, g_ademo.pa, sizeof(qa));
-    memcpy(qs, g_ademo.ps, sizeof(qs));
-    // The anchor softmax underflows to exact zeros. Mixing the same floor
-    // used on the driven bin keeps reverse KL near -log of the chosen bin
-    // instead of infinite on every frame.
-    ademo_mix(qa, NUM_ACCEL_BINS);
-    ademo_mix(qs, NUM_STEER_BINS);
-    ademo_driven(da, NUM_ACCEL_BINS, g_ademo.act_a);
-    ademo_driven(ds, NUM_STEER_BINS, g_ademo.act_s);
-    g_ademo.kl = ademo_kl(qa, da, NUM_ACCEL_BINS)
-        + ademo_kl(qs, ds, NUM_STEER_BINS);
-    g_ademo.rkl = ademo_kl(da, qa, NUM_ACCEL_BINS)
-        + ademo_kl(ds, qs, NUM_STEER_BINS);
-    g_ademo.w1 = ademo_w1(qa, da, NUM_ACCEL_BINS)
-        + ademo_w1(qs, ds, NUM_STEER_BINS);
-    int ia = g_ademo.act_a;
-    int is = g_ademo.act_s;
-    if (ia < 0) {
-        ia = 0;
+    g_ademo.ent_a = ademo_entropy(g_ademo.pa, NUM_ACCEL_BINS);
+    g_ademo.ent_s = ademo_entropy(g_ademo.ps, NUM_STEER_BINS);
+    if (!ademo_policy_on()) {
+        return;
     }
-    if (ia >= NUM_ACCEL_BINS) {
-        ia = NUM_ACCEL_BINS - 1;
-    }
-    if (is < 0) {
-        is = 0;
-    }
-    if (is >= NUM_STEER_BINS) {
-        is = NUM_STEER_BINS - 1;
-    }
-    g_ademo.p_act_a = g_ademo.pa[ia];
-    g_ademo.p_act_s = g_ademo.ps[is];
+    // q is the anchor, p is the policy. Same reduction as the trainer:
+    // KL(anchor || policy), KL(policy || anchor), W1, summed over heads.
+    g_ademo.kl = ademo_kl_log(g_ademo.log_pa, g_ademo.pa, g_ademo.log_rla,
+            NUM_ACCEL_BINS)
+        + ademo_kl_log(g_ademo.log_ps, g_ademo.ps, g_ademo.log_rls,
+            NUM_STEER_BINS);
+    g_ademo.rkl = ademo_kl_log(g_ademo.log_rla, g_ademo.rla, g_ademo.log_pa,
+            NUM_ACCEL_BINS)
+        + ademo_kl_log(g_ademo.log_rls, g_ademo.rls, g_ademo.log_ps,
+            NUM_STEER_BINS);
+    g_ademo.w1 = ademo_w1(g_ademo.pa, g_ademo.rla, NUM_ACCEL_BINS)
+        + ademo_w1(g_ademo.ps, g_ademo.rls, NUM_STEER_BINS);
 }
 
 static void ademo_math_open(void) {
@@ -752,6 +866,7 @@ static void ademo_math_open(void) {
     for (int c = 32; c < 127; c++) {
         cps[n++] = c;
     }
+    cps[n++] = 0x03C0;
     cps[n++] = 0x03C4;
     cps[n++] = 0x00B7;
     cps[n++] = 0x2081;
@@ -858,14 +973,26 @@ static void ademo_layout(Drive* env, AdemoLayout* L) {
     yb += head + 2.0f + head + 8.0f;
     L->button = (Rectangle){inner_x, yb, inner_w, btn_h};
     yb += btn_h + 6.0f;
+    if (g_ademo.net) {
+        L->policy = (Rectangle){inner_x, yb, inner_w, btn_h};
+        yb += btn_h + 6.0f;
+    } else {
+        L->policy = (Rectangle){0.0f, 0.0f, 0.0f, 0.0f};
+    }
     L->reset = (Rectangle){inner_x, yb, inner_w, btn_h};
     yb += btn_h + 10.0f;
     L->accel_y = yb;
     yb += head + 4.0f;
-    float series_h = 88.0f;
+    int dist_rows = 1;
+    float series_h = 0.0f;
+    float series_extra = 0.0f;
+    if (ademo_policy_on()) {
+        dist_rows = 3;
+        series_h = 88.0f;
+        series_extra = 8.0f + head + 4.0f + series_h + 4.0f + head;
+    }
     float fixed = xrow + head + 4.0f + xrow + head + 8.0f
-        + step * 4.0f + 8.0f + head + 4.0f + series_h
-        + 4.0f + head + pad;
+        + step * (float)dist_rows + series_extra + pad;
     float room = bottom - yb - fixed;
     float bar_h = room * 0.5f;
     if (bar_h < 72.0f) {
@@ -883,13 +1010,17 @@ static void ademo_layout(Drive* env, AdemoLayout* L) {
     L->legend_y = yb;
     yb += head + 8.0f;
     L->dist_y = yb;
-    yb += step * 4.0f + 8.0f;
-    L->series_y = yb;
-    yb += head + 4.0f;
-    L->series = (Rectangle){
-        inner_x + 40.0f, yb, inner_w - 40.0f, series_h
-    };
-    yb += series_h + 4.0f + head + pad;
+    yb += step * (float)dist_rows;
+    if (series_h > 0.0f) {
+        yb += 8.0f;
+        L->series_y = yb;
+        yb += head + 4.0f;
+        L->series = (Rectangle){
+            inner_x + 40.0f, yb, inner_w - 40.0f, series_h
+        };
+        yb += series_h + 4.0f + head;
+    }
+    yb += pad;
     L->card = (Rectangle){x, y, col_w, yb - y};
     L->text_x = inner_x;
     L->text_w = inner_w;
@@ -897,6 +1028,8 @@ static void ademo_layout(Drive* env, AdemoLayout* L) {
     L->dist_step = step;
     L->head_size = head;
 }
+
+static void ademo_hist_clear(void);
 
 // 1 when Reset was clicked. The caller resets after puf_sim_poll,
 // which clears sim_hold_step at the start of the frame.
@@ -908,7 +1041,22 @@ static int ademo_poll(Drive* env) {
     ademo_layout(env, &L);
     Vector2 mouse = GetMousePosition();
     if (CheckCollisionPointRec(mouse, L.button)) {
-        g_ademo.anchor_drives = !g_ademo.anchor_drives;
+        if (g_ademo.who == ADEMO_ANCHOR) {
+            g_ademo.who = ADEMO_YOU;
+        } else {
+            g_ademo.who = ADEMO_ANCHOR;
+        }
+        ademo_hist_clear();
+        return 0;
+    }
+    if (g_ademo.net && CheckCollisionPointRec(mouse, L.policy)) {
+        if (g_ademo.who == ADEMO_POLICY) {
+            g_ademo.who = ADEMO_YOU;
+        } else {
+            g_ademo.who = ADEMO_POLICY;
+            ademo_policy_zero();
+        }
+        ademo_hist_clear();
         return 0;
     }
     if (CheckCollisionPointRec(mouse, L.reset)) {
@@ -918,6 +1066,9 @@ static int ademo_poll(Drive* env) {
 }
 
 // Height is the probability. p = 1 fills the axis. The mid line is 0.5.
+// This plot is narrower than the 257-bin table. A fractional bar width
+// does not rasterize, and a 1px floor runs past the frame. Each pixel
+// shows the tallest bin whose center falls in it.
 static void ademo_bars(Rectangle plot, const float* p, int n, int taken) {
     DrawRectangleRec(plot, WELL);
     float top = plot.y + 1.0f;
@@ -927,28 +1078,61 @@ static void ademo_bars(Rectangle plot, const float* p, int n, int taken) {
         (Vector2){plot.x + 1.0f, mid},
         (Vector2){plot.x + plot.width - 1.0f, mid},
         1.0f, GRID);
-    DrawRectangleLinesEx(plot, 1.0f, LINE);
-    float gap = 1.0f;
-    float bw = (plot.width - gap * (float)(n - 1)) / (float)n;
-    if (bw < 1.0f) {
-        bw = 1.0f;
+    int cols = (int)plot.width;
+    if (cols < 1) {
+        cols = 1;
+    }
+    if (cols > 512) {
+        cols = 512;
+    }
+    float peak[512];
+    for (int c = 0; c < cols; c++) {
+        peak[c] = 0.0f;
     }
     for (int i = 0; i < n; i++) {
-        float h = p[i] * span;
-        if (h < 0.0f) {
-            h = 0.0f;
+        int c = (int)(((float)i + 0.5f) * (float)cols / (float)n);
+        if (c < 0) {
+            c = 0;
         }
+        if (c >= cols) {
+            c = cols - 1;
+        }
+        if (p[i] > peak[c]) {
+            peak[c] = p[i];
+        }
+    }
+    for (int c = 0; c < cols; c++) {
+        float h = peak[c] * span;
         if (h > span) {
             h = span;
         }
-        float bx = plot.x + (float)i * (bw + gap);
-        float by = top + span - h;
-        DrawRectangleRec((Rectangle){bx, by, bw, h}, SAGE);
-        if (i == taken) {
-            DrawRectangleLinesEx(
-                (Rectangle){bx, top, bw, span}, 1.5f, CORAL);
+        if (h < 1.0f) {
+            continue;
         }
+        DrawRectangleRec((Rectangle){
+            plot.x + (float)c, top + span - h, 1.0f, h
+        }, SAGE);
     }
+    if (taken >= 0 && taken < n) {
+        int c = (int)(((float)taken + 0.5f) * (float)cols / (float)n);
+        if (c < 0) {
+            c = 0;
+        }
+        if (c >= cols) {
+            c = cols - 1;
+        }
+        float bx = plot.x + (float)c - 1.0f;
+        float right = plot.x + plot.width - 3.0f;
+        if (bx < plot.x) {
+            bx = plot.x;
+        }
+        if (bx > right) {
+            bx = right;
+        }
+        DrawRectangleLinesEx(
+            (Rectangle){bx, top, 3.0f, span}, 1.0f, CORAL);
+    }
+    DrawRectangleLinesEx(plot, 1.0f, LINE);
 }
 
 static float ademo_tw(Drive* env, const char* text, float size) {
@@ -993,15 +1177,12 @@ static void ademo_yaxis(Drive* env, Rectangle plot) {
     DrawTextPro(font, word, at, origin, -90.0f, wsz, 0.4f, MUTED);
 }
 
-// Min, zero, and max of the parametrized bins. The bins are uniform,
-// so these three marks sit on the first bin, the coast bin, and the last.
+// Min, zero, and max command. Counts are odd and the bins are uniform,
+// so the marks are the first bin, the coast bin, and the last. A whole
+// command prints as an integer. ±1.5 would round to ±2 with %+.0f.
 static void ademo_xaxis(Drive* env, Rectangle plot, int n,
         const float* values) {
-    float gap = 1.0f;
-    float bw = (plot.width - gap * (float)(n - 1)) / (float)n;
-    if (bw < 1.0f) {
-        bw = 1.0f;
-    }
+    float slot = plot.width / (float)n;
     float size = 11.0f;
     float base = plot.y + plot.height;
     int marks[3];
@@ -1010,38 +1191,37 @@ static void ademo_xaxis(Drive* env, Rectangle plot, int n,
     marks[2] = n - 1;
     for (int k = 0; k < 3; k++) {
         int i = marks[k];
-        float cx = plot.x + (float)i * (bw + gap) + bw * 0.5f;
+        float cx = plot.x + ((float)i + 0.5f) * slot;
         char buf[16];
         float v = values[i];
-        if (v > -0.05f && v < 0.05f) {
+        float mag = fabsf(v);
+        float rounded = floorf(mag + 0.5f);
+        if (mag < 0.05f) {
             snprintf(buf, sizeof(buf), "0");
-        } else {
+        } else if (fabsf(mag - rounded) < 0.05f) {
             snprintf(buf, sizeof(buf), "%+.0f", v);
+        } else {
+            snprintf(buf, sizeof(buf), "%+.1f", v);
         }
         float tw = ademo_tw(env, buf, size);
+        float tx = cx - tw * 0.5f;
+        if (k == 0 && tx < plot.x) {
+            tx = plot.x;
+        }
+        if (k == 2 && tx + tw > plot.x + plot.width) {
+            tx = plot.x + plot.width - tw;
+        }
         DrawLineEx(
             (Vector2){cx, base},
             (Vector2){cx, base + 3.0f},
             1.0f, INK);
-        sim_sans(env, buf, cx - tw * 0.5f, base + 4.0f, size, MUTED);
+        sim_sans(env, buf, tx, base + 4.0f, size, MUTED);
     }
 }
 
 static void ademo_num(char* dst, int n, float v) {
     if (!isfinite(v)) {
         snprintf(dst, (size_t)n, "inf");
-        return;
-    }
-    snprintf(dst, (size_t)n, "%.3f", v);
-}
-
-static void ademo_prob(char* dst, int n, float v) {
-    if (!isfinite(v)) {
-        snprintf(dst, (size_t)n, "inf");
-        return;
-    }
-    if (v > 0.0f && v < 0.001f) {
-        snprintf(dst, (size_t)n, "%.1e", v);
         return;
     }
     snprintf(dst, (size_t)n, "%.3f", v);
@@ -1094,43 +1274,44 @@ static void ademo_legend(Drive* env, AdemoLayout* L) {
     float tw = ademo_tw(env, "anchor probability", s);
     float x2 = x + 16.0f + tw + 12.0f;
     DrawRectangleLinesEx(
-        (Rectangle){x2, y + 1.0f, 11.0f, 11.0f}, 1.5f, CORAL);
-    sim_sans(env, "selected bin", x2 + 16.0f, y, s, MUTED);
+        (Rectangle){x2, y + 1.0f, 9.0f, 11.0f}, 1.0f, CORAL);
+    sim_sans(env, "selected bin", x2 + 14.0f, y, s, MUTED);
 }
 
+// KL(τ ‖ π) or KL(π ‖ τ). π is the linked policy.
 static void ademo_kl_row(AdemoLayout* L, int row, int reverse, Color col) {
     float y = L->dist_y + (float)row * L->dist_step;
     float size = L->dist_size;
     float x = L->text_x;
     const int kl[] = {'K', 'L', '('};
+    const int mid[] = {' ', 0x2016, ' '};
     x = ademo_runes(kl, 3, x, y, size, col);
     if (reverse) {
-        const int act[] = {'a', 'c', 't', ' ', 0x2016, ' '};
-        x = ademo_runes(act, 6, x, y, size, col);
+        x = ademo_one(0x03C0, x, y, size, col);
+        x = ademo_runes(mid, 3, x, y, size, col);
         x = ademo_one(0x03C4, x, y, size, col);
     } else {
         x = ademo_one(0x03C4, x, y, size, col);
-        const int act[] = {' ', 0x2016, ' ', 'a', 'c', 't'};
-        x = ademo_runes(act, 6, x, y, size, col);
+        x = ademo_runes(mid, 3, x, y, size, col);
+        x = ademo_one(0x03C0, x, y, size, col);
     }
     ademo_one(')', x, y, size, col);
 }
 
-static void ademo_w1_label(AdemoLayout* L, Color col) {
-    float y = L->dist_y + 2.0f * L->dist_step;
+// H(τ). Sum of the two heads, same reduction as the KL rows.
+static void ademo_entropy_label(AdemoLayout* L, Color col) {
+    float y = L->dist_y;
+    float size = L->dist_size;
+    float x = ademo_one('H', L->text_x, y, size, col);
+    const int tail[] = {'(', 0x03C4, ')'};
+    ademo_runes(tail, 3, x, y, size, col);
+}
+
+static void ademo_w1_label(AdemoLayout* L, int row, Color col) {
+    float y = L->dist_y + (float)row * L->dist_step;
     float size = L->dist_size;
     float x = ademo_one('W', L->text_x, y, size, col);
     ademo_one(0x2081, x, y, size, col);
-}
-
-static void ademo_pact_label(AdemoLayout* L, Color col) {
-    float y = L->dist_y + 3.0f * L->dist_step;
-    float size = L->dist_size;
-    float x = L->text_x;
-    x = ademo_one(0x03C4, x, y, size, col);
-    const int open[] = {'(', 'a', 'c', 't', ' ', '|', ' '};
-    x = ademo_runes(open, 7, x, y, size, col);
-    ademo_ot(x, y, size, col);
 }
 
 // One sample per sim step. Pause does not fill the trace with copies.
@@ -1143,6 +1324,9 @@ static void ademo_hist_clear(void) {
 // hist_at is the slot of the current step. A new step advances it.
 // The same step is overwritten so the trace matches the readout.
 static void ademo_hist_note(Drive* env) {
+    if (!ademo_policy_on()) {
+        return;
+    }
     int fresh = env->timestep != g_ademo.hist_step;
     if (fresh) {
         if (g_ademo.hist_n > 0) {
@@ -1314,16 +1498,27 @@ static void ademo_hud(Drive* env) {
     }
     const char* hint = "You drive the SDC    WASD or arrows";
     const char* button = "Let anchor take control";
-    if (g_ademo.anchor_drives) {
+    if (g_ademo.who == ADEMO_ANCHOR) {
         hint = "Anchor drives the SDC    greedy bins";
         button = "You drive";
+    } else if (g_ademo.who == ADEMO_POLICY) {
+        hint = "Policy drives the SDC    greedy bins";
     }
     sim_sans(env, hint, L.text_x, L.hint_y, L.head_size, MUTED);
     ademo_cmd(env, &L);
     Vector2 mouse = GetMousePosition();
     int hot = CheckCollisionPointRec(mouse, L.button);
     int hot_reset = CheckCollisionPointRec(mouse, L.reset);
-    ademo_button(env, L.button, button, g_ademo.anchor_drives, hot);
+    ademo_button(env, L.button, button, g_ademo.who == ADEMO_ANCHOR, hot);
+    if (g_ademo.net) {
+        const char* plab = "Let policy take control";
+        if (g_ademo.who == ADEMO_POLICY) {
+            plab = "You drive";
+        }
+        int hot_policy = CheckCollisionPointRec(mouse, L.policy);
+        ademo_button(env, L.policy, plab, g_ademo.who == ADEMO_POLICY,
+            hot_policy);
+    }
     ademo_button(env, L.reset, "Reset", 0, hot_reset);
     sim_sans(env, "Acceleration (m/s^2)", L.text_x, L.accel_y,
         L.head_size, MUTED);
@@ -1343,48 +1538,46 @@ static void ademo_hud(Drive* env) {
         (Vector2){L.text_x + L.text_w, L.dist_y - 8.0f},
         1.0f, LINE);
     char buf[64];
-    ademo_num(buf, 64, g_ademo.kl);
-    ademo_value(env, &L, 0, buf, !isfinite(g_ademo.kl));
-    ademo_num(buf, 64, g_ademo.rkl);
-    ademo_value(env, &L, 1, buf, !isfinite(g_ademo.rkl));
-    ademo_num(buf, 64, g_ademo.w1);
-    ademo_value(env, &L, 2, buf, !isfinite(g_ademo.w1));
-    char pa_txt[16];
-    char ps_txt[16];
-    ademo_prob(pa_txt, 16, g_ademo.p_act_a);
-    ademo_prob(ps_txt, 16, g_ademo.p_act_s);
-    snprintf(buf, sizeof(buf), "a %s   s %s", pa_txt, ps_txt);
-    ademo_value(env, &L, 3, buf, 0);
-    if (!g_math_ready) {
-        const char* names[] = {
-            "KL(tau || act)",
-            "KL(act || tau)",
-            "W1",
-            "tau(act | o_t)",
-        };
-        for (int i = 0; i < 4; i++) {
-            float y = L.dist_y + (float)i * L.dist_step;
-            sim_sans(env, names[i], L.text_x, y, L.dist_size, INK);
+    if (!ademo_policy_on()) {
+        float ent = g_ademo.ent_a + g_ademo.ent_s;
+        snprintf(buf, sizeof(buf), "%.3f  a %.3f  s %.3f",
+            ent, g_ademo.ent_a, g_ademo.ent_s);
+        ademo_value(env, &L, 0, buf, !isfinite(ent));
+        if (!g_math_ready) {
+            sim_sans(env, "H(tau)", L.text_x, L.dist_y, L.dist_size,
+                isfinite(ent) ? INK : CRIMSON);
+        } else {
+            ademo_entropy_label(&L, isfinite(ent) ? INK : CRIMSON);
         }
     } else {
-        Color kl_col = INK;
-        Color rkl_col = INK;
-        Color w_col = INK;
-        if (!isfinite(g_ademo.kl)) {
-            kl_col = CRIMSON;
+        ademo_num(buf, 64, g_ademo.kl);
+        ademo_value(env, &L, 0, buf, !isfinite(g_ademo.kl));
+        ademo_num(buf, 64, g_ademo.rkl);
+        ademo_value(env, &L, 1, buf, !isfinite(g_ademo.rkl));
+        ademo_num(buf, 64, g_ademo.w1);
+        ademo_value(env, &L, 2, buf, !isfinite(g_ademo.w1));
+        if (!g_math_ready) {
+            const char* names[] = {
+                "KL(tau || pi)",
+                "KL(pi || tau)",
+                "W1",
+            };
+            float vals[] = {g_ademo.kl, g_ademo.rkl, g_ademo.w1};
+            for (int i = 0; i < 3; i++) {
+                float y = L.dist_y + (float)i * L.dist_step;
+                Color col = INK;
+                if (!isfinite(vals[i])) {
+                    col = CRIMSON;
+                }
+                sim_sans(env, names[i], L.text_x, y, L.dist_size, col);
+            }
+        } else {
+            ademo_kl_row(&L, 0, 0, isfinite(g_ademo.kl) ? INK : CRIMSON);
+            ademo_kl_row(&L, 1, 1, isfinite(g_ademo.rkl) ? INK : CRIMSON);
+            ademo_w1_label(&L, 2, isfinite(g_ademo.w1) ? INK : CRIMSON);
         }
-        if (!isfinite(g_ademo.rkl)) {
-            rkl_col = CRIMSON;
-        }
-        if (!isfinite(g_ademo.w1)) {
-            w_col = CRIMSON;
-        }
-        ademo_kl_row(&L, 0, 0, kl_col);
-        ademo_kl_row(&L, 1, 1, rkl_col);
-        ademo_w1_label(&L, w_col);
-        ademo_pact_label(&L, INK);
+        ademo_series(env, &L);
     }
-    ademo_series(env, &L);
 }
 
 static void ademo_sync(Drive* env) {
@@ -1408,11 +1601,23 @@ static int ademo_hot(Drive* env) {
 
 static void ademo_title(void) {
     char buf[64];
-    int map_id = 0;
-    if (g_scene_i >= 0 && g_scene_i < ADEMO_NSCENE) {
-        map_id = g_scenes[g_scene_i].map_id;
+    if (ademo_town()) {
+        if (g_ademo.net) {
+            snprintf(buf, sizeof(buf), "Anchor  Town01  policy");
+        } else {
+            snprintf(buf, sizeof(buf), "Anchor  Town01");
+        }
+    } else {
+        int map_id = 0;
+        if (g_scene_i >= 0 && g_scene_i < ADEMO_NSCENE) {
+            map_id = g_scenes[g_scene_i].map_id;
+        }
+        if (g_ademo.net) {
+            snprintf(buf, sizeof(buf), "Anchor  map %d  policy", map_id);
+        } else {
+            snprintf(buf, sizeof(buf), "Anchor  map %d", map_id);
+        }
     }
-    snprintf(buf, sizeof(buf), "Anchor  map %d", map_id);
     if (IsWindowReady()) {
         SetWindowTitle(buf);
     }
@@ -1514,11 +1719,45 @@ static void ademo_replay_step(Drive* env) {
     compute_observations(env);
 }
 
+// Town01 uses the trainer fleet and the trainer collision mode. Goals
+// are the forward-lane sample from initialize_env, then again on arrival.
+static void ademo_load_town(Drive* env, Dict* cfg, int which) {
+    dict_set_str(cfg, "data_dir", "data/mixed");
+    dict_set_str(cfg, "collision_physics", "through");
+    dict_set(cfg, "map_id", g_scenes[which].map_id);
+    int n = g_fleet;
+    if (n < 1) {
+        n = 1;
+    }
+    if (n > DRIVE_AGENT_MAX) {
+        n = DRIVE_AGENT_MAX;
+    }
+    dict_set(cfg, "num_agents", n);
+    g_logs = NULL;
+    g_log_n = 0;
+    g_sdc = 0;
+    puf_init(env, cfg);
+    ademo_bind(env);
+    puf_reset(env);
+    env->selected_agent_idx = g_sdc;
+    g_scene_i = which;
+    printf("scenario map %d  town01  vehicles %d  sdc %d\n",
+        g_scenes[which].map_id, env->active_agent_count, g_sdc);
+    fflush(stdout);
+    ademo_title();
+}
+
 static void ademo_load(Drive* env, Dict* cfg, int which) {
     if (which < 0 || which >= ADEMO_NSCENE) {
         which = 0;
     }
     ademo_release(env);
+    if (ademo_town_scene(which)) {
+        ademo_load_town(env, cfg, which);
+        return;
+    }
+    dict_set_str(cfg, "data_dir", g_log_dir[0] ? g_log_dir : "data/womd");
+    dict_set_str(cfg, "collision_physics", "bump");
     const char* dir = dict_get_str(cfg, "data_dir");
     char path[1200];
     snprintf(path, sizeof(path), "%s/json/%s",
@@ -1565,15 +1804,26 @@ static void ademo_boot(Drive* env, Dict* cfg, int start) {
             env->rng = 1;
         }
     }
+    const char* dir = dict_get_str(cfg, "data_dir");
+    snprintf(g_log_dir, sizeof(g_log_dir), "%s", dir);
+    g_fleet = (int)dict_get(cfg, "num_agents");
     ademo_load(env, cfg, start);
 }
 
 static void ademo_on_reset(Drive* env) {
+    if (ademo_town()) {
+        puf_reset(env);
+        env->selected_agent_idx = g_sdc;
+        ademo_hist_clear();
+        ademo_policy_zero();
+        return;
+    }
     if (!g_logs) {
         return;
     }
     ademo_place(env, 0);
     ademo_hist_clear();
+    ademo_policy_zero();
 }
 
 static void ademo_on_scene(Drive* env) {
@@ -1588,6 +1838,7 @@ static void ademo_on_scene(Drive* env) {
     }
     ademo_load(env, env->cfg, pick);
     ademo_hist_clear();
+    ademo_policy_zero();
 }
 
 static void ademo_shutdown(void) {
@@ -1605,6 +1856,7 @@ static void ademo_shutdown(void) {
 }
 
 static void ademo_frame(Drive* env, int step) {
+    g_ademo.commit = step && !puf_sim_paused(env);
     ademo_forward(env);
     ademo_actions(env);
     ademo_distances();
@@ -1614,6 +1866,7 @@ static void ademo_frame(Drive* env, int step) {
         if (g_logs && env->timestep >= ADEMO_LOOP) {
             ademo_place(env, 0);
             ademo_hist_clear();
+            ademo_policy_zero();
         } else if (g_logs) {
             ademo_replay_step(env);
         } else {

@@ -1275,7 +1275,13 @@ static void draw_world(Drive* env, Client* client) {
                 bounds.max.y - bounds.min.y,
                 bounds.max.z - bounds.min.z
             };
-            Vector3 scale = {size.x / model_size.x, size.y / model_size.y, size.z / model_size.z};
+            // glb files are Y-up. The 90° turn about X maps model Y to
+            // world Z and model Z to world Y. Length stays on X.
+            Vector3 scale = {
+                size.x / model_size.x,
+                size.z / model_size.y,
+                size.y / model_size.z,
+            };
             DrawModelEx(car_model, (Vector3){0, 0, 0}, (Vector3){1, 0, 0}, 90.0f, scale, car_tint);
             rlPopMatrix();
 
