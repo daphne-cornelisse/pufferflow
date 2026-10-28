@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """Plot a protein sweep from its log and per-run metrics.
 
-The figure is four rows. Score quality against sweep index is the first
-panel, colored by run. Score against collision count is next. Every panel
+The figure is five rows. The sweep objective against sweep index is the
+first panel, colored by run. Score against collision count is next. Every panel
 colors runs with ColorBrewer Set1, except episode return against sweep
 index, which is colored by trial wall clock. The other panels are return
 curves, goal score, collision rate, score against jerk when those series
-exist (otherwise collision count), and parameter count. Under that, the
-rate-like hyperparameters share one boxplot, each scaled to its own min
-and max. Hidden size, layer count, horizon, minibatch size, agent count,
-and timestep budget each have their own panel, in the units they were
-swept, with one swarm point per run.
+exist (otherwise collision count), and parameter count. The next row is
+the benchmark: replay collision rate, human-replay score against anchor
+coefficient, and long-horizon score. That score is the mean number of
+steps before a collision or an off-road event, on one episode length.
+Under that,
+the rate-like hyperparameters share one boxplot, each scaled to its own
+min and max. Hidden size, layer count, horizon, minibatch size, and
+timestep budget each have their own panel, in the units they
+were swept, with one swarm point per run.
+
+Benchmark numbers come from a [benchmark] section in the run ini, or from
+logs/drive/<run_id>.benchmark.txt written by ./drive --benchmark. A run
+with neither is left blank on that row.
 
     python scripts/plot_sweep.py logs/drive/sweep.log -o logs/drive/sweep-panels.png
 
 Wall clock is the trial cost in the sweep log, in minutes. Goal score and
 collision rate come from the binned env/ metrics written at the end of each
 run. Runs that failed before writing metrics are left out. Figures go under
-logs/drive.
+logs/drive, or logs/replay_sweep when that directory is the output.
 """
 
 import argparse
@@ -30,8 +38,20 @@ import seaborn as sns
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_LINE = re.compile(
-    r"sweep run=(\d+) score=\S+ cost=([0-9.eE+-]+)"
+    r"sweep run=(\d+) score=([0-9.eE+-]+) cost=([0-9.eE+-]+)"
 )
+# Names written by ./drive --benchmark. Anything else is shown as-is.
+OBJECTIVE_LABELS = {
+    "score": "score",
+    "replay_score": "replay score",
+    "replay_collision": "replay collision",
+    "replay_offroad": "replay off-road",
+    "replay_completion": "replay completion",
+    "replay_ade_lat": "lateral ADE",
+    "replay_ade_lon": "longitudinal ADE",
+    "horizon_collision": "horizon collisions",
+    "horizon_score": "steps before collision",
+}
 # Drive observation is 8 ego + 64*7 partners + 75*7 road. Decoder is
 # 7 accel logits, 13 steer logits, and one value output.
 POLICY_PARAMS_PER_HIDDEN = 8 + 7 * 64 + 7 * 75 + 7 + 13 + 1
@@ -52,7 +72,6 @@ HYPER_FIELDS = (
     ("num_layers", "policy", "num_layers"),
     ("horizon", "train", "horizon"),
     ("minibatch_size", "train", "minibatch_size"),
-    ("total_agents", "vec", "total_agents"),
     ("total_timesteps", "train", "total_timesteps"),
 )
 SCALED_HYPERS = (
@@ -71,18 +90,37 @@ SIZE_HYPERS = (
     "hidden_size",
     "num_layers",
     "minibatch_size",
-    "total_agents",
     "horizon",
     "total_timesteps",
+)
+BENCH_KEYS = (
+    "replay_collision",
+    "replay_score",
+    "horizon_score",
+)
+BENCH_PANELS = (
+    ("replay_collision", "collision rate", "Replay collision"),
+    ("replay_score", "score", "Human replay score"),
+    (
+        "horizon_score",
+        "steps",
+        "Long-horizon score\n"
+        "mean steps before a collision or off-road",
+    ),
 )
 
 
 def parse_sweep_log(path):
+    """Finished trials: run index, protein objective, wall-clock minutes."""
     runs = []
     for line in path.read_text().splitlines():
         match = RUN_LINE.search(line)
         if match:
-            runs.append((int(match.group(1)), float(match.group(2)) / 60.0))
+            runs.append((
+                int(match.group(1)),
+                float(match.group(2)),
+                float(match.group(3)) / 60.0,
+            ))
     if not runs:
         raise SystemExit(f"no finished runs in {path}")
     return runs
@@ -111,6 +149,70 @@ def section_value(text, section, key):
     return None
 
 
+def section_text(text, section, key):
+    """Raw ini value. Comments and list-looking lines are skipped."""
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped[1:-1] == section
+            continue
+        if not in_section or "=" not in stripped or stripped.startswith("#"):
+            continue
+        name, value = stripped.split("=", 1)
+        if name.strip() == key:
+            return value.strip().strip("'\"")
+    return None
+
+
+def parse_report(path):
+    """Metric floats, plus the `sweep <name> <value>` objective when present."""
+    out = {}
+    sweep_name = None
+    for line in path.read_text(errors="replace").splitlines():
+        bits = line.split()
+        if len(bits) >= 3 and bits[0] == "sweep":
+            try:
+                out["sweep"] = float(bits[2])
+            except ValueError:
+                continue
+            sweep_name = bits[1]
+            continue
+        if len(bits) < 2:
+            continue
+        try:
+            out[bits[0]] = float(bits[1])
+        except ValueError:
+            continue
+    return out, sweep_name
+
+
+def benchmark_values(ini_path, text):
+    """Replay metrics, and the benchmark objective name when a report has one."""
+    found = {}
+    sweep_name = None
+    for key in BENCH_KEYS:
+        value = section_value(text, "benchmark", key)
+        if value is not None:
+            found[key] = value
+    names = (
+        ini_path.with_suffix(".benchmark.txt"),
+        ROOT / "logs" / "drive" / f"{ini_path.stem}.benchmark.txt",
+    )
+    for path in names:
+        if not path.is_file():
+            continue
+        parsed, name = parse_report(path)
+        if name and sweep_name is None:
+            sweep_name = name
+        if "sweep" in parsed and "sweep_value" not in found:
+            found["sweep_value"] = parsed["sweep"]
+        for key in BENCH_KEYS:
+            if key not in found and key in parsed:
+                found[key] = parsed[key]
+    return found, sweep_name
+
+
 def policy_params(hidden, layers):
     """Weight count. num_layers is truncated to int, same as training."""
     hidden = int(hidden)
@@ -136,7 +238,7 @@ def load_frames(log_path, metrics_dir):
     counts = []
     summary = []
     missing = []
-    for run, wall_min in parse_sweep_log(log_path):
+    for run, objective, wall_min in parse_sweep_log(log_path):
         path = metrics_file(metrics_dir, run, log_mtime)
         if path is None:
             missing.append(run)
@@ -147,7 +249,6 @@ def load_frames(log_path, metrics_dir):
         collision_vals = metric_series(text, "env/collision_rate")
         jerk_vals = metric_series(text, "env/jerk")
         smooth_vals = metric_series(text, "env/smooth")
-        quality_vals = metric_series(text, "env/score_quality")
         completion_vals = metric_series(text, "env/completion_rate")
         count_vals = metric_series(text, "env/collision_count")
         steps = metric_series(text, "agent_steps")
@@ -168,7 +269,8 @@ def load_frames(log_path, metrics_dir):
         summary.append({
             "run": run,
             "score": score_vals[-1],
-            "score_quality": quality_vals[-1] if quality_vals else float("nan"),
+            "objective": objective,
+            "objective_name": "score",
             "completion_rate": (
                 completion_vals[-1] if completion_vals else float("nan")
             ),
@@ -185,6 +287,21 @@ def load_frames(log_path, metrics_dir):
         for label, section, key in HYPER_FIELDS:
             value = section_value(text, section, key)
             summary[-1][label] = float(value) if value is not None else float("nan")
+        bench, sweep_name = benchmark_values(path, text)
+        for key in BENCH_KEYS:
+            summary[-1][key] = bench.get(key, float("nan"))
+        if sweep_name:
+            summary[-1]["objective_name"] = sweep_name
+            if "sweep_value" in bench:
+                summary[-1]["objective"] = bench["sweep_value"]
+        else:
+            train_metric = section_text(text, "sweep", "metric")
+            if train_metric:
+                summary[-1]["objective_name"] = train_metric
+        coef = section_value(text, "train", "anchor_coef")
+        summary[-1]["anchor_coef"] = (
+            float(coef) if coef is not None else float("nan")
+        )
     if not summary:
         raise SystemExit(f"no metrics for runs in {log_path}")
     return (
@@ -227,21 +344,114 @@ def style_steps(ax):
 
 
 def figure_axes():
-    """Result panels, one scaled coefficient row, then one panel per size."""
-    fig = plt.figure(figsize=(22.4, 16.4), dpi=200, layout="constrained")
+    """Result panels, benchmark row, scaled coefficients, then sizes."""
+    fig = plt.figure(figsize=(22.4, 20.2), dpi=200, layout="constrained")
     outer = fig.add_gridspec(
-        4, 1, height_ratios=[1.0, 1.0, 1.05, 1.15],
+        5, 1, height_ratios=[1.0, 1.0, 0.95, 1.05, 1.15],
     )
     top = outer[0].subgridspec(1, 4, wspace=0.28)
     mid = outer[1].subgridspec(1, 4, wspace=0.28)
     axes = [fig.add_subplot(top[0, col]) for col in range(4)]
     axes += [fig.add_subplot(mid[0, col]) for col in range(4)]
-    coef_ax = fig.add_subplot(outer[2])
-    size_grid = outer[3].subgridspec(1, len(SIZE_HYPERS), wspace=0.42)
+    bench_grid = outer[2].subgridspec(1, 3, wspace=0.28)
+    bench_axes = [fig.add_subplot(bench_grid[0, col]) for col in range(3)]
+    coef_ax = fig.add_subplot(outer[3])
+    size_grid = outer[4].subgridspec(1, len(SIZE_HYPERS), wspace=0.42)
     size_axes = [
         fig.add_subplot(size_grid[0, i]) for i in range(len(SIZE_HYPERS))
     ]
-    return fig, axes, coef_ax, size_axes
+    return fig, axes, bench_axes, coef_ax, size_axes
+
+
+def draw_replay_vs_coef(ax, summary, palette, markers=None):
+    """Human-replay score against the anchor coefficient."""
+    title = "Human replay score"
+    present = (
+        "replay_score" in summary.columns
+        and "anchor_coef" in summary.columns
+        and bool(summary["replay_score"].notna().any())
+        and bool(summary["anchor_coef"].notna().any())
+    )
+    if not present:
+        ax.set_axis_off()
+        ax.set_title(title)
+        ax.text(
+            0.5, 0.5, "no benchmark report",
+            ha="center", va="center", transform=ax.transAxes, color="0.45",
+        )
+        return
+    if markers is None:
+        sns.scatterplot(
+            data=summary, x="anchor_coef", y="replay_score", hue="series",
+            palette=palette, s=58, ax=ax, legend=False,
+            edgecolor="white", linewidth=0.6,
+        )
+    else:
+        scatter_phases(
+            summary, "anchor_coef", "replay_score", ax, palette, markers,
+        )
+    ax.set_xscale("linear")
+    ax.set_ylim(-0.03, 1.03)
+    ax.set_xlabel("anchor coef")
+    ax.set_ylabel("score")
+    ax.set_title(title)
+
+
+def horizon_cap():
+    """Episode length when the benchmark configures one horizon."""
+    path = ROOT / "config" / "benchmark.ini"
+    if not path.is_file():
+        return None
+    raw = section_text(path.read_text(), "horizon", "horizons")
+    if raw is None:
+        return None
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if len(parts) != 1:
+        return None
+    try:
+        cap = float(parts[0])
+    except ValueError:
+        return None
+    if cap <= 0.0:
+        return None
+    return cap
+
+
+def draw_benchmark(axes, summary, palette, x, markers=None):
+    """Replay collision, human-replay score, and the long-horizon score."""
+    xlabel = "sweep index" if x == "run" else "run order"
+    for ax, (key, ylabel, title) in zip(axes, BENCH_PANELS):
+        if key == "replay_score":
+            draw_replay_vs_coef(ax, summary, palette, markers)
+            continue
+        present = key in summary.columns and bool(summary[key].notna().any())
+        if not present:
+            ax.set_axis_off()
+            ax.set_title(title)
+            ax.text(
+                0.5, 0.5, "no benchmark report",
+                ha="center", va="center", transform=ax.transAxes, color="0.45",
+            )
+            continue
+        if markers is None:
+            sns.scatterplot(
+                data=summary, x=x, y=key, hue="series",
+                palette=palette, s=58, ax=ax, legend=False,
+                edgecolor="white", linewidth=0.6,
+            )
+        else:
+            scatter_phases(summary, x, key, ax, palette, markers)
+        if key == "horizon_score":
+            cap = horizon_cap()
+            if cap is None:
+                ax.set_ylim(bottom=0.0)
+            else:
+                ax.set_ylim(0.0, cap)
+        else:
+            ax.set_ylim(-0.03, 1.03)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
 
 
 def draw_hypers(ax, summary, palette, fields):
@@ -321,6 +531,54 @@ def draw_size_panel(ax, summary, palette, label):
     ax.tick_params(axis="x", labelbottom=False)
 
 
+def objective_label(names):
+    """One ylabel when every trial optimized the same metric."""
+    cleaned = []
+    for name in names:
+        if name is None or name != name:
+            continue
+        text = str(name).strip()
+        if text:
+            cleaned.append(text)
+    if len(set(cleaned)) != 1:
+        return "objective"
+    name = cleaned[0]
+    if name in OBJECTIVE_LABELS:
+        return OBJECTIVE_LABELS[name]
+    return name.replace("_", " ")
+
+
+def draw_objective(ax, summary, palette, x, markers=None):
+    """Protein's trial score. The benchmark report names it when one exists."""
+    title = "Sweep objective"
+    present = (
+        "objective" in summary.columns
+        and bool(summary["objective"].notna().any())
+    )
+    if not present:
+        ax.set_axis_off()
+        ax.set_title(title)
+        return
+    if markers is None:
+        sns.scatterplot(
+            data=summary, x=x, y="objective", hue="series",
+            palette=palette, s=58, ax=ax, legend=False,
+            edgecolor="white", linewidth=0.6,
+        )
+    else:
+        scatter_phases(summary, x, "objective", ax, palette, markers)
+    values = summary["objective"].dropna()
+    if len(values) and bool(((values >= 0.0) & (values <= 1.0)).all()):
+        ax.set_ylim(-0.03, 1.03)
+    xlabel = "sweep index" if x == "run" else "run order"
+    names = []
+    if "objective_name" in summary.columns:
+        names = summary["objective_name"].tolist()
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(objective_label(names))
+    ax.set_title(title)
+
+
 def draw(returns, collisions, counts, summary, out):
     sns.set_theme(style="whitegrid", context="notebook")
     palette = categorical_palette(summary["run"])
@@ -330,20 +588,9 @@ def draw(returns, collisions, counts, summary, out):
     if len(counts):
         counts = with_series(counts)
 
-    fig, axes, hyper_ax, size_axes = figure_axes()
+    fig, axes, bench_axes, hyper_ax, size_axes = figure_axes()
 
-    if summary["score_quality"].notna().any():
-        sns.scatterplot(
-            data=summary, x="run", y="score_quality", hue="series",
-            palette=palette, s=58, ax=axes[0], legend=False,
-            edgecolor="white", linewidth=0.6,
-        )
-        axes[0].set_ylim(-0.03, 1.03)
-    else:
-        axes[0].set_axis_off()
-    axes[0].set_xlabel("sweep index")
-    axes[0].set_ylabel("score quality")
-    axes[0].set_title("Score quality")
+    draw_objective(axes[0], summary, palette, "run")
 
     if summary["score"].notna().any() and summary["collision_count"].notna().any():
         sns.scatterplot(
@@ -443,10 +690,11 @@ def draw(returns, collisions, counts, summary, out):
     axes[7].set_ylabel("parameters")
     axes[7].set_title("Network parameters")
 
+    draw_benchmark(bench_axes, summary, palette, "run")
     draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
     for ax, label in zip(size_axes, SIZE_HYPERS):
         draw_size_panel(ax, summary, palette, label)
-    for ax in list(axes) + [hyper_ax] + list(size_axes):
+    for ax in list(axes) + list(bench_axes) + [hyper_ax] + list(size_axes):
         sns.despine(ax=ax)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out)
@@ -482,7 +730,7 @@ def scatter_phases(summary, x, y, ax, palette, markers):
 
 
 def draw_overview(returns, collisions, counts, summary, out):
-    """Both physics phases. Score quality is colored by sweep index.
+    """Both physics phases. The sweep objective is the first panel.
 
     Through runs come first, then bump. Panels use Set1, one color per run,
     except episode return against run order, which is colored by wall clock.
@@ -490,17 +738,10 @@ def draw_overview(returns, collisions, counts, summary, out):
     """
     sns.set_theme(style="whitegrid", context="notebook")
     palette = series_palette(summary["series"])
-    fig, axes, hyper_ax, size_axes = figure_axes()
+    fig, axes, bench_axes, hyper_ax, size_axes = figure_axes()
     markers = {"through": "o", "bump": "s"}
 
-    if summary["score_quality"].notna().any():
-        scatter_phases(summary, "idx", "score_quality", axes[0], palette, markers)
-        axes[0].set_ylim(-0.03, 1.03)
-    else:
-        axes[0].set_axis_off()
-    axes[0].set_xlabel("run order")
-    axes[0].set_ylabel("score quality")
-    axes[0].set_title("Score quality")
+    draw_objective(axes[0], summary, palette, "idx", markers)
 
     if summary["score"].notna().any() and summary["collision_count"].notna().any():
         scatter_phases(summary, "collision_count", "score", axes[1], palette, markers)
@@ -606,6 +847,7 @@ def draw_overview(returns, collisions, counts, summary, out):
     axes[7].set_ylabel("parameters")
     axes[7].set_title("Network parameters")
 
+    draw_benchmark(bench_axes, summary, palette, "idx", markers)
     draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
     for ax, label in zip(size_axes, SIZE_HYPERS):
         draw_size_panel(ax, summary, palette, label)
@@ -617,7 +859,7 @@ def draw_overview(returns, collisions, counts, summary, out):
         ],
         loc="upper right", frameon=False,
     )
-    for ax in list(axes) + [hyper_ax] + list(size_axes):
+    for ax in list(axes) + list(bench_axes) + [hyper_ax] + list(size_axes):
         sns.despine(ax=ax)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out)
@@ -680,11 +922,15 @@ def main():
     )
     parser.add_argument(
         "-o", "--out", type=Path, default=ROOT / "logs" / "drive" / "sweep-panels.png",
-        help="output image under logs/drive",
+        help="output image under logs/drive or logs/replay_sweep",
     )
     args = parser.parse_args()
     out = args.out
-    if out.parent != ROOT / "logs" / "drive":
+    allowed = (
+        (ROOT / "logs" / "drive").resolve(),
+        (ROOT / "logs" / "replay_sweep").resolve(),
+    )
+    if out.parent.resolve() not in allowed:
         out = ROOT / "logs" / "drive" / out.name
     if args.phase:
         returns, collisions, counts, summary, missing = load_overview(args.phase)
