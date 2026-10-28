@@ -1276,7 +1276,8 @@ enum LossIdx {
 
 // Anchor penalty on the factorized action heads. kl is D_KL(anchor || policy),
 // the paper term. reverse_kl is D_KL(policy || anchor). wasserstein is 1D W1
-// on bin index (unit spacing), summed over heads like the KL.
+// on bin index (unit spacing), summed over heads like the KL. The drift mode
+// is not a fourth distance: it uses kl with a per-row coefficient.
 enum {
     ANCHOR_KL = 0,
     ANCHOR_REVERSE_KL = 1,
@@ -1693,25 +1694,35 @@ void ppo_loss_fwd_bwd(
         losses_acc, bufs.ppo_partials.data, ppo_grid);
 }
 
-// One sample, one thread. Adds coef/NT * d(distance)/d(policy logits) into grad.
-// Distance partials are the unweighted mean (sum of per-head distances).
+// One sample, one thread. Adds row_coef/NT * d(distance)/d(policy logits).
+// beta == NULL uses the scalar coef for every row. Otherwise beta[idx] is
+// that row's coefficient and coef is ignored.
+// partials[block] is the unweighted mean distance.
+// partials[gridDim + block] is the mean of row_coef * distance, which is
+// what LOSS_TOTAL adds, so the logged total matches the gradient.
 __global__ void anchor_distance_kernel(
         float* __restrict__ grad,
         const precision_t* __restrict__ policy,
         const precision_t* __restrict__ anchor,
         const int* __restrict__ act_sizes,
         float* __restrict__ partials,
-        int A_total, int nt, int dist, float coef) {
+        int A_total, int nt, int dist, float coef,
+        const float* __restrict__ beta) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int tid = threadIdx.x;
     float inv_nt = 1.0f / (float)nt;
     float mine = 0.0f;
+    float weighted = 0.0f;
     if (idx < nt) {
         int fused = A_total + 1;
         const precision_t* prow = policy + idx * fused;
         const precision_t* arow = anchor + idx * A_total;
         float* grow = grad + idx * A_total;
-        float scale = coef * inv_nt;
+        float row_coef = coef;
+        if (beta != NULL) {
+            row_coef = beta[idx];
+        }
+        float scale = row_coef * inv_nt;
         int off = 0;
         float dist_sum = 0.0f;
         for (int h = 0; h < NUM_ATNS; h++) {
@@ -1809,30 +1820,37 @@ __global__ void anchor_distance_kernel(
             off += A;
         }
         mine = dist_sum * inv_nt;
+        weighted = row_coef * mine;
     }
     __shared__ float smem[PPO_THREADS];
     smem[tid] = mine;
     block_reduce_sum(smem, &partials[blockIdx.x], tid, PPO_THREADS, 1);
+    __syncthreads();
+    smem[tid] = weighted;
+    block_reduce_sum(smem, &partials[gridDim.x + blockIdx.x], tid, PPO_THREADS, 1);
 }
 
 __global__ void anchor_loss_reduce(float* __restrict__ losses,
-        const float* __restrict__ partials, int nblocks, float coef) {
+        const float* __restrict__ partials, int nblocks) {
     float sum = 0.0f;
+    float wsum = 0.0f;
     for (int b = 0; b < nblocks; b++) {
         sum += partials[b];
+        wsum += partials[nblocks + b];
     }
     losses[LOSS_ANCHOR] += sum;
-    losses[LOSS_TOTAL] += coef * sum;
+    losses[LOSS_TOTAL] += wsum;
 }
 
 void anchor_distance(precision_t* policy, precision_t* anchor, float* grad,
         int* act_sizes, float* losses, float* partials,
-        int A_total, int nt, int dist, float coef, cudaStream_t stream) {
+        int A_total, int nt, int dist, float coef, const float* beta,
+        cudaStream_t stream) {
     int blocks = (nt + PPO_THREADS - 1) / PPO_THREADS;
     anchor_distance_kernel<<<blocks, PPO_THREADS, 0, stream>>>(
         grad, policy, anchor, act_sizes, partials,
-        A_total, nt, dist, coef);
-    anchor_loss_reduce<<<1, 1, 0, stream>>>(losses, partials, blocks, coef);
+        A_total, nt, dist, coef, beta);
+    anchor_loss_reduce<<<1, 1, 0, stream>>>(losses, partials, blocks);
 }
 
 // Fixture from an independent torch autograd of the three distances.
@@ -1873,7 +1891,7 @@ void anchor_distance_selfcheck() {
     assert(cudaMalloc(&anc, A_total * sizeof(precision_t)) == cudaSuccess);
     assert(cudaMalloc(&grad, A_total * sizeof(float)) == cudaSuccess);
     assert(cudaMalloc(&losses, NUM_LOSSES * sizeof(float)) == cudaSuccess);
-    assert(cudaMalloc(&partials, sizeof(float)) == cudaSuccess);
+    assert(cudaMalloc(&partials, 2 * sizeof(float)) == cudaSuccess);
     assert(cudaMalloc(&sizes, 2 * sizeof(int)) == cudaSuccess);
     assert(cudaMalloc(&stage, fused * sizeof(float)) == cudaSuccess);
     cudaMemcpy(sizes, sizes_h, 2 * sizeof(int), cudaMemcpyHostToDevice);
@@ -1886,7 +1904,7 @@ void anchor_distance_selfcheck() {
         cudaMemset(grad, 0, A_total * sizeof(float));
         cudaMemset(losses, 0, NUM_LOSSES * sizeof(float));
         anchor_distance(pol, anc, grad, sizes, losses, partials,
-            A_total, nt, dist, 1.0f, 0);
+            A_total, nt, dist, 1.0f, NULL, 0);
         cudaDeviceSynchronize();
         float got_d;
         float got_g[6];
@@ -1906,6 +1924,36 @@ void anchor_distance_selfcheck() {
             }
         }
     }
+    // Per-row beta replaces coef. 99 must not leak into the gradient.
+    float half = 0.5f;
+    float* dhalf = NULL;
+    assert(cudaMalloc(&dhalf, sizeof(float)) == cudaSuccess);
+    cudaMemcpy(dhalf, &half, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(grad, 0, A_total * sizeof(float));
+    cudaMemset(losses, 0, NUM_LOSSES * sizeof(float));
+    anchor_distance(pol, anc, grad, sizes, losses, partials,
+        A_total, nt, 0, 99.0f, dhalf, 0);
+    cudaDeviceSynchronize();
+    float got_d = 0.0f;
+    float got_total = 0.0f;
+    float got_g[6];
+    cudaMemcpy(&got_d, losses + LOSS_ANCHOR, sizeof(float),
+        cudaMemcpyDeviceToHost);
+    cudaMemcpy(&got_total, losses + LOSS_TOTAL, sizeof(float),
+        cudaMemcpyDeviceToHost);
+    cudaMemcpy(got_g, grad, sizeof(got_g), cudaMemcpyDeviceToHost);
+    if (fabsf(got_d - (float)expect_d[0]) > 1e-4f
+            || fabsf(got_total - 0.5f * (float)expect_d[0]) > 1e-4f) {
+        printf("anchor beta distance %g total %g\n", got_d, got_total);
+        assert(0 && "anchor beta self-check");
+    }
+    for (int i = 0; i < 6; i++) {
+        if (fabsf(got_g[i] - 0.5f * (float)expect_g[0][i]) > 1e-4f) {
+            printf("anchor beta grad i %d got %g\n", i, got_g[i]);
+            assert(0 && "anchor beta self-check");
+        }
+    }
+    cudaFree(dhalf);
     cudaFree(pol);
     cudaFree(anc);
     cudaFree(grad);
