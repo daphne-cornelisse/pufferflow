@@ -636,6 +636,59 @@ void free_puffernet(PufferNet* net) {
 #include "offline.h"
 #pragma clang diagnostic pop
 #include "anchor_interactive.h"
+#include "benchmark.h"
+
+// One net per OpenMP thread. Weights are shared. State is not.
+typedef struct BenchNets {
+    PufferNet** nets;
+    int n;
+} BenchNets;
+
+// Argmax. forward_puffernet samples, which is the player, not this eval.
+static void bench_greedy(void* ctx, const float* obs, int n,
+        float* actions, const float* terminals) {
+    BenchNets* group = ctx;
+    int slot = 0;
+    PufferNet* net;
+#ifdef _OPENMP
+    if (omp_in_parallel()) {
+        slot = omp_get_thread_num();
+    }
+#endif
+    assert(slot >= 0 && slot < group->n);
+    net = group->nets[slot];
+    assert(net->num_agents == n);
+    assert(!net->is_continuous);
+    mingru_zero_term(net->mingru, terminals);
+    linear(net->encoder, (float*)obs);
+    mingru(net->mingru, net->encoder->output);
+    linear(net->decoder, net->mingru->output);
+    multidiscrete(net->multidiscrete, net->decoder->output, actions, 1, NULL);
+}
+
+static int bench_split_horizons(const char* text, int* out, int cap) {
+    char buf[128];
+    char* save = NULL;
+    char* tok;
+    int n = 0;
+    snprintf(buf, sizeof(buf), "%s", text);
+    tok = strtok_r(buf, ",", &save);
+    while (tok) {
+        int length;
+        while (*tok == ' ') {
+            tok++;
+        }
+        if (*tok) {
+            length = atoi(tok);
+            assert(n < cap);
+            assert(length >= 2);
+            out[n] = length;
+            n++;
+        }
+        tok = strtok_r(NULL, ",", &save);
+    }
+    return n;
+}
 #endif
 
 #if !defined(PUF_NMMO3_NET) && !defined(PUF_ASTEROIDS_NET) && !defined(PUF_MINIMAL_NET) && !defined(PUF_CRAFTAX_NET)
@@ -806,6 +859,11 @@ int main(int argc, char** argv) {
     const char* cli_path = NULL;
     int cli_latest = 0;
     const char* anchor_path = NULL;
+    int benchmark = 0;
+    int bench_scenes = -1;
+    int bench_rollouts = -1;
+    char bench_horizons_text[128] = {0};
+    char bench_out[512] = {0};
     int saw_data_dir = 0;
     int saw_map_id = 0;
     int saw_episode = 0;
@@ -832,6 +890,35 @@ int main(int argc, char** argv) {
         }
         if (strncmp(argv[i], "--anchor=", 9) == 0) {
             anchor_path = argv[i] + 9;
+            continue;
+        }
+        if (strcmp(argv[i], "--benchmark") == 0) {
+            benchmark = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                cli_path = argv[++i];
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--benchmark=", 12) == 0) {
+            benchmark = 1;
+            cli_path = argv[i] + 12;
+            continue;
+        }
+        if (strncmp(argv[i], "--benchmark-scenes=", 19) == 0) {
+            bench_scenes = atoi(argv[i] + 19);
+            continue;
+        }
+        if (strncmp(argv[i], "--benchmark-rollouts=", 21) == 0) {
+            bench_rollouts = atoi(argv[i] + 21);
+            continue;
+        }
+        if (strncmp(argv[i], "--benchmark-horizons=", 21) == 0) {
+            snprintf(bench_horizons_text, sizeof(bench_horizons_text),
+                "%s", argv[i] + 21);
+            continue;
+        }
+        if (strncmp(argv[i], "--benchmark-out=", 16) == 0) {
+            snprintf(bench_out, sizeof(bench_out), "%s", argv[i] + 16);
             continue;
         }
         if (strcmp(argv[i], "--headless") == 0) {
@@ -863,6 +950,10 @@ int main(int argc, char** argv) {
 #ifndef PUFFER_DRIVE
     if (anchor_path) {
         fprintf(stderr, "--anchor is the drive player\n");
+        return 1;
+    }
+    if (benchmark) {
+        fprintf(stderr, "--benchmark is the drive player\n");
         return 1;
     }
 #else
@@ -947,6 +1038,84 @@ int main(int argc, char** argv) {
 #endif
 
 #ifdef PUFFER_DRIVE
+    if (benchmark && anchor_path) {
+        fprintf(stderr, "--benchmark cannot be combined with --anchor\n");
+        return 1;
+    }
+    if (benchmark) {
+        BenchCfg spec;
+        BenchPolicy replay_pol;
+        BenchPolicy horizon_pol;
+        BenchNets replay_group;
+        BenchNets horizon_group;
+        PufferNet** replay_nets;
+        PufferNet* horizon_net;
+        int nthreads = 1;
+        int t;
+        if (!have_net) {
+            fprintf(stderr, "benchmark checkpoint did not load (%s)\n",
+                path ? path : "-");
+            return 1;
+        }
+        bench_cfg_load(&spec);
+        if (bench_scenes >= 0) {
+            spec.scenes = bench_scenes;
+        }
+        if (bench_rollouts >= 0) {
+            spec.rollouts = bench_rollouts;
+        }
+        if (bench_horizons_text[0]) {
+            spec.n_horizons = bench_split_horizons(bench_horizons_text,
+                spec.horizons, BENCH_HORIZON_MAX);
+        }
+        if (bench_out[0]) {
+            bench_copy(spec.out_dir, (int)sizeof(spec.out_dir), bench_out);
+        }
+        assert(spec.scenes >= 0);
+        assert(spec.agents >= 1 && spec.agents <= DRIVE_AGENT_MAX);
+        assert(spec.rollouts >= 1);
+        assert(spec.n_horizons >= 1);
+#ifdef _OPENMP
+        nthreads = omp_get_max_threads();
+#endif
+        if (nthreads < 1) {
+            nthreads = 1;
+        }
+        replay_nets = calloc((size_t)nthreads, sizeof(PufferNet*));
+        assert(replay_nets);
+        for (t = 0; t < nthreads; t++) {
+            weights->idx = 0;
+            replay_nets[t] = make_puffernet(weights, 1, OBS_SIZE,
+                hidden_size, num_layers, act_sizes, num_actions);
+        }
+        weights->idx = 0;
+        horizon_net = make_puffernet(weights, spec.agents, OBS_SIZE,
+            hidden_size, num_layers, act_sizes, num_actions);
+        replay_group.nets = replay_nets;
+        replay_group.n = nthreads;
+        horizon_group.nets = &horizon_net;
+        horizon_group.n = 1;
+        replay_pol.ctx = &replay_group;
+        replay_pol.batch = 1;
+        replay_pol.threads = nthreads;
+        replay_pol.act = bench_greedy;
+        horizon_pol.ctx = &horizon_group;
+        horizon_pol.batch = spec.agents;
+        horizon_pol.threads = 1;
+        horizon_pol.act = bench_greedy;
+        printf("benchmark %s  hidden %d  layers %d  threads %d\n",
+            path, hidden_size, num_layers, nthreads);
+        fflush(stdout);
+        bench_run(env_sec, &spec, &replay_pol, &horizon_pol, path);
+        for (t = 0; t < nthreads; t++) {
+            free_puffernet(replay_nets[t]);
+        }
+        free(replay_nets);
+        free_puffernet(horizon_net);
+        free(weights);
+        puf_ini_free(&ini);
+        return 0;
+    }
     if (anchor_path) {
         if (!saw_data_dir) {
             dict_set_str(env_sec, "data_dir", "data/womd");

@@ -4158,6 +4158,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     char eval_ckpt[4096] = {0};
     if (final_checkpoint[0]) {
         snprintf(eval_ckpt, sizeof(eval_ckpt), "%s", final_checkpoint);
+        puf_ini_put(ini, "base.load_model_path", eval_ckpt);
     }
     // Close every rank before rank-0 eval. Eval on the live DP trainer leaves
     // child vec workers in BUF_RUNNING/BUF_WAITING while rank 0 waitpid()s
@@ -4309,6 +4310,112 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     return result;
 }
 
+// Human-replay score from config/benchmark.ini. Empty sweep_metric keeps
+// the training score. A sweep worker (result_fd) or after_train runs it.
+static int bench_cfg_metric(char* metric, int n, int* after_train) {
+    Ini bench = {0};
+    const char* name;
+    if (access("config/benchmark.ini", R_OK) != 0) {
+        return 0;
+    }
+    puf_ini_load_file(&bench, "config/benchmark.ini");
+    name = puf_ini_get_str(&bench, "benchmark", "sweep_metric");
+    snprintf(metric, (size_t)n, "%s", name ? name : "");
+    *after_train = (int)puf_ini_get(&bench, "benchmark", "after_train");
+    puf_ini_free(&bench);
+    return metric[0] != 0;
+}
+
+static float bench_report_value(const char* path, const char* metric) {
+    FILE* fp = fopen(path, "r");
+    char line[256];
+    float value = 0.0f;
+    int found = 0;
+    if (!fp) {
+        fprintf(stderr, "replay objective: missing %s\n", path);
+        exit(1);
+    }
+    while (fgets(line, (int)sizeof(line), fp)) {
+        char key[64];
+        float v = 0.0f;
+        if (sscanf(line, "sweep %63s %f", key, &v) == 2
+                && strcmp(key, metric) == 0) {
+            value = v;
+            found = 1;
+        }
+    }
+    fclose(fp);
+    if (!found) {
+        fprintf(stderr, "replay objective: %s not in %s\n", metric, path);
+        exit(1);
+    }
+    return value;
+}
+
+static void apply_replay_objective(Ini* ini, TrainResult* result) {
+    char metric[64];
+    char out_dir[512];
+    char report[576];
+    char bench_arg[1024];
+    char out_arg[576];
+    char* argv[4];
+    const char* ckpt;
+    const char* run_id;
+    int after_train = 0;
+    int result_fd;
+    int status = 0;
+    pid_t pid = 0;
+    float score;
+    if (!bench_cfg_metric(metric, (int)sizeof(metric), &after_train)) {
+        return;
+    }
+    result_fd = (int)puf_ini_get(ini, "base", "result_fd");
+    if (result_fd <= 0 && !after_train) {
+        return;
+    }
+    ckpt = puf_ini_get_str(ini, "base", "load_model_path");
+    if (!ckpt || !ckpt[0] || strcmp(ckpt, "None") == 0
+            || strcmp(ckpt, "'None'") == 0) {
+        fprintf(stderr, "replay objective: no checkpoint\n");
+        exit(1);
+    }
+    run_id = puf_ini_get_str(ini, "base", "run_id");
+    snprintf(out_dir, sizeof(out_dir), "analysis/benchmark/%s", run_id);
+    snprintf(bench_arg, sizeof(bench_arg), "--benchmark=%s", ckpt);
+    snprintf(out_arg, sizeof(out_arg), "--benchmark-out=%s", out_dir);
+    argv[0] = (char*)"./drive";
+    argv[1] = bench_arg;
+    argv[2] = out_arg;
+    argv[3] = NULL;
+    fprintf(stderr, "replay objective %s %s\n", metric, ckpt);
+    if (posix_spawn(&pid, "./drive", NULL, NULL, argv, environ) != 0) {
+        perror("replay objective");
+        exit(1);
+    }
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status)
+            || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "replay objective benchmark failed\n");
+        exit(1);
+    }
+    snprintf(report, sizeof(report), "%s/report.txt", out_dir);
+    // "score" still logs replay and horizon, and protein keeps env/score.
+    if (strcmp(metric, "score") == 0) {
+        if (access(report, R_OK) != 0) {
+            fprintf(stderr, "replay objective: missing %s\n", report);
+            exit(1);
+        }
+        fprintf(stderr, "replay objective kept training score\n");
+        return;
+    }
+    score = bench_report_value(report, metric);
+    // One protein point. The training curve stays in the run ini.
+    result->score = score;
+    result->scores[0] = score;
+    result->points = 1;
+    result->costs[0] = result->cost;
+    result->step_points[0] = result->steps;
+    fprintf(stderr, "replay objective %s=%.6f\n", metric, score);
+}
 
 // Fork DP workers before any CUDA/NCCL call (those start runtime threads;
 // fork after that SIGSEGVs children and rank 0 hangs in ncclCommInitRank).
@@ -4394,6 +4501,7 @@ TrainResult launch_train(Ini* ini) {
         .nccl_id = nccl_ptr,
     };
     TrainResult result = run_train(ini, &host);
+    apply_replay_objective(ini, &result);
     if (world_size > 1) {
         close(nccl_pipe[1]);
     }
