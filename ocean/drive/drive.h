@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <math.h>
 #include <assert.h>
+#include <errno.h>
 #include <string.h>
 #include "raylib.h"
 typedef float obs_t;
@@ -22,19 +23,17 @@ struct Log {
     float episode_return;
     float episode_length;
     float perf;
+    // Safe arrivals / arrivals this episode. In [0, 1].
     float score;
-    float score_full_horizon;
-    // Clean first arrival, discounted by the jerk paid this episode.
-    // 0 when the car never scores. Equals score when the penalty is 0.
-    float score_quality;
     // Sum of the velocity-change penalty over the episode. Negative.
     float jerk;
     float offroad_rate;
     float collision_rate;
     float collision_count;
-    // Goals reached / goals sampled this episode. The goal still open
-    // at the end counts as sampled. In [0, 1]. A collision on the way
-    // still counts as reached; score_full_horizon is the clean share.
+    float steps_before_first_failure;
+    float total_distance_travelled;
+    float total_infractions;
+    float distance_before_first_failure;
     float completion_rate;
     float n;
 };
@@ -67,6 +66,8 @@ typedef struct Entity {
     int goals_completed;
     int goals_clean;
     int collided_this_goal;
+    // Set on the first vehicle overlap or off-road. Stays set for the episode.
+    int failed;
     int active_agent;
     int lane_node;
     // Signed speed and heading at the previous observation. dyn_ready
@@ -175,6 +176,8 @@ struct Env {
     float reward_vehicle_collision;
     float reward_offroad_collision;
     char* map_name;
+    // Index of map_%03d.bin. 0 Town01, 1 Town02, 2 Town06, 3 Town10HD.
+    int map_id;
     float world_mean_x;
     float world_mean_y;
     float reward_goal;
@@ -240,7 +243,11 @@ static int puf_sim_paused(Drive* env) {
 // Roads only.
 Entity* load_map_binary(const char* filename, Drive* env) {
     FILE* file = fopen(filename, "rb");
-    assert(file);
+    if (!file) {
+        fprintf(stderr, "load_map_binary: cannot open %s: %s\n",
+            filename ? filename : "(null)", strerror(errno));
+        exit(1);
+    }
     assert(fread(&env->num_roads, sizeof(int), 1, file) == 1);
     assert(env->num_roads >= 0);
     env->num_objects = 0;
@@ -1390,8 +1397,7 @@ static void sit_on_lane(Drive* env, Entity* e, int k) {
 // sit between the car and a point still inside the band.
 static void lane_reach(Drive* env, int src) {
     int n = env->lane_n;
-    float path_cap = env->goal_distance_max * 3.0f
-        + GOAL_FOLLOW_GAP + MIN_DISTANCE_TO_GOAL;
+    float path_cap = env->goal_distance_max * 3.0f + GOAL_FOLLOW_GAP;
     for (int i = 0; i < n; i++) {
         env->lane_dist[i] = -1.0f;
         env->lane_seen[i] = 0;
@@ -1511,12 +1517,12 @@ static float open_path_limit(float blocker) {
     if (blocker >= 1.0e29f) {
         return 1.0e30f;
     }
-    return blocker - (GOAL_FOLLOW_GAP + MIN_DISTANCE_TO_GOAL);
+    return blocker - GOAL_FOLLOW_GAP;
 }
 
-// Reservoir sample of forward nodes in the Euclidean band whose arrival
-// disk ends GOAL_FOLLOW_GAP meters before the next car. Returns 0 when
-// that window is empty.
+// Reservoir sample of forward nodes in the 5–50 m band whose path ends
+// GOAL_FOLLOW_GAP meters before the next car. Returns 0 when that
+// window is empty.
 static int pick_forward_goal(Drive* env, Entity* e, int self) {
     int node = e->lane_node;
     if (node < 0 || node >= env->lane_n) {
@@ -1614,6 +1620,7 @@ void initialize_env(Drive* env) {
         env->entities[i].goals_completed = 0;
         env->entities[i].goals_clean = 0;
         env->entities[i].collided_this_goal = 0;
+        env->entities[i].failed = 0;
     }
     for (int i = 0; i < n; i++) {
         assert(place_car(env, i) && "no free lane point");
@@ -1850,26 +1857,31 @@ void puf_step(Drive* env) {
 
     if (env->timestep == env->episode_length) {
         for (int i = 0; i < env->active_agent_count; i++) {
-            float full = 0.0f;
             float completion = 0.0f;
             if (env->entities[i].goals_sampled > 0) {
                 float sampled = (float)env->entities[i].goals_sampled;
-                full = (float)env->entities[i].goals_clean / sampled;
                 completion = (float)env->entities[i].goals_completed / sampled;
             }
-            env->logs[i].score_full_horizon = full;
             env->logs[i].completion_rate = completion;
             env->log.completion_rate += completion;
             env->log.offroad_rate += env->logs[i].offroad_rate;
             env->log.collision_rate += env->logs[i].collision_rate;
             env->log.collision_count += env->logs[i].collision_count;
+            env->log.steps_before_first_failure +=
+                env->logs[i].steps_before_first_failure;
+            env->log.total_distance_travelled +=
+                env->logs[i].total_distance_travelled;
+            env->log.total_infractions += env->logs[i].total_infractions;
+            env->log.distance_before_first_failure +=
+                env->logs[i].distance_before_first_failure;
+            // Every arrival this episode. The goal still open is not in n.
+            int reached = env->entities[i].goals_completed;
+            float safe = 0.0f;
+            if (reached > 0) {
+                safe = (float)env->entities[i].goals_clean / (float)reached;
+            }
+            env->logs[i].score = safe;
             env->log.score += env->logs[i].score;
-            env->log.score_full_horizon += full;
-            // Agents that never score stay at 0. exp(jerk) is 1 with no
-            // velocity change and falls as the penalty adds up.
-            float quality = env->logs[i].score * expf(env->logs[i].jerk);
-            env->logs[i].score_quality = quality;
-            env->log.score_quality += quality;
             env->log.jerk += env->logs[i].jerk;
             env->log.perf += env->logs[i].perf;
             env->log.episode_length += env->logs[i].episode_length;
@@ -1881,6 +1893,7 @@ void puf_step(Drive* env) {
     }
 
     float step_jerk[DRIVE_AGENT_MAX] = {0};
+    float step_distance[DRIVE_AGENT_MAX] = {0};
     for (int i = 0; i < env->active_agent_count; i++) {
         Entity* agent = &env->entities[i];
         if (agent->x == INVALID_POSITION) {
@@ -1893,13 +1906,16 @@ void puf_step(Drive* env) {
         float prev_vx = agent->vx;
         float prev_vy = agent->vy;
         move_dynamics(env, i);
+        // Path length for meters per infraction. Includes the contact step.
+        float speed = sqrtf(agent->vx * agent->vx + agent->vy * agent->vy);
+        step_distance[i] = speed * SIM_DT;
+        env->logs[i].total_distance_travelled += step_distance[i];
         float dvx = agent->vx - prev_vx;
         float dvy = agent->vy - prev_vy;
         step_jerk[i] = env->reward_jerk
             * sqrtf(dvx * dvx + dvy * dvy) / SIM_DT;
     }
 
-    // Collision detection and rewards
     for (int i = 0; i < env->active_agent_count; i++) {
         Entity* agent = &env->entities[i];
         if (agent->x == INVALID_POSITION) {
@@ -1919,10 +1935,15 @@ void puf_step(Drive* env) {
             env->logs[i].episode_return += env->reward_offroad_collision;
         }
         if (collision_state > NO_COLLISION) {
+            env->logs[i].total_infractions += 1.0f;
             agent->collided_this_goal = 1;
             if (agent->goals_completed == 0) {
                 agent->collided_before_goal = 1;
             }
+            agent->failed = 1;
+        } else if (!agent->failed) {
+            env->logs[i].steps_before_first_failure += 1.0f;
+            env->logs[i].distance_before_first_failure += step_distance[i];
         }
 
         float distance_to_goal = relative_distance_2d(
@@ -1941,14 +1962,12 @@ void puf_step(Drive* env) {
             if (!agent->collided_this_goal) {
                 agent->goals_clean++;
             }
-            // First arrival only. Later goals do not raise score.
+            // First clean arrival. Score is the full-episode safe share.
             if (agent->goals_completed == 1 && !agent->collided_before_goal) {
-                env->logs[i].score = 1.0f;
                 env->logs[i].perf = 1.0f;
             }
         }
 
-        // After the collision assignment, which writes rewards[0].
         float jerk_penalty = step_jerk[i];
         env->agents[i].rewards[0] += jerk_penalty;
         env->logs[i].episode_return += jerk_penalty;
@@ -1986,6 +2005,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->cfg = kwargs;
     env->use_action_values = 0;
     int map_id = dict_get(kwargs, "map_id");
+    env->map_id = map_id;
     char bin_dir[480];
     char map_file[512];
     snprintf(bin_dir, sizeof(bin_dir), "%s/binaries", dict_get_str(kwargs, "data_dir"));
@@ -2003,17 +2023,36 @@ void puf_init(Env* env, Dict* kwargs) {
     }
 }
 
+// Logged as env/score_town_01 and so on. Town10HD is score_town_10.
+static const char* drive_score_town_key(int map_id) {
+    switch (map_id) {
+    case 0: return "score_town_01";
+    case 1: return "score_town_02";
+    case 2: return "score_town_06";
+    case 3: return "score_town_10";
+    default: return NULL;
+    }
+}
+
 void puf_log(Log* log, Dict* out) {
     dict_set(out, "perf", log->perf);
     dict_set(out, "score", log->score);
-    dict_set(out, "score_full_horizon", log->score_full_horizon);
-    dict_set(out, "score_quality", log->score_quality);
     dict_set(out, "jerk", log->jerk);
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
     dict_set(out, "offroad_rate", log->offroad_rate);
     dict_set(out, "collision_rate", log->collision_rate);
     dict_set(out, "collision_count", log->collision_count);
+    dict_set(out, "steps_before_first_failure", log->steps_before_first_failure);
+    dict_set(out, "distance_before_first_failure",
+        log->distance_before_first_failure);
+    // Meters per infraction step. With none, the meters driven.
+    float avg_distance_per_infraction = log->total_distance_travelled;
+    if (log->total_infractions > 0.0f) {
+        avg_distance_per_infraction =
+            log->total_distance_travelled / log->total_infractions;
+    }
+    dict_set(out, "avg_distance_per_infraction", avg_distance_per_infraction);
     dict_set(out, "n", log->n);
     dict_set(out, "completion_rate", log->completion_rate);
 }

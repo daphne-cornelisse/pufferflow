@@ -162,6 +162,6 @@ static const int collision_offsets[25][2] = {
 #define LANE_STITCH 1.0f
 #define LANE_HEADING_DOT 0.5f
 #define LANE_CAR_RADIUS 2.5f
-#define GOAL_FOLLOW_GAP 8.0f
+#define GOAL_FOLLOW_GAP 2.0f
 #define LANE_NODE_SNAP 4.0f
 #define LANE_SUCC_MAX 32
