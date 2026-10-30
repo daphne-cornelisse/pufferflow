@@ -57,7 +57,8 @@ static inline void dict_reserve(Dict* dict, int cap) {
 }
 
 static inline DictItem* dict_insert(Dict* dict, const char* key) {
-    if (strlen(key) >= PUF_DICT_MAX_KEY) {
+    size_t n = strlen(key);
+    if (n >= PUF_DICT_MAX_KEY) {
         fprintf(stderr, "dict key too long: %s\n", key);
         exit(1);
     }
@@ -67,7 +68,7 @@ static inline DictItem* dict_insert(Dict* dict, const char* key) {
 
     DictItem* item = &dict->items[dict->size++];
     memset(item, 0, sizeof(*item));
-    snprintf(item->key, sizeof(item->key), "%s", key);
+    memcpy(item->key, key, n + 1);
     return item;
 }
 

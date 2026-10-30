@@ -304,7 +304,7 @@ if [ "$MODE" = "cpu" ]; then
         "${LINK_ARCHIVES[@]}"
         "${EXTRA_LDFLAGS[@]}"
         "${STANDALONE_LDFLAGS[@]}"
-        -lm -lpthread "${OMP_FLAGS[@]}"
+        -lm -lpthread -ldl "${OMP_FLAGS[@]}"
         -DPLATFORM_DESKTOP
         "${STANDALONE_DEFINES[@]}"
         "${EXTRA_CFLAGS[@]}"
