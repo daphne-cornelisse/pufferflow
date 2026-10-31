@@ -28,11 +28,11 @@
 #ifndef MAX_AGENTS
 #define MAX_AGENTS 64
 #endif
-// Cars one map copy may hold. config num_agents must be in 1..this.
-// A throughput binary may raise this with -DDRIVE_AGENT_MAX without
-// changing the observation width.
+// Cars one map copy may hold. ./build.sh drive sets this from
+// config/drive.ini num_agents. Observation width stays MAX_AGENTS.
+// A density binary may raise it with -DDRIVE_AGENT_MAX.
 #ifndef DRIVE_AGENT_MAX
-#define DRIVE_AGENT_MAX 128
+#define DRIVE_AGENT_MAX 256
 #endif
 
 // Collision state

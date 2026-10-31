@@ -23,9 +23,7 @@ struct Log {
     float episode_return;
     float episode_length;
     float perf;
-    // Safe arrivals / arrivals this episode. In [0, 1].
     float score;
-    // Sum of the velocity-change penalty over the episode. Negative.
     float jerk;
     float offroad_rate;
     float collision_rate;
@@ -66,7 +64,6 @@ typedef struct Entity {
     int goals_completed;
     int goals_clean;
     int collided_this_goal;
-    // Set on the first vehicle overlap or off-road. Stays set for the episode.
     int failed;
     int active_agent;
     int lane_node;
@@ -156,7 +153,6 @@ struct Env {
     int tag;
     int boundary_reached;
     int max_agents;
-    // Cars on this map. Entity i is agent i. Roads follow the cars.
     int active_agent_count;
     int selected_agent_idx;
     Entity* entities;
@@ -184,7 +180,6 @@ struct Env {
     float reward_jerk;
     int collision_physics;
     unsigned int rng;
-    // 1 when a loaded checkpoint is driving. 0 draws the rejection line.
     int checkpoint_ok;
     char checkpoint_error[256];
     // Euclidean goal band, meters. The point is on the forward centerline.
@@ -511,7 +506,6 @@ int get_neighbor_cache_entities(Drive* env, int cell_idx,
     return pairs;
 }
 
-// Mean Centering
 void set_means(Drive* env) {
     float mean_x = 0.0f;
     float mean_y = 0.0f;
@@ -552,7 +546,6 @@ void set_means(Drive* env) {
     }
 }
 
-// Collision detection
 int check_line_intersection(float p1[2], float p2[2],
         float q1[2], float q2[2]) {
     if (fmax(p1[0], p2[0]) < fmin(q1[0], q2[0])
@@ -654,7 +647,6 @@ int check_aabb_collision(Entity* car1, Entity* car2) {
     return 1;
 }
 
-// Half-extent of the car's box along a unit axis.
 static float box_radius(const Entity* e, float nx, float ny) {
     float hl = e->length * 0.5f;
     float hw = e->width * 0.5f;
@@ -1867,13 +1859,10 @@ void puf_step(Drive* env) {
             env->log.offroad_rate += env->logs[i].offroad_rate;
             env->log.collision_rate += env->logs[i].collision_rate;
             env->log.collision_count += env->logs[i].collision_count;
-            env->log.steps_before_first_failure +=
-                env->logs[i].steps_before_first_failure;
-            env->log.total_distance_travelled +=
-                env->logs[i].total_distance_travelled;
+            env->log.steps_before_first_failure += env->logs[i].steps_before_first_failure;
+            env->log.total_distance_travelled += env->logs[i].total_distance_travelled;
             env->log.total_infractions += env->logs[i].total_infractions;
-            env->log.distance_before_first_failure +=
-                env->logs[i].distance_before_first_failure;
+            env->log.distance_before_first_failure += env->logs[i].distance_before_first_failure;
             // Every arrival this episode. The goal still open is not in n.
             int reached = env->entities[i].goals_completed;
             float safe = 0.0f;
@@ -2044,13 +2033,10 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "collision_rate", log->collision_rate);
     dict_set(out, "collision_count", log->collision_count);
     dict_set(out, "steps_before_first_failure", log->steps_before_first_failure);
-    dict_set(out, "distance_before_first_failure",
-        log->distance_before_first_failure);
-    // Meters per infraction step. With none, the meters driven.
+    dict_set(out, "distance_before_first_failure", log->distance_before_first_failure);
     float avg_distance_per_infraction = log->total_distance_travelled;
     if (log->total_infractions > 0.0f) {
-        avg_distance_per_infraction =
-            log->total_distance_travelled / log->total_infractions;
+        avg_distance_per_infraction = log->total_distance_travelled / log->total_infractions;
     }
     dict_set(out, "avg_distance_per_infraction", avg_distance_per_infraction);
     dict_set(out, "n", log->n);

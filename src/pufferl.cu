@@ -514,9 +514,7 @@ struct AnchorLayer {
 struct Anchor {
     int on;
     int dist;
-    int drift;
     float coef;
-    float alpha;
     int n_layers;
     int in_dim;
     int width;
@@ -528,10 +526,6 @@ struct Anchor {
     AnchorLayer layer[ANCHOR_MAX_LAYERS];
     precision_t* head_w[NUM_ATNS];
     precision_t* head_b[NUM_ATNS];
-    precision_t* drift_w;
-    precision_t* drift_b;
-    precision_t* drift_y;
-    float* beta;
     precision_t* norm;
     precision_t* hid[2];
     precision_t* scratch;
@@ -1633,22 +1627,6 @@ static void anchor_gemm(precision_t* x, int nt, int k,
     puf_mm_nn(&a, &b, &c, stream, 1.0f, 0.0f, handle);
 }
 
-// V is the raw linear head. Negative predictions clamp to 0, which keeps
-// beta at coef. beta_i = coef / (1 + alpha * max(V_i, 0)).
-__global__ void anchor_drift_beta(float* beta, precision_t* pred,
-        const precision_t* bias, int nt, float coef, float alpha) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nt) {
-        return;
-    }
-    float v = to_float(pred[i]) + to_float(bias[0]);
-    pred[i] = from_float(v);
-    if (v < 0.0f) {
-        v = 0.0f;
-    }
-    beta[i] = coef / (1.0f + alpha * v);
-}
-
 // obs is flat (nt, in_dim), same order as the squeezed train minibatch.
 static void anchor_forward(Anchor* a, precision_t* obs, int nt,
         cudaStream_t stream, cublasHandle_t handle) {
@@ -1677,12 +1655,6 @@ static void anchor_forward(Anchor* a, precision_t* obs, int nt,
             a->logits, a->scratch, a->head_b[h],
             nt, A, a->a_total, offset);
         offset += A;
-    }
-    if (a->drift) {
-        anchor_gemm(src, nt, src_n, a->drift_w, 1, a->drift_y,
-            stream, handle);
-        anchor_drift_beta<<<grid_size(nt), BLOCK_SIZE, 0, stream>>>(
-            a->beta, a->drift_y, a->drift_b, nt, a->coef, a->alpha);
     }
 }
 
@@ -1826,9 +1798,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
                 pufferl->ppo_bufs.grad_logits.data, pufferl->act_sizes,
                 pufferl->losses, pufferl->anchor.partials,
                 A_total, nt, pufferl->anchor.dist,
-                pufferl->anchor.coef,
-                pufferl->anchor.drift ? pufferl->anchor.beta : NULL,
-                stream);
+                pufferl->anchor.coef, stream);
         }
 
         Float grad_logits = pufferl->ppo_bufs.grad_logits;
@@ -2342,8 +2312,7 @@ static void anchor_d2h(float* dst, precision_t* src, int n,
 static void anchor_cpu_row(float* dst, const float* obs,
         float** W, float** b, int* lin, int* lout, int n_layers,
         float** hw, float** hb, int* heads,
-        const float* mu, const float* sig, int in_dim, int cap,
-        const float* drift_w, float drift_b, float* drift_v) {
+        const float* mu, const float* sig, int in_dim, int cap) {
     float* cur = (float*)malloc((size_t)cap * sizeof(float));
     float* nxt = (float*)malloc((size_t)cap * sizeof(float));
     assert(cur && nxt);
@@ -2372,13 +2341,6 @@ static void anchor_cpu_row(float* dst, const float* obs,
         nxt = swap;
         n = out;
     }
-    if (drift_v) {
-        float v = drift_b;
-        for (int k = 0; k < n; k++) {
-            v += cur[k] * drift_w[k];
-        }
-        *drift_v = v;
-    }
     int off = 0;
     for (int h = 0; h < NUM_ATNS; h++) {
         int A = heads[h];
@@ -2395,8 +2357,7 @@ static void anchor_cpu_row(float* dst, const float* obs,
     free(nxt);
 }
 
-static int anchor_dist_id(const char* s, int* drift) {
-    *drift = 0;
+static int anchor_dist_id(const char* s) {
     if (strcmp(s, "kl") == 0) {
         return ANCHOR_KL;
     }
@@ -2405,10 +2366,6 @@ static int anchor_dist_id(const char* s, int* drift) {
     }
     if (strcmp(s, "wasserstein") == 0) {
         return ANCHOR_WASSERSTEIN;
-    }
-    if (strcmp(s, "drift") == 0) {
-        *drift = 1;
-        return ANCHOR_KL;
     }
     printf("anchor_dist %s\n", s);
     assert(0 && "anchor_dist");
@@ -2420,14 +2377,9 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
     Anchor* a = &p->anchor;
     const char* dist_s = puf_ini_get_str(ini, "train", "anchor_dist");
     const char* path = puf_ini_get_str(ini, "train", "anchor");
-    a->dist = anchor_dist_id(dist_s, &a->drift);
+    a->dist = anchor_dist_id(dist_s);
     a->coef = (float)puf_ini_get(ini, "train", "anchor_coef");
-    a->alpha = (float)puf_ini_get(ini, "train", "anchor_drift_alpha");
     a->on = 0;
-    a->drift_w = NULL;
-    a->drift_b = NULL;
-    a->drift_y = NULL;
-    a->beta = NULL;
     if (path[0] == 0) {
         return;
     }
@@ -2506,20 +2458,6 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
     float* sig = anchor_load_f32(&zip, "sig", &sgr, &sgc);
     assert(mr == OBS_SIZE && mc == 0);
     assert(sgr == OBS_SIZE && sgc == 0);
-    float* Vd = NULL;
-    float* bd = NULL;
-    float drift_b = 0.0f;
-    if (a->drift) {
-        int vr = 0;
-        int vc = 0;
-        int br = 0;
-        int bc = 0;
-        Vd = anchor_load_f32(&zip, "Vd", &vr, &vc);
-        bd = anchor_load_f32(&zip, "bd", &br, &bc);
-        assert(vc == 0 && vr == last && "Vd width");
-        assert(bc == 0 && br == 1 && "bd");
-        drift_b = bd[0];
-    }
 
     int max_w = 0;
     for (int i = 0; i < n_layers; i++) {
@@ -2554,14 +2492,6 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
     anchor_h2d(&a->head_b[1], bs, n_steer, stream);
     anchor_h2d(&a->mu, mu, OBS_SIZE, stream);
     anchor_h2d(&a->sig, sig, OBS_SIZE, stream);
-    if (a->drift) {
-        anchor_h2d(&a->drift_w, Vd, last, stream);
-        anchor_h2d(&a->drift_b, bd, 1, stream);
-        assert(cudaMalloc(&a->drift_y,
-            (size_t)max_nt * sizeof(precision_t)) == cudaSuccess);
-        assert(cudaMalloc(&a->beta,
-            (size_t)max_nt * sizeof(float)) == cudaSuccess);
-    }
     assert(cudaMalloc(&a->norm,
         (size_t)max_nt * OBS_SIZE * sizeof(precision_t)) == cudaSuccess);
     assert(cudaMalloc(&a->hid[0],
@@ -2591,16 +2521,11 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
     assert(raw && cpu && gpu && zmu && zsig);
     float* hw[2] = {Wa, Ws};
     float* hb[2] = {ba, bs};
-    float cpu_v0 = 0.0f;
-    float cpu_v1 = 0.0f;
-    float gpu_v0 = 0.0f;
-    float gpu_v1 = 0.0f;
     for (int j = 0; j < OBS_SIZE; j++) {
         raw[j] = mu[j];
     }
     anchor_cpu_row(cpu, raw, host_w, host_b, lin, lout, n_layers,
-        hw, hb, heads, mu, sig, OBS_SIZE, cap,
-        a->drift ? Vd : NULL, drift_b, a->drift ? &cpu_v0 : NULL);
+        hw, hb, heads, mu, sig, OBS_SIZE, cap);
     precision_t* draw = NULL;
     anchor_h2d(&draw, raw, OBS_SIZE, stream);
     // Same handle the train graph will capture. First gemm is here, not
@@ -2608,9 +2533,6 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
     anchor_open_stream(a);
     anchor_forward(a, draw, 1, a->stream, a->handle);
     anchor_d2h(gpu, a->logits, a_total, a->stream);
-    if (a->drift) {
-        anchor_d2h(&gpu_v0, a->drift_y, 1, a->stream);
-    }
     float max0 = anchor_max_abs(gpu, cpu, a_total);
 
     for (int j = 0; j < OBS_SIZE; j++) {
@@ -2618,16 +2540,12 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
         zsig[j] = 1.0f;
     }
     anchor_cpu_row(cpu, raw, host_w, host_b, lin, lout, n_layers,
-        hw, hb, heads, zmu, zsig, OBS_SIZE, cap,
-        a->drift ? Vd : NULL, drift_b, a->drift ? &cpu_v1 : NULL);
+        hw, hb, heads, zmu, zsig, OBS_SIZE, cap);
     anchor_h2d_into(a->mu, zmu, OBS_SIZE, stream);
     anchor_h2d_into(a->sig, zsig, OBS_SIZE, stream);
     anchor_h2d_into(draw, raw, OBS_SIZE, stream);
     anchor_forward(a, draw, 1, a->stream, a->handle);
     anchor_d2h(gpu, a->logits, a_total, a->stream);
-    if (a->drift) {
-        anchor_d2h(&gpu_v1, a->drift_y, 1, a->stream);
-    }
     float max1 = anchor_max_abs(gpu, cpu, a_total);
     anchor_h2d_into(a->mu, mu, OBS_SIZE, stream);
     anchor_h2d_into(a->sig, sig, OBS_SIZE, stream);
@@ -2642,27 +2560,13 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
         printf("anchor forward max diff zeros %g quarter %g\n", max0, max1);
         assert(0 && "anchor forward check");
     }
-    if (a->drift) {
-        float dv0 = fabsf(gpu_v0 - cpu_v0);
-        float dv1 = fabsf(gpu_v1 - cpu_v1);
-        if (dv0 > tol0 || dv1 > tol1) {
-            printf("anchor drift V zeros %g (%g vs %g) quarter %g (%g vs %g)\n",
-                dv0, gpu_v0, cpu_v0, dv1, gpu_v1, cpu_v1);
-            assert(0 && "anchor drift check");
-        }
-    }
     // Train captures this handle at minibatch_size. cublas allocates on
     // the first call of that shape, which a graph capture is not allowed to do.
     anchor_forward(a, a->norm, a->max_nt, a->stream, a->handle);
     assert(cudaStreamSynchronize(a->stream) == cudaSuccess);
     a->on = 1;
-    if (a->drift) {
-        printf("anchor %s  drift  coef %g  alpha %g  %d x %d\n",
-            path, a->coef, a->alpha, n_layers, max_w);
-    } else {
-        printf("anchor %s  %s  coef %g  %d x %d\n",
-            path, dist_s, a->coef, n_layers, max_w);
-    }
+    printf("anchor %s  %s  coef %g  %d x %d\n",
+        path, dist_s, a->coef, n_layers, max_w);
 
     for (int i = 0; i < n_layers; i++) {
         free(host_w[i]);
@@ -2674,8 +2578,6 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
     free(bs);
     free(mu);
     free(sig);
-    free(Vd);
-    free(bd);
     free(raw);
     free(cpu);
     free(gpu);
@@ -3907,6 +3809,24 @@ EvalResult run_eval(Ini* ini, TrainContext* ctx, int mode, int verbose,
     return r;
 }
 
+// entropy, kl, and the other loss/* stats stay off the ini.
+// policy, value, and anchor are kept. importance is not a loss/ key.
+static int puf_log_metric(const char* key) {
+    if (strncmp(key, "loss/", 5) != 0) {
+        return 1;
+    }
+    if (strcmp(key, "loss/policy") == 0) {
+        return 1;
+    }
+    if (strcmp(key, "loss/value") == 0) {
+        return 1;
+    }
+    if (strcmp(key, "loss/anchor") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 // Config plus the binned train curve. last_log is included as the final
 // sample and then removed, so a later eval can append its own snapshot.
 // Called before post-train eval: that eval reopens every map, and an abort
@@ -3930,7 +3850,7 @@ static void write_run_log(Ini* ini, const char* log_path, PufLogHistory* hist,
         Dict* key_src = &hist->items[hist->size - 1];
         for (int k = 0; k < key_src->size; k++) {
             const char* key = key_src->items[k].key;
-            if (strncmp(key, "loss/", 5) == 0) {
+            if (!puf_log_metric(key)) {
                 continue;
             }
             log_history_bin_mean(hist, key, points, out);
@@ -4412,7 +4332,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             Dict* key_src = &log_history.items[log_history.size - 1];
             for (int k = 0; k < key_src->size; k++) {
                 const char* key = key_src->items[k].key;
-                if (strncmp(key, "loss/", 5) == 0) {
+                if (!puf_log_metric(key)) {
                     continue;
                 }
                 log_history_bin_mean(&log_history, key, metric_points, out);
