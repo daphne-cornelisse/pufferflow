@@ -1012,6 +1012,37 @@ int main(int argc, char** argv) {
     int opened = weights != NULL;
     int raw_floats = file_floats;
     int fits = !weights || (need - file_floats <= 7 && file_floats <= need);
+#if !defined(PUF_NMMO3_NET) && !defined(PUF_ASTEROIDS_NET) \
+        && !defined(PUF_MINIMAL_NET) && !defined(PUF_CRAFTAX_NET)
+    // A sweep trial's width and depth are not in config/drive.ini.
+    // One power-of-two width and layer count matches the file.
+    if (benchmark && weights && !fits) {
+        int match_h = 0;
+        int match_l = 0;
+        int hits = 0;
+        for (int h = 64; h <= 512; h *= 2) {
+            for (int layers = 1; layers <= 4; layers++) {
+                int alt = puffernet_weight_count(OBS_SIZE, h, layers,
+                    act_sizes, num_actions);
+                if (file_floats <= alt && alt - file_floats <= 7) {
+                    match_h = h;
+                    match_l = layers;
+                    hits++;
+                }
+            }
+        }
+        if (hits == 1) {
+            hidden_size = match_h;
+            num_layers = match_l;
+            need = puffernet_weight_count(OBS_SIZE, hidden_size,
+                num_layers, act_sizes, num_actions);
+            fits = 1;
+            fprintf(stderr,
+                "benchmark weights match hidden %d layers %d\n",
+                hidden_size, num_layers);
+        }
+    }
+#endif
     if (weights && !fits) {
         free(weights);
         weights = NULL;

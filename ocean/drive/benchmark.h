@@ -91,14 +91,17 @@ static void bench_mkdir(const char* path) {
 
 static void bench_prepare_dir(const char* path) {
     char tmp[512];
-    char* slash;
+    char* p;
     bench_copy(tmp, (int)sizeof(tmp), path);
-    slash = strrchr(tmp, '/');
-    if (slash && slash != tmp) {
-        *slash = 0;
+    for (p = tmp + 1; *p; p++) {
+        if (*p != '/') {
+            continue;
+        }
+        *p = 0;
         bench_mkdir(tmp);
+        *p = '/';
     }
-    bench_mkdir(path);
+    bench_mkdir(tmp);
 }
 
 static float bench_metric(const BenchCfg* cfg, float collision, float offroad,
@@ -314,7 +317,7 @@ static int bench_replay_scene(Dict* cfg, int map_id, const char* json_path,
     *collision = hit ? 1.0f : 0.0f;
     *offroad = road ? 1.0f : 0.0f;
     *completion = reached ? 1.0f : 0.0f;
-    // Same rule as logs[i].score: first goal, and no hit before it.
+    // One logged goal, so the clean-arrival count is 0 or 1.
     // Off-road counts. The collision rate above stays vehicle-only.
     *score = (reached && !hit && !road) ? 1.0f : 0.0f;
     *ade_lat = lat_sum / (float)ade_n;
@@ -609,7 +612,7 @@ static void bench_plot(const char* csv_path, const char* png_path, int map_id) {
     if (access(py, X_OK) != 0) {
         py = "python3";
     }
-    if (map_id == 1) {
+    if (map_id == 0) {
         snprintf(title, sizeof(title), "Town01");
     } else {
         snprintf(title, sizeof(title), "map %d", map_id);

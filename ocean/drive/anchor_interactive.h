@@ -122,7 +122,7 @@ static int ademo_policy_on(void) {
 
 // Sorted WOMD index, same order as data/womd/binaries/map_%03d.bin.
 // The SDC starts outside the 5 m goal disk, on a busy junction.
-// A NULL name is CARLA Town01 (data/mixed/binaries/map_001.bin). That
+// A NULL name is CARLA Town01 (data/mixed/binaries/map_000.bin). That
 // map has no trajectory, so its goals come from pick_forward_goal.
 #define ADEMO_LOOP 90
 
@@ -142,7 +142,7 @@ static const AdemoScene g_scenes[] = {
     {601, "tfrecord-00063-of-01000_238.json"},
     {500, "tfrecord-00052-of-01000_184.json"},
     {241, "tfrecord-00024-of-01000_121.json"},
-    {1, NULL},
+    {0, NULL},
 };
 
 #define ADEMO_NSCENE ((int)(sizeof(g_scenes) / sizeof(g_scenes[0])))

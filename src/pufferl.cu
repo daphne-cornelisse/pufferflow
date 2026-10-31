@@ -1019,6 +1019,34 @@ static Env* puf_vec_create(int, Dict*, obs_t*, float*, float*, float*) {
 }
 #endif
 
+
+// Map index for env_i of nenvs copies. The first (nenvs % num_maps)
+// maps get one extra copy. Returns -1 when every copy uses map_id.
+static int env_map_slot(int env_i, int nenvs, int num_maps) {
+    if (num_maps <= 1 || nenvs <= 1) {
+        return -1;
+    }
+    if (env_i < 0) {
+        env_i = 0;
+    }
+    if (env_i >= nenvs) {
+        env_i = nenvs - 1;
+    }
+    int extra = nenvs % num_maps;
+    int big = nenvs / num_maps + 1;
+    if (extra == 0) {
+        return env_i / (nenvs / num_maps);
+    }
+    if (env_i < extra * big) {
+        return env_i / big;
+    }
+    int small = nenvs / num_maps;
+    if (small < 1) {
+        return env_i;
+    }
+    return extra + (env_i - extra * big) / small;
+}
+
 static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     if (PUF_BACKEND == PUF_GPU) {
         assert(vec->buffers == 1 && "GPU env: num_buffers must be 1");
@@ -1047,9 +1075,33 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
 #else
     Env* envs = (Env*)calloc(total_agents, sizeof(Env));
     int agents_created = 0;
+    int num_maps = 1;
+    DictItem* maps_item = dict_find(ek, "num_maps");
+    if (maps_item && maps_item->value > 1.0) {
+        num_maps = (int)maps_item->value;
+    }
+    int agents_per = 1;
+    DictItem* agents_item = dict_find(ek, "num_agents");
+    if (agents_item && agents_item->value >= 1.0) {
+        agents_per = (int)agents_item->value;
+    }
+    int nenvs_est = (total_agents + agents_per - 1) / agents_per;
+    if (nenvs_est < 1) {
+        nenvs_est = 1;
+    }
     while (agents_created < total_agents) {
         envs[num_envs].rng = num_envs;
-        puf_init(&envs[num_envs], ek);
+        Dict* ek_i = ek;
+        int slot = env_map_slot(num_envs, nenvs_est, num_maps);
+        if (slot >= 0) {
+            ek_i = (Dict*)calloc(1, sizeof(Dict));
+            assert(ek_i);
+            dict_copy(ek_i, ek);
+            // Files are map_000.bin .. map_{num_maps-1}.bin. Each copy
+            // keeps this dict so a later env cannot change its map_id.
+            dict_set(ek_i, "map_id", (double)slot);
+        }
+        puf_init(&envs[num_envs], ek_i);
         agents_created += envs[num_envs].num_agents;
         num_envs++;
     }
@@ -1409,6 +1461,21 @@ static void env_close(VecEnv* vec) {
 }
 
 void vec_log(VecEnv* vec, Dict* out, int clear) {
+    // Mean score of finished episodes on each town, before the sum clears logs.
+    float town_score[4] = {0};
+    float town_n[4] = {0};
+    int town_seen[4] = {0};
+    if (PUF_BACKEND != PUF_GPU) {
+        for (int i = 0; i < vec->size; i++) {
+            int id = vec->envs[i].map_id;
+            if (id < 0 || id > 3 || !drive_score_town_key(id)) {
+                continue;
+            }
+            town_seen[id] = 1;
+            town_score[id] += vec->envs[i].log.score;
+            town_n[id] += vec->envs[i].log.n;
+        }
+    }
     Log aggregate = {0};
     float* acc = (float*)&aggregate;
     env_log_sum(vec, &aggregate, clear);
@@ -1420,6 +1487,16 @@ void vec_log(VecEnv* vec, Dict* out, int clear) {
             acc[j] /= n;
         }
         puf_log(&aggregate, &env_out);
+        for (int id = 0; id < 4; id++) {
+            if (!town_seen[id]) {
+                continue;
+            }
+            float mean = 0.0f;
+            if (town_n[id] > 0.0f) {
+                mean = town_score[id] / town_n[id];
+            }
+            dict_set(&env_out, drive_score_town_key(id), mean);
+        }
     }
     dict_set(&env_out, "n", n);
     for (int i = 0; i < env_out.size; i++) {
@@ -3830,6 +3907,48 @@ EvalResult run_eval(Ini* ini, TrainContext* ctx, int mode, int verbose,
     return r;
 }
 
+// Config plus the binned train curve. last_log is included as the final
+// sample and then removed, so a later eval can append its own snapshot.
+// Called before post-train eval: that eval reopens every map, and an abort
+// there used to discard a finished run because this file was written after.
+static void write_run_log(Ini* ini, const char* log_path, PufLogHistory* hist,
+        Dict* last_log, const char* target_key, int points) {
+    assert(hist->size == 0 || dict_find(last_log, target_key));
+    FILE* fp = fopen(log_path, "w");
+    assert(fp && "failed to open log for writing");
+    fprintf(fp, "# PufferLib log v1\n");
+    puf_ini_write(fp, ini);
+    fprintf(fp, "\n[metrics]\n");
+
+    int pushed = 0;
+    if (last_log->size > 0) {
+        puf_log_history_add(hist, last_log);
+        pushed = 1;
+    }
+    if (hist->size > 0) {
+        double* out = (double*)calloc((size_t)points, sizeof(double));
+        Dict* key_src = &hist->items[hist->size - 1];
+        for (int k = 0; k < key_src->size; k++) {
+            const char* key = key_src->items[k].key;
+            if (strncmp(key, "loss/", 5) == 0) {
+                continue;
+            }
+            log_history_bin_mean(hist, key, points, out);
+            fprintf(fp, "%s = ", key);
+            for (int i = 0; i < points; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "", out[i]);
+            }
+            fputc('\n', fp);
+        }
+        free(out);
+    }
+    if (pushed) {
+        dict_clear(&hist->items[hist->size - 1]);
+        hist->size--;
+    }
+    fclose(fp);
+}
+
 // CPU player records a split BEV / agent view from this checkpoint.
 // Failure leaves the train result intact. The caller is still inside the
 // train process, so the next checkpoint waits until the clip is written.
@@ -4160,6 +4279,13 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         snprintf(eval_ckpt, sizeof(eval_ckpt), "%s", final_checkpoint);
         puf_ini_put(ini, "base.load_model_path", eval_ckpt);
     }
+    // Eval reopens the maps. A missing file used to abort here, after the
+    // checkpoint was saved and before this log existed.
+    char log_path[4096];
+    snprintf(log_path, sizeof(log_path), "%s/%s.ini", log_dir, run_id);
+    if (ctx->artifact_owner) {
+        write_run_log(ini, log_path, &log_history, &last_log, target_key, points);
+    }
     // Close every rank before rank-0 eval. Eval on the live DP trainer leaves
     // child vec workers in BUF_RUNNING/BUF_WAITING while rank 0 waitpid()s
     // (and previously poisoned rank-0 CUDA graphs if children exited early).
@@ -4181,8 +4307,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         close_pufferl(ep);
     }
 
-    char log_path[4096];
-    snprintf(log_path, sizeof(log_path), "%s/%s.ini", log_dir, run_id);
     if (ctx->artifact_owner) {
         FILE* fp = fopen(log_path, "w");
         assert(fp && "failed to open log for writing");
@@ -4310,8 +4434,9 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     return result;
 }
 
-// Human-replay score from config/benchmark.ini. Empty sweep_metric keeps
-// the training score. A sweep worker (result_fd) or after_train runs it.
+// Human-replay score from config/benchmark.ini. Empty sweep_metric skips
+// the launch. after_train runs it after ./puffer train. A sweep worker
+// (result_fd > 0) does not: its meta-objective is [sweep] metric.
 static int bench_cfg_metric(char* metric, int n, int* after_train) {
     Ini bench = {0};
     const char* name;
@@ -4358,7 +4483,9 @@ static void apply_replay_objective(Ini* ini, TrainResult* result) {
     char report[576];
     char bench_arg[1024];
     char out_arg[576];
-    char* argv[4];
+    char hidden_arg[64];
+    char layers_arg[64];
+    char* argv[6];
     const char* ckpt;
     const char* run_id;
     int after_train = 0;
@@ -4370,7 +4497,10 @@ static void apply_replay_objective(Ini* ini, TrainResult* result) {
         return;
     }
     result_fd = (int)puf_ini_get(ini, "base", "result_fd");
-    if (result_fd <= 0 && !after_train) {
+    // Sweep workers report env/<sweep.metric> and return. The benchmark
+    // is a separate ./drive --benchmark launch, or after_train on a
+    // normal train.
+    if (result_fd > 0 || !after_train) {
         return;
     }
     ckpt = puf_ini_get_str(ini, "base", "load_model_path");
@@ -4383,10 +4513,16 @@ static void apply_replay_objective(Ini* ini, TrainResult* result) {
     snprintf(out_dir, sizeof(out_dir), "analysis/benchmark/%s", run_id);
     snprintf(bench_arg, sizeof(bench_arg), "--benchmark=%s", ckpt);
     snprintf(out_arg, sizeof(out_arg), "--benchmark-out=%s", out_dir);
+    snprintf(hidden_arg, sizeof(hidden_arg), "--policy.hidden_size=%d",
+        (int)puf_ini_get(ini, "policy", "hidden_size"));
+    snprintf(layers_arg, sizeof(layers_arg), "--policy.num_layers=%d",
+        (int)puf_ini_get(ini, "policy", "num_layers"));
     argv[0] = (char*)"./drive";
     argv[1] = bench_arg;
     argv[2] = out_arg;
-    argv[3] = NULL;
+    argv[3] = hidden_arg;
+    argv[4] = layers_arg;
+    argv[5] = NULL;
     fprintf(stderr, "replay objective %s %s\n", metric, ckpt);
     if (posix_spawn(&pid, "./drive", NULL, NULL, argv, environ) != 0) {
         perror("replay objective");
