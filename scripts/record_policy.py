@@ -33,6 +33,8 @@ ENV_KEYS = (
     "reward_offroad_collision",
     "reward_goal",
     "reward_jerk",
+    "target_speed",
+    "speed_band",
     "goal_distance_min",
     "goal_distance_max",
     "collision_physics",

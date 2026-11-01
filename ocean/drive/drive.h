@@ -33,6 +33,9 @@ struct Log {
     float total_infractions;
     float distance_before_first_failure;
     float completion_rate;
+    // Sum of speed in m/s, and how many steps that sum covers.
+    float speed_sum;
+    float speed_steps;
     float n;
 };
 
@@ -178,6 +181,9 @@ struct Env {
     float world_mean_y;
     float reward_goal;
     float reward_jerk;
+    // Target and the band around it, in m/s.
+    float target_speed;
+    float speed_band;
     int collision_physics;
     unsigned int rng;
     int checkpoint_ok;
@@ -1245,6 +1251,7 @@ void compute_observations(Drive* env) {
         }
         obs[6] = accel_lag * OBS_ACCEL_SCALE;
         obs[7] = yaw_lag * OBS_YAW_SCALE;
+        obs[EGO_TARGET_SPEED] = env->target_speed * OBS_SPEED_SCALE;
         ego->dyn_speed = signed_speed;
         ego->dyn_heading = ego->heading;
         ego->dyn_ready = 1;
@@ -1833,6 +1840,23 @@ static void respawn_agent(Drive* env, int agent_idx) {
     e->reached_goal = 1;
 }
 
+// SPEED_REWARD when signed speed is inside the band. Speeds are m/s.
+float speed_bonus(Drive* env, Entity* agent) {
+    if (env->target_speed <= 0.0f) {
+        return 0.0f;
+    }
+    float signed_speed = agent->vx * agent->heading_x
+        + agent->vy * agent->heading_y;
+    float err = signed_speed - env->target_speed;
+    if (err < 0.0f) {
+        err = -err;
+    }
+    if (err > env->speed_band) {
+        return 0.0f;
+    }
+    return SPEED_REWARD;
+}
+
 void puf_step(Drive* env) {
     human_controls(env);
     if (!env->entities || env->active_agent_count <= 0) {
@@ -1875,6 +1899,8 @@ void puf_step(Drive* env) {
             env->log.perf += env->logs[i].perf;
             env->log.episode_length += env->logs[i].episode_length;
             env->log.episode_return += env->logs[i].episode_return;
+            env->log.speed_sum += env->logs[i].speed_sum;
+            env->log.speed_steps += env->logs[i].speed_steps;
             env->log.n += 1;
         }
         puf_reset(env);
@@ -1899,6 +1925,8 @@ void puf_step(Drive* env) {
         float speed = sqrtf(agent->vx * agent->vx + agent->vy * agent->vy);
         step_distance[i] = speed * SIM_DT;
         env->logs[i].total_distance_travelled += step_distance[i];
+        env->logs[i].speed_sum += speed;
+        env->logs[i].speed_steps += 1.0f;
         float dvx = agent->vx - prev_vx;
         float dvy = agent->vy - prev_vy;
         step_jerk[i] = env->reward_jerk
@@ -1961,6 +1989,9 @@ void puf_step(Drive* env) {
         env->agents[i].rewards[0] += jerk_penalty;
         env->logs[i].episode_return += jerk_penalty;
         env->logs[i].jerk += jerk_penalty;
+        float bonus = speed_bonus(env, agent);
+        env->agents[i].rewards[0] += bonus;
+        env->logs[i].episode_return += bonus;
         if (arrived) {
             respawn_agent(env, i);
         }
@@ -1991,6 +2022,9 @@ void puf_init(Env* env, Dict* kwargs) {
     env->reward_offroad_collision = dict_get(kwargs, "reward_offroad_collision");
     env->reward_goal = dict_get(kwargs, "reward_goal");
     env->reward_jerk = dict_get(kwargs, "reward_jerk");
+    // Ini values are km/h. A target of 0 pays nothing.
+    env->target_speed = dict_get(kwargs, "target_speed") * KMH_TO_MPS;
+    env->speed_band = dict_get(kwargs, "speed_band") * KMH_TO_MPS;
     env->cfg = kwargs;
     env->use_action_values = 0;
     int map_id = dict_get(kwargs, "map_id");
@@ -2041,6 +2075,12 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "avg_distance_per_infraction", avg_distance_per_infraction);
     dict_set(out, "n", log->n);
     dict_set(out, "completion_rate", log->completion_rate);
+    // km/h. Mean over every active car-step in the finished episodes.
+    float avg_speed = 0.0f;
+    if (log->speed_steps > 0.0f) {
+        avg_speed = (log->speed_sum / log->speed_steps) / KMH_TO_MPS;
+    }
+    dict_set(out, "avg_speed", avg_speed);
 }
 
 // Window, camera, and HUD.

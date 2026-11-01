@@ -37,6 +37,9 @@ static void pf_fill(PfHandle* h, const char* data_dir, int map_id, int num_agent
     dict_set(&h->cfg, "reward_offroad_collision", -1.0);
     dict_set(&h->cfg, "reward_goal", 1.0);
     dict_set(&h->cfg, "reward_jerk", -0.0003);
+    // Waymo offline reward stays the logged task.
+    dict_set(&h->cfg, "target_speed", OFFLINE_TARGET_SPEED_KMH);
+    dict_set(&h->cfg, "speed_band", SPEED_BAND_KMH);
     dict_set_str(&h->cfg, "data_dir", h->data_dir);
     dict_set(&h->cfg, "map_id", map_id);
     dict_set(&h->cfg, "num_agents", num_agents);

@@ -617,6 +617,7 @@ static void offline_integrate(Drive* env, int stop_at_goal) {
             }
         }
         env->agents[i].rewards[0] += step_jerk[i];
+        env->agents[i].rewards[0] += speed_bonus(env, agent);
         if (arrived && stop_at_goal) {
             agent->vx = 0.0f;
             agent->vy = 0.0f;

@@ -7,10 +7,11 @@ colors runs with ColorBrewer Set1, except episode return against sweep
 index, which is colored by trial wall clock. The other panels are return
 curves, goal score, infractions per meter, score against jerk when
 those series exist (otherwise meters per infraction), and parameter count.
-The next row is final meters per infraction against score, then meters
-driven before the first vehicle overlap or off-road
-(env/distance_before_first_failure) over training steps. Older inis
-that still say env/distance_before_failure are read as the same series.
+The next row is final meters per infraction against score, completion
+rate against score, then meters driven before the first vehicle overlap
+or off-road (env/distance_before_first_failure) over training steps.
+Older inis that still say env/distance_before_failure are read as the
+same series.
 A panel stays blank when the run ini has no such series. The next row is
 training score against anchor coefficient, then the per-town scores
 score_town_01, score_town_02, score_town_06, and score_town_10. A town
@@ -436,8 +437,8 @@ def figure_axes():
     mid = outer[1].subgridspec(1, 4, wspace=0.28)
     axes = [fig.add_subplot(top[0, col]) for col in range(4)]
     axes += [fig.add_subplot(mid[0, col]) for col in range(4)]
-    failure_grid = outer[2].subgridspec(1, 2, wspace=0.28)
-    failure_axes = [fig.add_subplot(failure_grid[0, col]) for col in range(2)]
+    failure_grid = outer[2].subgridspec(1, 3, wspace=0.28)
+    failure_axes = [fig.add_subplot(failure_grid[0, col]) for col in range(3)]
     town_grid = outer[3].subgridspec(1, 1 + len(TOWN_FIELDS), wspace=0.32)
     town_axes = [
         fig.add_subplot(town_grid[0, col]) for col in range(1 + len(TOWN_FIELDS))
@@ -544,6 +545,31 @@ def draw_gap_vs_score(ax, summary, palette, markers=None):
     fit_failure_axis(ax, summary[key])
 
 
+def draw_completion_vs_score(ax, summary, palette, markers=None):
+    """Final completion rate against the training score."""
+    title = "Completion rate vs score"
+    key = "completion_rate"
+    present = (
+        key in summary.columns
+        and "score" in summary.columns
+        and bool(summary[key].notna().any())
+        and bool(summary["score"].notna().any())
+    )
+    if not present:
+        blank_panel(ax, title, "no completion rate")
+        return
+    scatter_metric(summary, "score", key, ax, palette, markers)
+    scores = summary["score"].dropna()
+    if len(scores) and float(scores.max()) <= 1.0:
+        ax.set_xlim(-0.03, 1.03)
+    rates = summary[key].dropna()
+    if len(rates) and float(rates.max()) <= 1.0:
+        ax.set_ylim(-0.03, 1.03)
+    ax.set_xlabel("score")
+    ax.set_ylabel("completion rate")
+    ax.set_title(title)
+
+
 def draw_failure_metric(scatter_ax, curve_ax, summary, curves, key, ylabel,
         title, message, x, palette, markers=None, draw_scatter=True):
     """Final value against the sweep, then the same series over training."""
@@ -588,10 +614,11 @@ def draw_failure_metric(scatter_ax, curve_ax, summary, curves, key, ylabel,
 
 
 def draw_failure(axes, summary, curves, palette, x, markers=None):
-    """Meters per infraction against score, then meters before failure over steps."""
+    """Meters per infraction and completion against score, then meters before failure."""
     draw_gap_vs_score(axes[0], summary, palette, markers)
+    draw_completion_vs_score(axes[1], summary, palette, markers)
     draw_failure_metric(
-        axes[0], axes[1], summary, curves,
+        axes[0], axes[2], summary, curves,
         "distance_before_first_failure", "meters before first failure",
         "Distance before first failure", "no distance before first failure",
         x, palette, markers, draw_scatter=False,

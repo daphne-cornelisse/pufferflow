@@ -561,6 +561,32 @@ static void ademo_selfcheck(void) {
     }
 }
 
+// One new observation input. The inserted row is zero, so the old
+// forward is unchanged. mu at that slot is 0 and sig is 1.
+static float* ademo_insert_row(float* W, int rows, int cols, int at) {
+    float* grown = (float*)calloc((size_t)(rows + 1) * (size_t)cols,
+        sizeof(float));
+    assert(grown);
+    assert(at >= 0 && at < rows);
+    memcpy(grown, W, (size_t)at * (size_t)cols * sizeof(float));
+    memcpy(grown + (size_t)(at + 1) * (size_t)cols,
+        W + (size_t)at * (size_t)cols,
+        (size_t)(rows - at) * (size_t)cols * sizeof(float));
+    free(W);
+    return grown;
+}
+
+static float* ademo_insert_stat(float* x, int n, int at, float fill) {
+    float* grown = (float*)malloc((size_t)(n + 1) * sizeof(float));
+    assert(grown);
+    assert(at >= 0 && at < n);
+    memcpy(grown, x, (size_t)at * sizeof(float));
+    grown[at] = fill;
+    memcpy(grown + at + 1, x + at, (size_t)(n - at) * sizeof(float));
+    free(x);
+    return grown;
+}
+
 static void ademo_open(const char* path) {
     Ademo* a = &g_ademo;
     memset(a, 0, sizeof(*a));
@@ -571,6 +597,7 @@ static void ademo_open(const char* path) {
     ademo_zip_open(&zip, path);
 
     int n_layers = 0;
+    int grew_obs = 0;
     while (n_layers < ADEMO_LAYERS) {
         char wk[16];
         char bk[16];
@@ -586,6 +613,12 @@ static void ademo_open(const char* path) {
         a->W[n_layers] = ademo_load_f32(&zip, wk, &wr, &wc);
         a->b[n_layers] = ademo_load_f32(&zip, bk, &br, &bc);
         assert(wc > 0 && bc == 0 && br == wc);
+        if (n_layers == 0 && wr + 1 == OBS_SIZE) {
+            int at = EGO_TARGET_SPEED;
+            a->W[n_layers] = ademo_insert_row(a->W[n_layers], wr, wc, at);
+            wr = OBS_SIZE;
+            grew_obs = 1;
+        }
         if (n_layers == 0) {
             assert(wr == OBS_SIZE);
         } else {
@@ -627,6 +660,15 @@ static void ademo_open(const char* path) {
     int sgc = 0;
     a->mu = ademo_load_f32(&zip, "mu", &mr, &mc);
     a->sig = ademo_load_f32(&zip, "sig", &sgr, &sgc);
+    if (grew_obs) {
+        int at = EGO_TARGET_SPEED;
+        assert(mr + 1 == OBS_SIZE && sgr + 1 == OBS_SIZE);
+        a->mu = ademo_insert_stat(a->mu, mr, at, 0.0f);
+        a->sig = ademo_insert_stat(a->sig, sgr, at, 1.0f);
+        mr = OBS_SIZE;
+        sgr = OBS_SIZE;
+        printf("anchor inserted a zero-weight target speed at index %d\n", at);
+    }
     assert(mr == OBS_SIZE && mc == 0);
     assert(sgr == OBS_SIZE && sgc == 0);
     ademo_finite(a->Wa, ar * ac, "Wa");

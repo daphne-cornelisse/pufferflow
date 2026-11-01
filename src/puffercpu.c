@@ -720,8 +720,8 @@ static int puffernet_weight_count(int input_dim, int hidden, int layers,
 
 #ifdef MAX_AGENTS
 // An old checkpoint has 7 ego features and 63 partners (973 inputs).
-// The current net adds one open ego slot and one partner slot.
-// Both inserts are zero, so that policy's actions stay put.
+// Extra ego features and the extra partner slot are zero, so that
+// policy's actions stay put.
 static Weights* puf_widen_partner_ckpt(Weights* weights, int hidden,
         int layers, const int act_sizes[], int num_actions,
         int file_floats) {
@@ -775,9 +775,62 @@ static Weights* puf_widen_partner_ckpt(Weights* weights, int hidden,
         (size_t)tail * sizeof(float));
     free(weights);
     fprintf(stderr,
-        "loaded checkpoint trained with %d partners and no max-speed "
-        "feature; both new inputs have zero weight\n",
-        legacy_partners);
+        "loaded a %d-input checkpoint; added ego and partner inputs are zero\n",
+        legacy_in);
+    return grown;
+}
+
+// The previous ego block has no target speed. That input is one column
+// at the end of the ego features, and its weight is zero.
+static Weights* puf_widen_target_ckpt(Weights* weights, int hidden,
+        int layers, const int act_sizes[], int num_actions,
+        int file_floats) {
+    int old_ego = EGO_TARGET_SPEED;
+    int old_in = old_ego
+        + PARTNER_FEATURES * MAX_AGENTS
+        + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    if (OBS_SIZE != old_in + 1) {
+        return weights;
+    }
+    int old_need = puffernet_weight_count(old_in, hidden, layers,
+        act_sizes, num_actions);
+    if (file_floats != old_need) {
+        return weights;
+    }
+    int old_enc = puf_align8(hidden * old_in);
+    int new_enc = puf_align8(hidden * OBS_SIZE);
+    int tail = file_floats - old_enc;
+    if (tail < 0) {
+        return weights;
+    }
+    int new_floats = new_enc + tail;
+    int need = puffernet_weight_count(OBS_SIZE, hidden, layers,
+        act_sizes, num_actions);
+    if (new_floats != need) {
+        return weights;
+    }
+
+    Weights* grown = calloc(1, sizeof(Weights)
+        + (size_t)(new_floats + 7) * sizeof(float));
+    if (!grown) {
+        perror("calloc");
+        exit(1);
+    }
+    grown->data = (float*)(grown + 1);
+    grown->size = new_floats + 7;
+    for (int o = 0; o < hidden; o++) {
+        float* src = weights->data + (size_t)o * (size_t)old_in;
+        float* dst = grown->data + (size_t)o * (size_t)OBS_SIZE;
+        memcpy(dst, src, (size_t)old_ego * sizeof(float));
+        memcpy(dst + old_ego + 1, src + old_ego,
+            (size_t)(old_in - old_ego) * sizeof(float));
+    }
+    memcpy(grown->data + new_enc, weights->data + old_enc,
+        (size_t)tail * sizeof(float));
+    free(weights);
+    fprintf(stderr,
+        "loaded a %d-input checkpoint; target-speed input has zero weight\n",
+        old_in);
     return grown;
 }
 #endif
@@ -1002,6 +1055,11 @@ int main(int argc, char** argv) {
 #ifdef MAX_AGENTS
     if (weights && file_floats + 7 < need) {
         weights = puf_widen_partner_ckpt(weights, hidden_size, num_layers,
+            act_sizes, num_actions, file_floats);
+        file_floats = weights->size - 7;
+    }
+    if (weights && file_floats + 7 < need) {
+        weights = puf_widen_target_ckpt(weights, hidden_size, num_layers,
             act_sizes, num_actions, file_floats);
         file_floats = weights->size - 7;
     }

@@ -58,7 +58,18 @@
 // Index 6 is the previous step's signed acceleration, clamped to the
 // action bounds. Index 7 is the previous step's yaw rate, clamped to
 // ±OBS_YAW_ABS. Both are 0 on the first step of a life.
-#define EGO_FEATURES 8
+// EGO_TARGET_SPEED is the target in m/s times OBS_SPEED_SCALE, the
+// same scale as index 2.
+#define EGO_FEATURES 9
+#define EGO_TARGET_SPEED (EGO_FEATURES - 1)
+// km/h. Training reads target_speed and speed_band from the ini.
+// A target of 0 pays nothing. Offline uses this band.
+#define SPEED_BAND_KMH 2.0f
+// Per step, inside the band. A collision step is -1.
+#define SPEED_REWARD 0.01f
+#define KMH_TO_MPS (1.0f / 3.6f)
+// Waymo offline keeps its logged reward, so its target stays off.
+#define OFFLINE_TARGET_SPEED_KMH 0.0f
 #define ROAD_FEATURES 7
 
 #define OBS_SIZE (EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS \
