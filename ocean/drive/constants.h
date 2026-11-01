@@ -118,8 +118,11 @@
 #define NUM_STEER_BINS 257
 #define ACCEL_MIN -8.0f
 #define ACCEL_MAX 8.0f
-#define STEER_MIN -1.5f
-#define STEER_MAX 1.5f
+// Front-wheel angle. tan(δ) = wheelbase / rear-axle radius, and the
+// wheelbase is 0.6 of the body length, so atan(0.6) keeps that radius
+// at least one body length.
+#define STEER_MAX 0.5404195f
+#define STEER_MIN -0.5404195f
 #define ACCEL_COAST_BIN ((NUM_ACCEL_BINS - 1) / 2)
 #define STEER_COAST_BIN ((NUM_STEER_BINS - 1) / 2)
 

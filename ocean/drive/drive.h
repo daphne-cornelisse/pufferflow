@@ -109,14 +109,17 @@ static float bicycle_wheelbase(float length) {
     return wheelbase;
 }
 
-// Kinematic bicycle. New speed, then a circular arc. No side slip.
+// Ackermann bicycle. The rear axle has no sideslip and yaws at
+// v tan(δ) / L. The body center is half a wheelbase ahead of it.
 static void bicycle_integrate(float* x, float* y, float* heading,
         float* vx, float* vy, float length, float acceleration, float steering) {
     float c = cosf(*heading);
     float s = sinf(*heading);
     float v = (*vx) * c + (*vy) * s + acceleration * SIM_DT;
     float wheelbase = bicycle_wheelbase(length);
-    float tsteer = tanf(steering);
+    float half = 0.5f * wheelbase;
+    float rx = *x - half * c;
+    float ry = *y - half * s;
     float dth;
     float dx_b;
     float dy_b;
@@ -126,11 +129,12 @@ static void bicycle_integrate(float* x, float* y, float* heading,
     if (v < -MAX_SPEED) {
         v = -MAX_SPEED;
     }
-    // tan diverges at ±pi/2. A command that close is a divide-by-zero in
-    // the steer inverse, not a turn the log can contain.
-    if (tsteer > 1.0e6f || tsteer < -1.0e6f) {
-        tsteer = 0.0f;
+    if (steering > STEER_MAX) {
+        steering = STEER_MAX;
+    } else if (steering < STEER_MIN) {
+        steering = STEER_MIN;
     }
+    float tsteer = tanf(steering);
     dth = v * tsteer / wheelbase * SIM_DT;
     if (fabsf(dth) < 1.0e-4f) {
         dx_b = v * SIM_DT;
@@ -140,11 +144,17 @@ static void bicycle_integrate(float* x, float* y, float* heading,
         dx_b = radius * sinf(dth);
         dy_b = radius * (1.0f - cosf(dth));
     }
-    *x += dx_b * c - dy_b * s;
-    *y += dx_b * s + dy_b * c;
+    rx += dx_b * c - dy_b * s;
+    ry += dx_b * s + dy_b * c;
     *heading = normalize_heading(*heading + dth);
-    *vx = v * cosf(*heading);
-    *vy = v * sinf(*heading);
+    c = cosf(*heading);
+    s = sinf(*heading);
+    *x = rx + half * c;
+    *y = ry + half * s;
+    // Center velocity: axle speed along the heading, plus the yaw swing.
+    float v_lat = v * tsteer * 0.5f;
+    *vx = v * c - v_lat * s;
+    *vy = v * s + v_lat * c;
 }
 
 struct Env {
