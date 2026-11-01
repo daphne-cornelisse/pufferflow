@@ -308,6 +308,9 @@ def _set_lr(opt, lr):
         group["lr"] = lr
 
 STOP_JOINT = 0.99
+# Mean of accel-within-10 and steer-within-10. train_and_eval_maps stops
+# here and writes the checkpoint.
+STOP_WITHIN10 = 0.95
 MAX_EPOCHS = 5000
 
 def bin_centers(lo, hi, n):
@@ -449,9 +452,10 @@ def train(x, ya, ys, n_accel, n_steer, batch_size=2048, ckpt_path=None, mu=None,
                     _set_lr(opt, lr)
                     stall = 0
                     print(f"lr {lr:.2e}", flush=True)
-                if stop_within10 is not None and watched >= float(stop_within10):
-                    break
-                if acc > STOP_JOINT or lr < 1e-6:
+                if stop_within10 is not None:
+                    if watched >= float(stop_within10):
+                        break
+                elif acc > STOP_JOINT or lr < 1e-6:
                     break
         if (
             stop_within10 is None
@@ -493,11 +497,18 @@ def train(x, ya, ys, n_accel, n_steer, batch_size=2048, ckpt_path=None, mu=None,
                     print(f"hard lr {lr:.2e}", flush=True)
         if best_state is not None and stats is not None and _score() < best_score:
             pol.load_state_dict(best_state)
-            print(
-                f"restored best joint {best_acc:.4f} from epoch {best_epoch} "
-                f"(last joint {acc:.4f})",
-                flush=True,
-            )
+            if stop_within10 is not None:
+                print(
+                    f"restored best within10 {best_score:.4f} from epoch {best_epoch} "
+                    f"(last within10 {_score():.4f})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"restored best joint {best_acc:.4f} from epoch {best_epoch} "
+                    f"(last joint {acc:.4f})",
+                    flush=True,
+                )
             acc, acc_a, acc_s = best_acc, best_acc_a, best_acc_s
     finally:
         if metric_fh is not None:
@@ -838,6 +849,7 @@ def evaluate_closed_loop(lib, pol, map_ids, rollouts=10):
                 ends[agent] = (xs[-1], ys[-1])
             completed = []
             failed = []
+            scored = []
             agent_disp = []
             for _ in range(rollouts):
                 tracks = closed_loop_rollout(lib, h, pol, agents, ends)
@@ -854,8 +866,10 @@ def evaluate_closed_loop(lib, pol, map_ids, rollouts=10):
                         ent_vals.append(np.asarray(rec["ent"], dtype=np.float32))
                     completed.append(rec["completed"])
                     failed.append(rec["failed"])
+                    scored.append(bool(rec["completed"]) and not rec["failed"])
             comp = float(np.mean(completed)) if completed else float("nan")
             fail = float(np.mean(failed)) if failed else float("nan")
+            score = float(np.mean(scored)) if scored else float("nan")
             disp_mean_map = float(np.mean(agent_disp)) if agent_disp else float("nan")
             per_map.append({
                 "map_id": int(map_id),
@@ -863,6 +877,7 @@ def evaluate_closed_loop(lib, pol, map_ids, rollouts=10):
                 "n_rollouts": len(completed),
                 "completion_rate": comp,
                 "failure_rate": fail,
+                "score_rate": score,
                 "displacement_mean": disp_mean_map,
             })
             print(
@@ -1027,7 +1042,7 @@ def _backup_foreign_ckpt(path, n_accel, n_steer):
 
 def train_and_eval_maps(n_maps=N_MAPS, accel_min=None, accel_max=None,
         n_accel=None, steer_min=None, steer_max=None, n_steer=None,
-        resume=False, enter_hard=False, stop_within10=None):
+        resume=False, enter_hard=False, stop_within10=STOP_WITHIN10):
     paths = _run_paths(n_maps)
     header = rl_action_space()
     if n_accel is None and accel_min is None:
@@ -1062,6 +1077,11 @@ def train_and_eval_maps(n_maps=N_MAPS, accel_min=None, accel_max=None,
         f"steer [{grid[3]:g}, {grid[4]:g}] x {n_steer}",
         flush=True,
     )
+    if stop_within10 is not None:
+        print(
+            f"stop and store the checkpoint at within-10 mean {float(stop_within10):.2f}",
+            flush=True,
+        )
     map_ids = list(range(n_maps))
     lib = drv.load()
     _require_compiled_grid(lib, grid)
@@ -1157,31 +1177,44 @@ def _map_rates(per_map):
     comp = np.asarray([row["completion_rate"] for row in used], dtype=np.float64)
     fail = np.asarray([row["failure_rate"] for row in used], dtype=np.float64)
     disp = np.asarray([row["displacement_mean"] for row in used], dtype=np.float64)
-    return {
+    scored = [row["score_rate"] for row in used if "score_rate" in row]
+    out = {
         "n": len(used),
         "comp_mean": float(comp.mean()), "comp_std": float(comp.std()),
         "fail_mean": float(fail.mean()), "fail_std": float(fail.std()),
         "disp_mean": float(disp.mean()), "disp_std": float(disp.std()),
     }
+    if scored:
+        score = np.asarray(scored, dtype=np.float64)
+        out["score_mean"] = float(score.mean())
+        out["score_std"] = float(score.std())
+    return out
 
 def plot_train_test(train, test, path, n_accel=257, n_steer=257, title=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     apply_figure_style()
-    blue, orange = sns.color_palette("muted", n_colors=2)
+    splits = [train] if test is None else [train, test]
+    colors = sns.color_palette("muted", n_colors=max(2, len(splits)))[:len(splits)]
+    width = 0.5 if len(splits) == 1 else 0.34
+    shifts = [0.0] if len(splits) == 1 else [-width / 2, width / 2]
     fig, axes = plt.subplots(1, 4, figsize=(16.8, 4.3), constrained_layout=True)
     ax_d, ax_h, ax_b, ax_c = axes
     ax_h.sharex(ax_d)
     dot = {"s": 8, "alpha": 0.2, "linewidths": 0, "rasterized": True}
-    ax_d.scatter(train["steps_d"], train["err"], color=blue, label="train", **dot)
-    ax_d.scatter(test["steps_d"], test["err"], color=orange, label="test", **dot)
+    for split, color in zip(splits, colors):
+        ax_d.scatter(
+            split["steps_d"], split["err"], color=color, label=split["name"], **dot,
+        )
     ax_d.set_xlabel("timestep")
     ax_d.set_ylabel("displacement (m)")
     ax_d.set_title("displacement")
     _solid_legend(ax_d, loc="upper left", fontsize=8, frameon=False, markerscale=2)
     style_ax(ax_d)
-    ax_h.scatter(train["steps_h"], train["ent"], color=blue, label="train", **dot)
-    ax_h.scatter(test["steps_h"], test["ent"], color=orange, label="test", **dot)
+    for split, color in zip(splits, colors):
+        ax_h.scatter(
+            split["steps_h"], split["ent"], color=color, label=split["name"], **dot,
+        )
     uniform = float(np.log(n_accel) + np.log(n_steer))
     ax_h.axhline(
         uniform, color="black", ls=(0, (6, 4)), lw=1.3, zorder=3,
@@ -1193,9 +1226,8 @@ def plot_train_test(train, test, path, n_accel=257, n_steer=257, title=None):
     ax_h.set_ylabel("entropy (nats)")
     ax_h.set_title("action entropy")
     style_ax(ax_h)
-    width = 0.34
     rate_x = np.asarray([0.0, 1.0])
-    for shift, split, color in ((-width / 2, train, blue), (width / 2, test, orange)):
+    for shift, split, color in zip(shifts, splits, colors):
         ax_b.bar(
             rate_x + shift,
             [split["comp_mean"], split["fail_mean"]],
@@ -1205,7 +1237,7 @@ def plot_train_test(train, test, path, n_accel=257, n_steer=257, title=None):
             label=split["name"],
         )
     ax_m = ax_b.twinx()
-    for shift, split, color in ((-width / 2, train, blue), (width / 2, test, orange)):
+    for shift, split, color in zip(shifts, splits, colors):
         ax_m.bar(
             [2.0 + shift], [split["disp_mean"]], yerr=[split["disp_std"]],
             color=color, width=width, capsize=3,
@@ -1217,10 +1249,10 @@ def plot_train_test(train, test, path, n_accel=257, n_steer=257, title=None):
     ax_b.set_title("mean ± std across maps")
     rate_top = max(
         split[key] + split[std]
-        for split in (train, test)
+        for split in splits
         for key, std in (("comp_mean", "comp_std"), ("fail_mean", "fail_std"))
     )
-    disp_top = max(split["disp_mean"] + split["disp_std"] for split in (train, test))
+    disp_top = max(split["disp_mean"] + split["disp_std"] for split in splits)
     ax_b.set_ylim(0.0, max(1.25, rate_top + 0.32))
     ax_m.set_ylim(0.0, max(disp_top, 1e-6) * 1.45)
     ax_b.set_axisbelow(True)
@@ -1228,7 +1260,7 @@ def plot_train_test(train, test, path, n_accel=257, n_steer=257, title=None):
     sns.despine(ax=ax_b, top=True, right=True)
     sns.despine(ax=ax_m, top=True, left=True, right=False)
     ax_b.legend(loc="upper right", fontsize=8, frameon=False)
-    for shift, split in ((-width / 2, train), (width / 2, test)):
+    for shift, split in zip(shifts, splits):
         for i, key, std in ((0, "comp_mean", "comp_std"), (1, "fail_mean", "fail_std")):
             ax_b.text(
                 i + shift, split[key] + split[std] + 0.02,
@@ -1241,7 +1273,7 @@ def plot_train_test(train, test, path, n_accel=257, n_steer=257, title=None):
             f"{split['disp_mean']:.2f} ± {split['disp_std']:.2f}",
             ha="center", va="bottom", fontsize=6.5,
         )
-    for split, color in ((train, blue), (test, orange)):
+    for split, color in zip(splits, colors):
         sns.regplot(
             x=split["pair_d"], y=split["pair_e"], ax=ax_c, ci=95,
             scatter_kws={"s": 8, "alpha": 0.2, "linewidths": 0, "rasterized": True,
@@ -1249,7 +1281,7 @@ def plot_train_test(train, test, path, n_accel=257, n_steer=257, title=None):
             line_kws={"color": color, "lw": 1.6},
         )
     y_text = 0.96
-    for split, color in ((train, blue), (test, orange)):
+    for split, color in zip(splits, colors):
         if len(split["pair_d"]) > 1:
             corr = float(np.corrcoef(split["pair_d"], split["pair_e"])[0, 1])
             ax_c.text(
@@ -1315,6 +1347,67 @@ def eval_train_test(train_maps=100, test_maps=100):
     out_json.write_text(json.dumps(summary, indent=2))
     print(f"wrote {out_json}", flush=True)
     print("DONE", flush=True)
+
+def eval_saved(n_maps=1000, rollouts=1):
+    # Every Waymo map is in the training set, so this is train-only.
+    # Score is the logged end within 5 m and no collision or off-road.
+    paths = _run_paths(n_maps)
+    lib = drv.load()
+    pol, acc = load_policy(paths["ckpt"])
+    z = np.load(paths["ckpt"])
+    n_accel, n_steer = int(z["n_accel"]), int(z["n_steer"])
+    map_ids = list(range(n_maps))
+    steps_d, err, steps_h, ent, per_map, pair_d, pair_e = evaluate_closed_loop(
+        lib, pol, map_ids, rollouts=rollouts,
+    )
+    rates = _map_rates(per_map)
+    pack = {
+        "name": "train",
+        "steps_d": steps_d, "err": err, "steps_h": steps_h, "ent": ent,
+        "pair_d": pair_d, "pair_e": pair_e,
+        "per_map": per_map, **rates,
+    }
+    out_plot = OUT / f"bc_{n_maps}_eval.png"
+    out_json = OUT / f"bc_{n_maps}_eval.json"
+    plot_train_test(
+        pack, None, out_plot, n_accel=n_accel, n_steer=n_steer,
+        title=(
+            f"Train maps 0–{n_maps - 1}. "
+            f"score {pack['score_mean']:.2f} ± {pack['score_std']:.2f}. "
+            f"Completion is the logged end within {GOAL_RADIUS_M:.0f} m "
+            f"by step {HORIZON_STEPS}"
+        ),
+    )
+    summary = {
+        "checkpoint": str(paths["ckpt"]),
+        "train_joint_accuracy": acc,
+        "maps": [map_ids[0], map_ids[-1]],
+        "rollouts_per_map": int(rollouts),
+        "greedy": True,
+        "score_mean": pack["score_mean"],
+        "score_std": pack["score_std"],
+        "completion_mean": pack["comp_mean"],
+        "completion_std": pack["comp_std"],
+        "failure_mean": pack["fail_mean"],
+        "failure_std": pack["fail_std"],
+        "displacement_mean": pack["disp_mean"],
+        "displacement_std": pack["disp_std"],
+        "n_maps_scored": pack["n"],
+        "score_definition": (
+            "reached the logged end within 5 m by step 100 "
+            "with no collision or off-road"
+        ),
+    }
+    out_json.write_text(json.dumps(summary, indent=2))
+    print(
+        f"score {pack['score_mean']:.3f} ± {pack['score_std']:.3f}  "
+        f"completion {pack['comp_mean']:.3f} ± {pack['comp_std']:.3f}  "
+        f"displacement {pack['disp_mean']:.3f} ± {pack['disp_std']:.3f}",
+        flush=True,
+    )
+    print(f"wrote {out_json}", flush=True)
+    print("DONE", flush=True)
+    return summary
 
 CARLA_DIR = drv.ROOT / "data" / "mixed"
 
