@@ -2372,6 +2372,32 @@ static int anchor_dist_id(const char* s) {
     return 0;
 }
 
+// One new observation input. The inserted row is zero, so the old
+// forward is unchanged. mu at that slot is 0 and sig is 1.
+static float* anchor_insert_row(float* W, int rows, int cols, int at) {
+    float* grown = (float*)calloc((size_t)(rows + 1) * (size_t)cols,
+        sizeof(float));
+    assert(grown);
+    assert(at >= 0 && at < rows);
+    memcpy(grown, W, (size_t)at * (size_t)cols * sizeof(float));
+    memcpy(grown + (size_t)(at + 1) * (size_t)cols,
+        W + (size_t)at * (size_t)cols,
+        (size_t)(rows - at) * (size_t)cols * sizeof(float));
+    free(W);
+    return grown;
+}
+
+static float* anchor_insert_stat(float* x, int n, int at, float fill) {
+    float* grown = (float*)malloc((size_t)(n + 1) * sizeof(float));
+    assert(grown);
+    assert(at >= 0 && at < n);
+    memcpy(grown, x, (size_t)at * sizeof(float));
+    grown[at] = fill;
+    memcpy(grown + at + 1, x + at, (size_t)(n - at) * sizeof(float));
+    free(x);
+    return grown;
+}
+
 static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
         bool is_continuous) {
     Anchor* a = &p->anchor;
@@ -2401,6 +2427,7 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
     int lin[ANCHOR_MAX_LAYERS];
     int lout[ANCHOR_MAX_LAYERS];
     int n_layers = 0;
+    int grew_obs = 0;
     while (n_layers < ANCHOR_MAX_LAYERS) {
         char wk[16];
         char bk[16];
@@ -2416,6 +2443,12 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
         host_w[n_layers] = anchor_load_f32(&zip, wk, &wr, &wc);
         host_b[n_layers] = anchor_load_f32(&zip, bk, &br, &bc);
         assert(wc > 0 && bc == 0 && br == wc);
+        if (n_layers == 0 && wr + 1 == OBS_SIZE) {
+            int at = EGO_TARGET_SPEED;
+            host_w[n_layers] = anchor_insert_row(host_w[n_layers], wr, wc, at);
+            wr = OBS_SIZE;
+            grew_obs = 1;
+        }
         if (n_layers == 0) {
             assert(wr == OBS_SIZE);
         } else {
@@ -2456,6 +2489,15 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
     int sgc = 0;
     float* mu = anchor_load_f32(&zip, "mu", &mr, &mc);
     float* sig = anchor_load_f32(&zip, "sig", &sgr, &sgc);
+    if (grew_obs) {
+        int at = EGO_TARGET_SPEED;
+        assert(mr + 1 == OBS_SIZE && sgr + 1 == OBS_SIZE);
+        mu = anchor_insert_stat(mu, mr, at, 0.0f);
+        sig = anchor_insert_stat(sig, sgr, at, 1.0f);
+        mr = OBS_SIZE;
+        sgr = OBS_SIZE;
+        printf("anchor inserted a zero-weight target speed at index %d\n", at);
+    }
     assert(mr == OBS_SIZE && mc == 0);
     assert(sgr == OBS_SIZE && sgc == 0);
 
@@ -3012,6 +3054,12 @@ static double dash_num(Dict* log, const char* key, double fallback) {
     return it ? it->value : fallback;
 }
 
+// Last finished episode. A log with only env/n leaves these in place.
+#define DASH_ENV_KEEP (2 * PUF_DASH_MAX_USER_ROWS)
+static char dash_env_key[DASH_ENV_KEEP][32];
+static double dash_env_val[DASH_ENV_KEEP];
+static int dash_env_n = 0;
+
 void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
     puf_dashboard_tty = isatty(STDOUT_FILENO);
     int term_rows = 1000, term_cols = PUF_DASH_W;
@@ -3021,6 +3069,21 @@ void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
             if (ws.ws_row > 0) term_rows = ws.ws_row;
             if (ws.ws_col > 0) term_cols = ws.ws_col;
         }
+    }
+
+    int env_n = 0;
+    for (int i = 0; i < log->size && env_n < DASH_ENV_KEEP; i++) {
+        const char* k = log->items[i].key;
+        if (strncmp(k, "env/", 4) != 0 || strcmp(k, "env/n") == 0) {
+            continue;
+        }
+        snprintf(dash_env_key[env_n], sizeof(dash_env_key[env_n]),
+            "%.31s", k + 4);
+        dash_env_val[env_n] = log->items[i].value;
+        env_n++;
+    }
+    if (env_n > 0) {
+        dash_env_n = env_n;
     }
 
     const char* env_name = puf_ini_get_str(ini, "base", "env_name");
@@ -3057,10 +3120,17 @@ void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
     }
     // Tiny terminal: one-line compact summary.
     if (puf_dashboard_tty && (term_cols < PUF_DASH_W || term_rows <= PUF_DASH_BASE_ROWS)) {
+        double score = 0;
+        for (int i = 0; i < dash_env_n; i++) {
+            if (strcmp(dash_env_key[i], "score") == 0) {
+                score = dash_env_val[i];
+                break;
+            }
+        }
         char compact[512];
         snprintf(compact, sizeof(compact),
             "PufferLib 5.0  env=%s  steps=%s  SPS=%s  score=%.3f  epoch=%s  to_go=%s",
-            env_name, steps_s, sps_s, dash_num(log, "env/score", 0), epoch_s, remaining);
+            env_name, steps_s, sps_s, score, epoch_s, remaining);
         printf("%.*s", term_cols > 1 ? term_cols - 1 : term_cols, compact);
         if (term_rows > 1) {
             dash_eol();
@@ -3146,34 +3216,27 @@ void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
         if (user_rows > PUF_DASH_MAX_USER_ROWS) user_rows = PUF_DASH_MAX_USER_ROWS;
     }
 
-    char pending_key[128];
-    double pending_val = 0;
-    int pending = 0, n = 0, max_items = 2 * user_rows;
-    for (int i = 0; i < log->size && n < max_items; i++) {
-        const char* key = log->items[i].key;
-        if (strncmp(key, "env/", 4) != 0 || strcmp(key, "env/n") == 0) continue;
-        const char* sk = key + 4;
-        if (!pending) {
-            snprintf(pending_key, sizeof(pending_key), "%s", sk);
-            pending_val = log->items[i].value;
-            pending = 1;
-        } else {
-            char ls[32], rs[32];
-            snprintf(ls, sizeof(ls), "%.3f", pending_val);
-            snprintf(rs, sizeof(rs), "%.3f", log->items[i].value);
-            printf("%s│%s %s%-25.25s%s %s%9.9s%s   %s%-25.25s%s %s%9.9s%s    %s│%s",
-                PUF_W, PUF_R, PUF_A, pending_key, PUF_R, PUF_W, ls, PUF_R,
-                PUF_A, sk, PUF_R, PUF_W, rs, PUF_R, PUF_W, PUF_R);
-            dash_eol();
-            pending = 0;
-        }
-        n++;
+    int shown = dash_env_n;
+    int max_items = 2 * user_rows;
+    if (shown > max_items) {
+        shown = max_items;
     }
-    if (pending) {
+    int pairs = shown / 2;
+    for (int r = 0; r < pairs; r++) {
+        int i = r * 2;
+        char ls[32], rs[32];
+        snprintf(ls, sizeof(ls), "%.3f", dash_env_val[i]);
+        snprintf(rs, sizeof(rs), "%.3f", dash_env_val[i + 1]);
+        printf("%s│%s %s%-25.25s%s %s%9.9s%s   %s%-25.25s%s %s%9.9s%s    %s│%s",
+            PUF_W, PUF_R, PUF_A, dash_env_key[i], PUF_R, PUF_W, ls, PUF_R,
+            PUF_A, dash_env_key[i + 1], PUF_R, PUF_W, rs, PUF_R, PUF_W, PUF_R);
+        dash_eol();
+    }
+    if (shown % 2) {
         char ls[32];
-        snprintf(ls, sizeof(ls), "%.3f", pending_val);
+        snprintf(ls, sizeof(ls), "%.3f", dash_env_val[shown - 1]);
         printf("%s│%s %s%-25.25s%s %s%9.9s%s   %-25.25s %9.9s    %s│%s",
-            PUF_W, PUF_R, PUF_A, pending_key,
+            PUF_W, PUF_R, PUF_A, dash_env_key[shown - 1],
             PUF_R, PUF_W, ls, PUF_R, "", "", PUF_W, PUF_R);
         dash_eol();
     }
