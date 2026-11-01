@@ -65,8 +65,9 @@
 // km/h. Training reads target_speed and speed_band from the ini.
 // A target of 0 pays nothing. Offline uses this band.
 #define SPEED_BAND_KMH 2.0f
-// Per step, inside the band. A collision step is -1.
-#define SPEED_REWARD 0.01f
+// Per second at full lane alignment, times the step. Gigaflow's
+// α_velocity. Paid only inside the speed band.
+#define SPEED_ALPHA 0.0025f
 #define KMH_TO_MPS (1.0f / 3.6f)
 // Waymo offline keeps its logged reward, so its target stays off.
 #define OFFLINE_TARGET_SPEED_KMH 0.0f

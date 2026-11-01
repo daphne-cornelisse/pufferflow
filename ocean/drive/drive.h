@@ -1840,7 +1840,8 @@ static void respawn_agent(Drive* env, int agent_idx) {
     e->reached_goal = 1;
 }
 
-// SPEED_REWARD when signed speed is inside the band. Speeds are m/s.
+// Gigaflow's velocity term, with the speed floor replaced by the band.
+// SPEED_ALPHA * dt * max(lane alignment, 0). Speeds are m/s.
 float speed_bonus(Drive* env, Entity* agent) {
     if (env->target_speed <= 0.0f) {
         return 0.0f;
@@ -1854,7 +1855,54 @@ float speed_bonus(Drive* env, Entity* agent) {
     if (err > env->speed_band) {
         return 0.0f;
     }
-    return SPEED_REWARD;
+    int list[MAX_ENTITIES_PER_CELL * 2 * 25];
+    int n = check_neighbors(env, agent->x, agent->y, list,
+        MAX_ENTITIES_PER_CELL * 2 * 25, collision_offsets, 25);
+    float best = -1.0f;
+    float lane_x = 0.0f;
+    float lane_y = 0.0f;
+    for (int i = 0; i < n; i += 2) {
+        Entity* road = &env->entities[list[i]];
+        int seg = list[i + 1];
+        if (road->type != ROAD_LANE) {
+            continue;
+        }
+        float ax = road->pts_x[seg];
+        float ay = road->pts_y[seg];
+        float bx = road->pts_x[seg + 1];
+        float by = road->pts_y[seg + 1];
+        float dx = bx - ax;
+        float dy = by - ay;
+        float len2 = dx * dx + dy * dy;
+        if (len2 <= 0.0f) {
+            continue;
+        }
+        float t = ((agent->x - ax) * dx + (agent->y - ay) * dy) / len2;
+        if (t < 0.0f) {
+            t = 0.0f;
+        } else if (t > 1.0f) {
+            t = 1.0f;
+        }
+        float ox = agent->x - (ax + t * dx);
+        float oy = agent->y - (ay + t * dy);
+        float d2 = ox * ox + oy * oy;
+        if (best >= 0.0f && d2 >= best) {
+            continue;
+        }
+        best = d2;
+        lane_x = dx;
+        lane_y = dy;
+    }
+    if (best < 0.0f) {
+        return 0.0f;
+    }
+    float inv = 1.0f / sqrtf(lane_x * lane_x + lane_y * lane_y);
+    float align = agent->heading_x * lane_x * inv
+        + agent->heading_y * lane_y * inv;
+    if (align < 0.0f) {
+        align = 0.0f;
+    }
+    return SPEED_ALPHA * SIM_DT * align;
 }
 
 void puf_step(Drive* env) {
