@@ -3519,6 +3519,14 @@ void run_sweep(Ini* ini, const char* exe_path) {
     int use_logit = strcmp(metric_dist, "logit") == 0;
     float max_cost = puf_ini_get(ini, "sweep", "max_suggestion_cost");
     float early_stop_quantile = puf_ini_get(ini, "sweep", "early_stop_quantile");
+    const char* sweep_init = puf_ini_get_str(ini, "sweep", "init");
+    assert((strcmp(sweep_init, "random") == 0 || strcmp(sweep_init, "current") == 0)
+        && "sweep.init must be random or current");
+    int random_init = strcmp(sweep_init, "random") == 0;
+    const char* sweep_focus = puf_ini_get_str(ini, "sweep", "focus");
+    assert((strcmp(sweep_focus, "pareto") == 0 || strcmp(sweep_focus, "score") == 0)
+        && "sweep.focus must be pareto or score");
+    int score_focus = strcmp(sweep_focus, "score") == 0;
     assert(max_runs >= 1 && "sweep.max_runs must be >= 1");
     assert(downsample >= 1 && downsample <= TRAIN_RESULT_MAX_POINTS
         && "sweep.downsample must be in [1, TRAIN_RESULT_MAX_POINTS]");
@@ -3540,6 +3548,8 @@ void run_sweep(Ini* ini, const char* exe_path) {
     ProteinSweep* protein = protein_sweep_create((ProteinSweep){
         .space = space,
         .num_random_samples = 10,
+        .random_init = random_init,
+        .score_focus = score_focus,
         .suggestions_per_pareto = 256,
         .gp_training_iter = 50,
         .gp_learning_rate = 0.001f,
@@ -3568,6 +3578,17 @@ void run_sweep(Ini* ini, const char* exe_path) {
     int next_run_id = 0;
     int completed = 0;
     int active = 0;
+    for (int j = 0; j < space->num; j++) {
+        float val = puf_ini_get(ini, params[j].section, params[j].key);
+        float norm = space_normalize(&space->spaces[j], val);
+        if (!(isfinite(norm) && norm >= -1.0f && norm <= 1.0f)) {
+            fprintf(stderr,
+                "default sweep value outside its sweep range: %s.%s\n",
+                params[j].section, params[j].key);
+            exit(1);
+        }
+        protein->origin[j] = norm;
+    }
     // Free-list: slot i owns GPUs [i*train_gpus, (i+1)*train_gpus). Refill as
     // soon as any trial exits (waitpid -1), so finished GPUs are never idle
     // while more runs remain.
@@ -3579,17 +3600,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
 
             ProteinSweepInfo info = {0};
             if (!next_run_id) {
-                for (int j = 0; j < space->num; j++) {
-                    float val = puf_ini_get(ini, params[j].section, params[j].key);
-                    float norm = space_normalize(&space->spaces[j], val);
-                    if (!(isfinite(norm) && norm >= -1.0f && norm <= 1.0f)) {
-                        fprintf(stderr,
-                            "default sweep value outside its sweep range: %s.%s\n",
-                            params[j].section, params[j].key);
-                        exit(1);
-                    }
-                    samples[j] = norm;
-                }
+                memcpy(samples, protein->origin, space->num * sizeof(float));
             } else {
                 // Invalid jobs die and produce "fail" obs
                 info = protein_sweep_suggest(protein, samples, NAN);

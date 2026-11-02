@@ -479,6 +479,8 @@ typedef struct {
     // Caller populates config variables
     SweepSpace *space;
     int num_random_samples;
+    int random_init;
+    int score_focus;
     int suggestions_per_pareto;
     int gp_training_iter;
     float gp_learning_rate;
@@ -502,6 +504,7 @@ typedef struct {
     float *fail_params, *fail_scores, *fail_costs;
     int succ_n, fail_n, n_top, dim, cost_dim;
     int *top_idx;
+    float *origin, *scales;
     float min_score, max_score, log_c_min, log_c_max;
     int acq_cap;
     float *d_scales, *d_candidates, *d_pred_y, *d_pred_c;
@@ -566,12 +569,13 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->acq_cap = acq_cap;
     int max_ext = sw->success_cap + sw->failure_cap;
     int kd_cap = max_ext > acq_cap ? max_ext : acq_cap;
-    float scales[dim];
+    sw->origin = (float *)malloc(dim * sizeof(float));
+    sw->scales = (float *)malloc(dim * sizeof(float));
     for (int i = 0; i < dim; i++) {
-        scales[i] = sw->space->spaces[i].scale;
+        sw->scales[i] = sw->space->spaces[i].scale;
     }
     cudaMalloc(&sw->d_scales, dim * sizeof(float));
-    cudaMemcpy(sw->d_scales, scales, dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(sw->d_scales, sw->scales, dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMalloc(&sw->d_candidates, acq_cap * dim * sizeof(float));
     cudaMalloc(&sw->d_pred_y, 2 * acq_cap * sizeof(float));
     sw->d_pred_c = sw->d_pred_y + acq_cap;
@@ -697,6 +701,21 @@ static float noise01(void) {
     return 0.1f * sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
 }
 
+// One draw in the same box the GP search uses, centered on the initial config.
+static void origin_step(ProteinSweep *sw, float *out, int is_fixed_cost,
+        float fixed_cost_norm) {
+    int dim = sw->dim;
+    for (int d = 0; d < dim; d++) {
+        float u = (rand() + 1.0f) / ((float)RAND_MAX + 2.0f);
+        float s = sw->scales[d] * sw->global_search_scale;
+        float val = sw->origin[d] + s * (2.0f * u - 1.0f);
+        out[d] = fmaxf(-1.0f, fminf(1.0f, val));
+    }
+    if (is_fixed_cost && sw->cost_dim >= 0) {
+        out[sw->cost_dim] = fixed_cost_norm;
+    }
+}
+
 static void sobol_fallback(ProteinSweep *sw, float *out, int is_fixed_cost,
         float fixed_cost_norm) {
     int dim = sw->dim, cost_dim = sw->cost_dim;
@@ -713,6 +732,16 @@ static void sobol_fallback(ProteinSweep *sw, float *out, int is_fixed_cost,
         out[cost_dim] = fmaxf(-1.0f,
             fminf(1.0f, sw->cost_random_suggestion + noise01()));
     }
+}
+
+static void suggest_uninformed(ProteinSweep *sw, float *out, int is_fixed_cost,
+        float fixed_cost_norm, ProteinSweepInfo *info) {
+    if (sw->random_init) {
+        sobol_fallback(sw, out, is_fixed_cost, fixed_cost_norm);
+        info->is_random = 1;
+        return;
+    }
+    origin_step(sw, out, is_fixed_cost, fixed_cost_norm);
 }
 
 // KD Tree near-duplicate filter
@@ -843,6 +872,13 @@ static int pareto_cmp(const void *a, const void *b) {
     return (ca > cb) - (ca < cb);
 }
 
+static const float *g_rank_scores;
+static int score_desc_cmp(const void *a, const void *b) {
+    float sa = g_rank_scores[*(const int *)a];
+    float sb = g_rank_scores[*(const int *)b];
+    return (sa < sb) - (sa > sb);
+}
+
 ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         float *out, float fixed_cost_norm) {
     ProteinSweepInfo info = {0};
@@ -850,9 +886,9 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     int dim = sw->dim, cost_dim = sw->cost_dim;
     int is_fixed_cost = !isnan(fixed_cost_norm);
 
-    if (sw->suggestion_idx <= sw->num_random_samples || sw->succ_n == 0) {
-        sobol_fallback(sw, out, is_fixed_cost, fixed_cost_norm);
-        info.is_random = 1;
+    if (sw->succ_n == 0 || (sw->random_init
+            && sw->suggestion_idx <= sw->num_random_samples)) {
+        suggest_uninformed(sw, out, is_fixed_cost, fixed_cost_norm, &info);
         return info;
     }
 
@@ -1102,30 +1138,45 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     int *use_pareto = sw->prune_pareto ? sw->pruned_buf : sw->pareto_buf;
     int n_use = sw->prune_pareto ? n_pruned : n_pareto;
 
-    // Search centers
+    // Search centers. Score mode stays on the best scores. Pareto mode also
+    // keeps every length-efficient run and shorter copies of the best few.
     int n_centers = 0;
-    for (int i = 0; i < n_use; i++) {
-        memcpy(&sw->centers_buf[n_centers++ * dim],
-            &sw->succ_params[use_pareto[i] * dim], dim * sizeof(float));
-    }
-    float divisors[] = {2.0f, 3.0f};
-    int n_shift = (cost_dim >= 0) ? 2 : 1;
-    for (int r = 0; r < n_shift; r++) {
-        for (int i = 0; i < sw->n_top; i++) {
-            const float *src = &sw->succ_params[sw->top_idx[i] * dim];
-            float *dst = &sw->centers_buf[n_centers * dim];
-            memcpy(dst, src, dim * sizeof(float));
-            if (cost_dim >= 0) {
-                float orig = src[cost_dim];
-                dst[cost_dim] = orig - (orig + 1.0f) / divisors[r];
+    if (sw->score_focus) {
+        for (int i = 0; i < sw->succ_n; i++) {
+            sw->pruned_buf[i] = i;
+        }
+        g_rank_scores = sw->succ_scores;
+        qsort(sw->pruned_buf, sw->succ_n, sizeof(int), score_desc_cmp);
+        int n_best = sw->top_k < sw->succ_n ? sw->top_k : sw->succ_n;
+        for (int i = 0; i < n_best; i++) {
+            int idx = sw->pruned_buf[i];
+            memcpy(&sw->centers_buf[n_centers++ * dim],
+                &sw->succ_params[idx * dim], dim * sizeof(float));
+        }
+    } else {
+        for (int i = 0; i < n_use; i++) {
+            memcpy(&sw->centers_buf[n_centers++ * dim],
+                &sw->succ_params[use_pareto[i] * dim], dim * sizeof(float));
+        }
+        float divisors[] = {2.0f, 3.0f};
+        int n_shift = (cost_dim >= 0) ? 2 : 1;
+        for (int r = 0; r < n_shift; r++) {
+            for (int i = 0; i < sw->n_top; i++) {
+                const float *src = &sw->succ_params[sw->top_idx[i] * dim];
+                float *dst = &sw->centers_buf[n_centers * dim];
+                memcpy(dst, src, dim * sizeof(float));
+                if (cost_dim >= 0) {
+                    float orig = src[cost_dim];
+                    dst[cost_dim] = orig - (orig + 1.0f) / divisors[r];
+                }
+                n_centers++;
             }
-            n_centers++;
         }
     }
 
-    // Target cost
+    // Target cost. Score mode keeps the budget cap and drops the ladder.
     float target_cost = 0.0f;
-    if (!is_fixed_cost) {
+    if (!is_fixed_cost && !sw->score_focus) {
         if (sw->pool_remaining <= 0) {
             for (int i = PROTEIN_NUM_COST_RATIOS - 1; i > 0; i--) {
                 int j = rand() % (i + 1);
@@ -1167,8 +1218,7 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     }
 
     if (n_cands == 0) {
-        sobol_fallback(sw, out, is_fixed_cost, fixed_cost_norm);
-        info.is_random = 1;
+        suggest_uninformed(sw, out, is_fixed_cost, fixed_cost_norm, &info);
         return info;
     }
 
@@ -1241,8 +1291,12 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         if (!is_fixed_cost) {
             float cn = sw->h_pred[n_cands + i];
             float c = expf(cn * (log_c_max - log_c_min) + log_c_min);
-            s *= (c < sw->max_suggestion_cost ? 1.0f : 0.0f)
-                * (1.0f - fabsf(target_cost - cn));
+            float cap = c < sw->max_suggestion_cost ? 1.0f : 0.0f;
+            float ladder = 1.0f;
+            if (!sw->score_focus) {
+                ladder = 1.0f - fabsf(target_cost - cn);
+            }
+            s *= cap * ladder;
         }
         if (sw->clf_fitted) {
             float z = sw->clf_bias;
