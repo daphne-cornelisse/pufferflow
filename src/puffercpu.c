@@ -552,6 +552,11 @@ void mingru_zero_term(MinGRU* layer, const float* terminals) {
 //   decoder weight ((atn_sum+1) x hidden_dim, last output is value)
 //   decoder logstd (1 x num_actions) IF continuous
 //   mingru weights[0..num_layers-1] (3*hidden_dim x hidden_dim each)
+// Drive replaces the linear encoder. Its parameter order is the tower
+// list in ocean/drive/drive_encoder.cu.
+#ifdef PUFFER_DRIVE
+typedef struct DriveEnc DriveEnc;
+#endif
 typedef struct PufferNet {
     int num_agents;
     float* obs;
@@ -562,7 +567,350 @@ typedef struct PufferNet {
     int is_continuous;
     int num_actions;
     Multidiscrete* multidiscrete;
+#ifdef PUFFER_DRIVE
+    DriveEnc* drive;
+#endif
 } PufferNet;
+
+#ifdef PUFFER_DRIVE
+#include "constants.h"
+
+#define DRIVE_ROAD_CONT (ROAD_FEATURES - 1)
+#define DRIVE_ROAD_CLASSES (DRIVEWAY - ROAD_LANE + 1)
+#define DRIVE_ROAD_IN (DRIVE_ROAD_CONT + DRIVE_ROAD_CLASSES)
+
+#define DRIVE_ATTN_Q 4
+#define DRIVE_ATTN_HEADS 4
+
+struct DriveEnc {
+    int hidden;
+    int batch;
+    float* ego_w1; float* ego_b1; float* ego_g; float* ego_be;
+    float* ego_w2; float* ego_b2;
+    float* part_w1; float* part_b1; float* part_g; float* part_be;
+    float* part_w2; float* part_b2;
+    float* road_w1; float* road_b1; float* road_g; float* road_be;
+    float* road_w2; float* road_b2;
+    float* q_lat; float* wq; float* bq; float* wk; float* bk;
+    float* wv; float* bv; float* wo; float* bo;
+    float* attn_g; float* attn_be; float* fc_w; float* fc_b;
+    float* qproj;
+    float* scratch;
+};
+
+static int drive_align8(int n) {
+    return (n + 7) & ~7;
+}
+
+static int drive_tower_nfloats(int n, int H, int feat) {
+    n = drive_align8(n + H * feat);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H * H);
+    n = drive_align8(n + H);
+    return n;
+}
+
+static int drive_encoder_nfloats(int H) {
+    int n = 0;
+    int Q = DRIVE_ATTN_Q;
+    n = drive_tower_nfloats(n, H, EGO_FEATURES);
+    n = drive_tower_nfloats(n, H, PARTNER_FEATURES);
+    n = drive_tower_nfloats(n, H, DRIVE_ROAD_IN);
+    n = drive_align8(n + Q * H);
+    n = drive_align8(n + H * H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H * H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H * H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H * H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H * Q * H);
+    n = drive_align8(n + H);
+    return n;
+}
+
+static float* drive_take(Weights* w, int n) {
+    return get_weights_aligned(w, n);
+}
+
+static void drive_load_tower(Weights* w, int H, int feat,
+        float** w1, float** b1, float** g, float** be,
+        float** w2, float** b2) {
+    *w1 = drive_take(w, H * feat);
+    *b1 = drive_take(w, H);
+    *g = drive_take(w, H);
+    *be = drive_take(w, H);
+    *w2 = drive_take(w, H * H);
+    *b2 = drive_take(w, H);
+}
+
+static DriveEnc* drive_enc_load(Weights* w, int batch, int H) {
+    DriveEnc* d = calloc(1, sizeof(DriveEnc));
+    d->hidden = H;
+    d->batch = batch;
+    drive_load_tower(w, H, EGO_FEATURES,
+        &d->ego_w1, &d->ego_b1, &d->ego_g, &d->ego_be,
+        &d->ego_w2, &d->ego_b2);
+    drive_load_tower(w, H, PARTNER_FEATURES,
+        &d->part_w1, &d->part_b1, &d->part_g, &d->part_be,
+        &d->part_w2, &d->part_b2);
+    drive_load_tower(w, H, DRIVE_ROAD_IN,
+        &d->road_w1, &d->road_b1, &d->road_g, &d->road_be,
+        &d->road_w2, &d->road_b2);
+    d->q_lat = drive_take(w, DRIVE_ATTN_Q * H);
+    d->wq = drive_take(w, H * H);
+    d->bq = drive_take(w, H);
+    d->wk = drive_take(w, H * H);
+    d->bk = drive_take(w, H);
+    d->wv = drive_take(w, H * H);
+    d->bv = drive_take(w, H);
+    d->wo = drive_take(w, H * H);
+    d->bo = drive_take(w, H);
+    d->attn_g = drive_take(w, H);
+    d->attn_be = drive_take(w, H);
+    d->fc_w = drive_take(w, H * DRIVE_ATTN_Q * H);
+    d->fc_b = drive_take(w, H);
+    d->qproj = calloc((size_t)DRIVE_ATTN_Q * H, sizeof(float));
+    int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
+    int stride = (3 + 2 * S + 2 * DRIVE_ATTN_Q) * H + S;
+    d->scratch = calloc((size_t)batch * (size_t)stride, sizeof(float));
+    return d;
+}
+
+static void drive_token(float* h2, const float* x, int F,
+        const float* w1, const float* b1, const float* g, const float* be,
+        const float* w2, const float* b2, float* h1, float* ln, int H) {
+    for (int o = 0; o < H; o++) {
+        const float* wr = w1 + (size_t)o * F;
+        float sum = b1[o];
+        for (int i = 0; i < F; i++) {
+            sum += x[i] * wr[i];
+        }
+        h1[o] = sum;
+    }
+    float mean = 0.0f;
+    for (int i = 0; i < H; i++) {
+        mean += h1[i];
+    }
+    mean /= (float)H;
+    float var = 0.0f;
+    for (int i = 0; i < H; i++) {
+        float d = h1[i] - mean;
+        var += d * d;
+    }
+    var /= (float)H;
+    float inv = 1.0f / sqrtf(var + 1.0e-5f);
+    for (int i = 0; i < H; i++) {
+        ln[i] = (h1[i] - mean) * inv * g[i] + be[i];
+    }
+    for (int o = 0; o < H; o++) {
+        const float* wr = w2 + (size_t)o * H;
+        float sum = b2[o];
+        for (int i = 0; i < H; i++) {
+            sum += ln[i] * wr[i];
+        }
+        h2[o] = sum;
+    }
+}
+
+static void drive_project(float* y, const float* x, const float* w,
+        const float* b, int K, int N) {
+    for (int n = 0; n < N; n++) {
+        const float* wr = w + (size_t)n * K;
+        float sum = b[n];
+        for (int k = 0; k < K; k++) {
+            sum += x[k] * wr[k];
+        }
+        y[n] = sum;
+    }
+}
+
+static void drive_ln_vec(float* y, const float* x, const float* g,
+        const float* be, int H) {
+    float mean = 0.0f;
+    int i;
+    for (i = 0; i < H; i++) {
+        mean += x[i];
+    }
+    mean /= (float)H;
+    float var = 0.0f;
+    for (i = 0; i < H; i++) {
+        float d = x[i] - mean;
+        var += d * d;
+    }
+    var /= (float)H;
+    float inv = 1.0f / sqrtf(var + 1.0e-5f);
+    for (i = 0; i < H; i++) {
+        y[i] = (x[i] - mean) * inv * g[i] + be[i];
+    }
+}
+
+// One token into K[s], V[s]. Padding is a real key, same as the CUDA path.
+static void drive_kv_token(DriveEnc* d, float* K, float* V, int s,
+        const float* x, int F, const float* w1, const float* b1,
+        const float* g, const float* be, const float* w2, const float* b2,
+        float* h1, float* ln, float* h2) {
+    int H = d->hidden;
+    drive_token(h2, x, F, w1, b1, g, be, w2, b2, h1, ln, H);
+    drive_project(K + (size_t)s * H, h2, d->wk, d->bk, H, H);
+    drive_project(V + (size_t)s * H, h2, d->wv, d->bv, H, H);
+}
+
+static void drive_kv_slots(DriveEnc* d, float* K, float* V, int* s,
+        const float* row, int off, int slots, int raw, int one_hot,
+        const float* w1, const float* b1, const float* g, const float* be,
+        const float* w2, const float* b2, float* h1, float* ln, float* h2) {
+    int n;
+    for (n = 0; n < slots; n++) {
+        const float* rawf = row + off + n * raw;
+        float feat[16];
+        const float* x = rawf;
+        int F = raw;
+        if (one_hot) {
+            int cls;
+            int k;
+            for (k = 0; k < DRIVE_ROAD_CONT; k++) {
+                feat[k] = rawf[k];
+            }
+            cls = (int)rawf[DRIVE_ROAD_CONT];
+            if (cls < 0) {
+                cls = 0;
+            }
+            if (cls >= DRIVE_ROAD_CLASSES) {
+                cls = DRIVE_ROAD_CLASSES - 1;
+            }
+            for (k = 0; k < DRIVE_ROAD_CLASSES; k++) {
+                feat[DRIVE_ROAD_CONT + k] = (k == cls) ? 1.0f : 0.0f;
+            }
+            x = feat;
+            F = DRIVE_ROAD_IN;
+        }
+        drive_kv_token(d, K, V, *s, x, F, w1, b1, g, be, w2, b2, h1, ln, h2);
+        *s += 1;
+    }
+}
+
+// One car. y is the encoder output (H). sc is that car's scratch row.
+// qproj is already filled. Does not touch another car's state.
+static void drive_encode_row(DriveEnc* d, const float* row, float* y, float* sc) {
+    int H = d->hidden;
+    int Q = DRIVE_ATTN_Q;
+    int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
+    int part_off = EGO_FEATURES;
+    int road_off = EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS;
+    int head_dim = H / DRIVE_ATTN_HEADS;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    float* h1 = sc;
+    float* ln = sc + H;
+    float* h2 = sc + 2 * H;
+    float* K = sc + 3 * H;
+    float* V = K + (size_t)S * H;
+    float* ctx = V + (size_t)S * H;
+    float* pre = ctx + (size_t)Q * H;
+    float* scores = pre + (size_t)Q * H;
+    int s = 0;
+    int h;
+    int head;
+    drive_kv_slots(d, K, V, &s, row, 0, 1, EGO_FEATURES, 0,
+        d->ego_w1, d->ego_b1, d->ego_g, d->ego_be,
+        d->ego_w2, d->ego_b2, h1, ln, h2);
+    drive_kv_slots(d, K, V, &s, row, road_off,
+        MAX_ROAD_SEGMENT_OBSERVATIONS, ROAD_FEATURES, 1,
+        d->road_w1, d->road_b1, d->road_g, d->road_be,
+        d->road_w2, d->road_b2, h1, ln, h2);
+    drive_kv_slots(d, K, V, &s, row, part_off, MAX_AGENTS,
+        PARTNER_FEATURES, 0,
+        d->part_w1, d->part_b1, d->part_g, d->part_be,
+        d->part_w2, d->part_b2, h1, ln, h2);
+    for (h = 0; h < Q * H; h++) {
+        ctx[h] = 0.0f;
+    }
+    for (head = 0; head < DRIVE_ATTN_HEADS; head++) {
+        int h0 = head * head_dim;
+        for (int q = 0; q < Q; q++) {
+            float m;
+            float sum = 0.0f;
+            int t;
+            int i;
+            for (t = 0; t < S; t++) {
+                float dot = 0.0f;
+                for (i = 0; i < head_dim; i++) {
+                    dot += d->qproj[q * H + h0 + i] * K[t * H + h0 + i];
+                }
+                scores[t] = dot * scale;
+            }
+            m = scores[0];
+            for (t = 1; t < S; t++) {
+                if (scores[t] > m) {
+                    m = scores[t];
+                }
+            }
+            for (t = 0; t < S; t++) {
+                scores[t] = expf(scores[t] - m);
+                sum += scores[t];
+            }
+            for (t = 0; t < S; t++) {
+                scores[t] /= sum;
+            }
+            for (i = 0; i < head_dim; i++) {
+                float acc = 0.0f;
+                for (t = 0; t < S; t++) {
+                    acc += scores[t] * V[t * H + h0 + i];
+                }
+                ctx[q * H + h0 + i] = acc;
+            }
+        }
+    }
+    for (int q = 0; q < Q; q++) {
+        drive_project(pre + (size_t)q * H, ctx + (size_t)q * H,
+            d->wo, d->bo, H, H);
+        for (h = 0; h < H; h++) {
+            pre[q * H + h] += d->q_lat[q * H + h];
+        }
+        drive_ln_vec(ctx + (size_t)q * H, pre + (size_t)q * H,
+            d->attn_g, d->attn_be, H);
+    }
+    drive_project(y, ctx, d->fc_w, d->fc_b, Q * H, H);
+    for (h = 0; h < H; h++) {
+        y[h] = tanhf(y[h]);
+    }
+}
+
+static void drive_encode(PufferNet* net, float* obs) {
+    DriveEnc* d = net->drive;
+    int B = d->batch;
+    int H = d->hidden;
+    int Q = DRIVE_ATTN_Q;
+    int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
+    int stride = (3 + 2 * S + 2 * Q) * H + S;
+    int q;
+    for (q = 0; q < Q; q++) {
+        drive_project(d->qproj + (size_t)q * H, d->q_lat + (size_t)q * H,
+            d->wq, d->bq, H, H);
+    }
+#ifdef _OPENMP
+#pragma omp parallel for if (B >= 8) schedule(static)
+#endif
+    for (int b = 0; b < B; b++) {
+        drive_encode_row(d, obs + (size_t)b * OBS_SIZE,
+            net->encoder->output + (size_t)b * H,
+            d->scratch + (size_t)b * stride);
+    }
+}
+#endif
+
+static void puf_encode(PufferNet* net, float* obs) {
+#ifdef PUFFER_DRIVE
+    drive_encode(net, obs);
+#else
+    linear(net->encoder, obs);
+#endif
+}
 
 PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
         int hidden_dim, int num_layers, int logit_sizes[], int num_actions) {
@@ -578,7 +926,19 @@ PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
     net->is_continuous = is_continuous;
     net->num_actions = num_actions;
 
+#ifdef PUFFER_DRIVE
+    assert(input_dim == OBS_SIZE);
+    assert(hidden_dim % 8 == 0);
+    net->encoder = calloc(1, sizeof(Linear)
+        + (size_t)num_agents * hidden_dim * sizeof(float));
+    net->encoder->output = (float*)(net->encoder + 1);
+    net->encoder->batch_size = num_agents;
+    net->encoder->input_dim = input_dim;
+    net->encoder->output_dim = hidden_dim;
+    net->drive = drive_enc_load(weights, num_agents, hidden_dim);
+#else
     net->encoder = make_linear(weights, num_agents, input_dim, hidden_dim);
+#endif
     net->decoder = make_linear(weights, num_agents, hidden_dim, atn_sum + 1);
     if (net->is_continuous) {
         net->log_std = get_weights_aligned(weights, num_actions);
@@ -602,7 +962,7 @@ void _gaussian_mean(float* input, float* output, int batch_size, int num_actions
 void forward_puffernet(PufferNet* net, float* observations, float* actions,
         const unsigned char* mask, const float* terminals) {
     mingru_zero_term(net->mingru, terminals);
-    linear(net->encoder, observations);
+    puf_encode(net, observations);
     mingru(net->mingru, net->encoder->output);
     linear(net->decoder, net->mingru->output);
     if (net->is_continuous) {
@@ -612,8 +972,98 @@ void forward_puffernet(PufferNet* net, float* observations, float* actions,
     }
 }
 
+#ifdef PUFFER_DRIVE
+// Critic head for one car. Reads the MinGRU state and does not write it,
+// so the action forward still consumes this observation once.
+static float puffernet_value(PufferNet* net, const float* obs, int agent) {
+    DriveEnc* d = net->drive;
+    MinGRU* g = net->mingru;
+    int H = d->hidden;
+    int Q = DRIVE_ATTN_Q;
+    int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
+    int stride = (3 + 2 * S + 2 * Q) * H + S;
+    static float* scratch = NULL;
+    static int scratch_n = 0;
+    static float* hid = NULL;
+    static float* nxt = NULL;
+    static float* combined = NULL;
+    static int hid_n = 0;
+    int q;
+    int l;
+    assert(agent >= 0 && agent < d->batch);
+    assert(H == g->hidden_size);
+    if (scratch_n < stride) {
+        scratch = (float*)realloc(scratch, (size_t)stride * sizeof(float));
+        assert(scratch);
+        scratch_n = stride;
+    }
+    if (hid_n < 3 * H) {
+        hid = (float*)realloc(hid, (size_t)H * sizeof(float));
+        nxt = (float*)realloc(nxt, (size_t)H * sizeof(float));
+        combined = (float*)realloc(combined, (size_t)3 * H * sizeof(float));
+        assert(hid && nxt && combined);
+        hid_n = 3 * H;
+    }
+    for (q = 0; q < Q; q++) {
+        drive_project(d->qproj + (size_t)q * H, d->q_lat + (size_t)q * H,
+            d->wq, d->bq, H, H);
+    }
+    drive_encode_row(d, obs, hid, scratch);
+    for (l = 0; l < g->num_layers; l++) {
+        Linear* proj = g->proj[l];
+        int Id = proj->input_dim;
+        int O = proj->output_dim;
+        const float* sb = g->state + ((size_t)l * g->batch_size + agent) * H;
+        int o;
+        int h;
+        assert(Id == H && O == 3 * H);
+        for (o = 0; o < O; o++) {
+            const float* w = proj->weights + (size_t)o * Id;
+            float sum = 0.0f;
+            int i;
+            for (i = 0; i < Id; i++) {
+                sum += hid[i] * w[i];
+            }
+            combined[o] = sum;
+        }
+        for (h = 0; h < H; h++) {
+            float hidden = combined[h];
+            float gate = combined[H + h];
+            float hw = combined[2 * H + h];
+            float s = sb[h];
+            float gate_s = _sigmoid(gate);
+            float h_tilde = (hidden >= 0.0f) ? hidden + 0.5f : _sigmoid(hidden);
+            float mingru_out = s + gate_s * (h_tilde - s);
+            float hw_s = _sigmoid(hw);
+            nxt[h] = hw_s * mingru_out + (1.0f - hw_s) * hid[h];
+        }
+        memcpy(hid, nxt, (size_t)H * sizeof(float));
+    }
+    {
+        Linear* dec = net->decoder;
+        int Id = dec->input_dim;
+        int row = dec->output_dim - 1;
+        const float* w = dec->weights + (size_t)row * Id;
+        float sum = 0.0f;
+        int i;
+        assert(row >= 0 && Id == H);
+        for (i = 0; i < Id; i++) {
+            sum += hid[i] * w[i];
+        }
+        return sum;
+    }
+}
+#endif
+
 void free_puffernet(PufferNet* net) {
     free(net->obs);
+#ifdef PUFFER_DRIVE
+    if (net->drive) {
+        free(net->drive->scratch);
+        free(net->drive->qproj);
+        free(net->drive);
+    }
+#endif
     free(net->encoder);
     free(net->decoder);
     free_mingru(net->mingru);
@@ -660,7 +1110,7 @@ static void bench_greedy(void* ctx, const float* obs, int n,
     assert(net->num_agents == n);
     assert(!net->is_continuous);
     mingru_zero_term(net->mingru, terminals);
-    linear(net->encoder, (float*)obs);
+    puf_encode(net, (float*)obs);
     mingru(net->mingru, net->encoder->output);
     linear(net->decoder, net->mingru->output);
     multidiscrete(net->multidiscrete, net->decoder->output, actions, 1, NULL);
@@ -707,7 +1157,12 @@ static int puffernet_weight_count(int input_dim, int hidden, int layers,
         }
     }
     int n = 0;
+#ifdef PUFFER_DRIVE
+    assert(input_dim == OBS_SIZE);
+    n = drive_encoder_nfloats(hidden);
+#else
     n = puf_align8(n + hidden * input_dim);
+#endif
     n = puf_align8(n + (atn_sum + 1) * hidden);
     if (continuous) {
         n = puf_align8(n + num_actions);

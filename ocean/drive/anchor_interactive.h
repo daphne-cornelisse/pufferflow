@@ -799,7 +799,7 @@ static void ademo_policy_dist(const float* obs, int commit) {
     }
     float term = 0.0f;
     mingru_zero_term(net->mingru, &term);
-    linear(net->encoder, (float*)obs);
+    puf_encode(net, (float*)obs);
     mingru(net->mingru, net->encoder->output);
     linear(net->decoder, net->mingru->output);
     float* logits = net->decoder->output;

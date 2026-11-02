@@ -936,6 +936,9 @@ void pufferl_forward(PuffeRL* pufferl, int buf, int t, cudaStream_t stream) {
     }
 
     if (step_graph) {
+        int block = hypers->total_agents / hypers->num_buffers;
+        int H = pufferl->policies[0].arch.encoder.out_dim;
+        drive_lt_prepare(block, H, stream);
         assert(cudaStreamBeginCapture(
             stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess
             && "cudaStreamBeginCapture failed");
@@ -1356,6 +1359,9 @@ static void rollout_start(PuffeRL* p) {
         double t_cap = 0;
         if (first) {
             t_cap = wall_clock();
+            int block = p->hypers.total_agents / p->hypers.num_buffers;
+            int H = p->policies[0].arch.encoder.out_dim;
+            drive_lt_prepare(block, H, stream);
             assert(cudaStreamBeginCapture(
                 stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess
                 && "cudaStreamBeginCapture failed");
@@ -1864,6 +1870,8 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     profile_begin("train_forward_backward", hypers->profile);
     if (first) {
         double t_cap = wall_clock();
+        int H = pufferl->policies[0].arch.encoder.out_dim;
+        drive_lt_prepare(hypers->minibatch_size, H, train_stream);
         assert(cudaStreamBeginCapture(
             train_stream, cudaStreamCaptureModeThreadLocal)
             == cudaSuccess && "cudaStreamBeginCapture failed");
