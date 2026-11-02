@@ -1347,6 +1347,29 @@ static const char* puf_model_path(const char* env_name, const char* cli_path,
 #endif
 }
 
+#ifdef PUFFER_DRIVE
+// Value of the observation the sim panel is about to draw.
+static void drive_note_value(PufferNet* net, Drive* env) {
+    int n = env->active_agent_count;
+    int slot = env->selected_agent_idx;
+    float* obs;
+    if (!net || n <= 0) {
+        env->predicted_ready = 0;
+        return;
+    }
+    if (slot < 0 || slot >= n) {
+        slot = 0;
+    }
+    obs = env->agents[slot].observations;
+    if (!obs) {
+        env->predicted_ready = 0;
+        return;
+    }
+    env->predicted_value = puffernet_value(net, obs, slot);
+    env->predicted_ready = 1;
+}
+#endif
+
 int main(int argc, char** argv) {
     const char* env_name = PUFFER_ENV_NAME;
     int argi = 1;
@@ -1849,6 +1872,9 @@ int main(int argc, char** argv) {
     }
 #endif
     if (!headless && !recording) {
+#ifdef PUFFER_DRIVE
+        drive_note_value(net, &env);
+#endif
         puf_render(&env);
     }
     // Web: Raylib 5.5 WindowShouldClose() always emscripten_sleep(16).
@@ -1943,6 +1969,11 @@ int main(int argc, char** argv) {
             }
         }
         if (!headless || recording) {
+#ifdef PUFFER_DRIVE
+            if (!recording) {
+                drive_note_value(net, &env);
+            }
+#endif
             puf_render(&env);
             if (recording && puf_record_done()) {
                 break;

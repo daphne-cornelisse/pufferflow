@@ -225,6 +225,9 @@ struct Env {
     int sim_lock_actions;
     // Anchor demo. Do not grow to the monitor. The user can resize.
     int sim_user_size;
+    // Critic head for the observation on screen. ready is 0 with no policy.
+    float predicted_value;
+    int predicted_ready;
     void (*hud_extra)(struct Env* env);
     int (*ui_hot)(struct Env* env);
     // Anchor demo. Log rewind instead of a random spawn.

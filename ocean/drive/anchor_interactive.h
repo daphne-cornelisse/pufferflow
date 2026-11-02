@@ -1897,12 +1897,25 @@ static void ademo_shutdown(void) {
     g_term = NULL;
 }
 
+// The policy forward just ran on the observation this frame draws.
+static void ademo_note_value(Drive* env) {
+    PufferNet* net = g_ademo.net;
+    if (!ademo_policy_on() || !net || !net->decoder
+            || net->decoder->output_dim < 1) {
+        env->predicted_ready = 0;
+        return;
+    }
+    env->predicted_value = net->decoder->output[net->decoder->output_dim - 1];
+    env->predicted_ready = 1;
+}
+
 static void ademo_frame(Drive* env, int step) {
     g_ademo.commit = step && !puf_sim_paused(env);
     ademo_forward(env);
     ademo_actions(env);
     ademo_distances();
     ademo_hist_note(env);
+    ademo_note_value(env);
     puf_render(env);
     if (step && !puf_sim_paused(env)) {
         if (g_logs && env->timestep >= ADEMO_LOOP) {

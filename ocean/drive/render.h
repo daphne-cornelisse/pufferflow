@@ -450,9 +450,11 @@ static void sim_obs_draw(Drive* env) {
     }
     DrawText(goal_txt, (int)rect.x + 10, (int)rect.y + 60, 14, SAGE_INK);
 
+    // The critic's value sits under the crop.
+    const float value_foot = 20.0f;
     Rectangle plot = {
         rect.x + 10.0f, rect.y + 78.0f,
-        rect.width - 20.0f, rect.height - 88.0f
+        rect.width - 20.0f, rect.height - 88.0f - value_foot
     };
     float side = plot.width;
     if (plot.height < side) {
@@ -565,6 +567,14 @@ static void sim_obs_draw(Drive* env) {
         vlen, STEEL_INK);
     EndScissorMode();
     DrawRectangleLinesEx(plot, 1.0f, LINE);
+    char value_txt[32];
+    if (env->predicted_ready) {
+        snprintf(value_txt, sizeof(value_txt), "value %.2f", env->predicted_value);
+    } else {
+        snprintf(value_txt, sizeof(value_txt), "value --");
+    }
+    DrawText(value_txt, (int)rect.x + 10,
+        (int)(plot.y + plot.height + 3.0f), 14, INK);
 }
 
 static void sim_transport_draw(Drive* env) {
