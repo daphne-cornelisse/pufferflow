@@ -129,7 +129,7 @@
 // Right-hand column: playback and follow.
 #define SIM_COL_W 132.0f
 #define SIM_OBS_W 220.0f
-#define SIM_OBS_H 264.0f
+#define SIM_OBS_H 280.0f
 #define SIM_OBS_RANGE 12.0f
 
 static float ACCELERATION_VALUES[NUM_ACCEL_BINS];

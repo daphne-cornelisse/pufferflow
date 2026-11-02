@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 """Plot a protein sweep from its log and per-run metrics.
 
-The figure is seven rows. The sweep objective against sweep index is the
-first panel, colored by run. Score against collision count is next. Every panel
-colors runs with ColorBrewer Set1, except episode return against sweep
-index, which is colored by trial wall clock. The other panels are return
-curves, goal score, infractions per meter, score against jerk when
-those series exist (otherwise meters per infraction), and parameter count.
+The figure is six rows. The sweep objective against sweep index is the
+first panel, colored by run. Episode return against sweep index is next,
+colored by trial wall clock, then the return curve. Every other panel
+uses the default seaborn palette. The next row is anchor loss over training steps,
+score against jerk when those series exist (otherwise meters per
+infraction), and parameter count.
 The next row is final meters per infraction against score, completion
 rate against score, then meters driven before the first vehicle overlap
 or off-road (env/distance_before_first_failure) over training steps.
 Older inis that still say env/distance_before_failure are read as the
 same series.
 A panel stays blank when the run ini has no such series. The next row is
-training score against anchor coefficient, then the per-town scores
-score_town_01, score_town_02, score_town_06, and score_town_10. A town
-panel stays blank when that run ini has no such series. The next row is
-the benchmark: replay collision rate, human-replay score against anchor
-coefficient, and long-horizon score. That score is the mean number of
-steps before a collision or an off-road event, on one episode length.
+training score against anchor coefficient beside town score against
+centerline density at 128 cars. Each panel is the same width as a top-row
+subplot. Density is the share of lane centerline taken by car length, from
+config/town_density.json. Every run is one point on each town, in one
+swarm so points that share a density do not stack. Towns are ordered by
+that density. A town is skipped when that run has no score for it.
 Under that,
 the rate-like hyperparameters share one boxplot, each scaled to its own
 min and max. Hidden size, layer count, horizon, minibatch size, and
 timestep budget each have their own panel, in the units they
 were swept, with one swarm point per run.
 
-Benchmark numbers come from a [benchmark] section in the run ini, or from
-logs/drive/<run_id>.benchmark.txt written by ./drive --benchmark. A run
-with neither is left blank on that row.
+A benchmark report can still name the sweep objective. That report is a
+[benchmark] section in the run ini, or logs/drive/<run_id>.benchmark.txt
+written by ./drive --benchmark.
 
     python scripts/plot_sweep.py logs/drive/sweep.log -o logs/drive/sweep-panels.png
 
@@ -38,10 +38,12 @@ logs/drive, or logs/replay_sweep when that directory is the output.
 """
 
 import argparse
+import json
 import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.transforms import ScaledTranslation
 import pandas as pd
 import seaborn as sns
 
@@ -106,16 +108,6 @@ BENCH_KEYS = (
     "replay_collision",
     "replay_score",
     "horizon_score",
-)
-BENCH_PANELS = (
-    ("replay_collision", "collision rate", "Replay collision"),
-    ("replay_score", "score", "Human replay score"),
-    (
-        "horizon_score",
-        "steps",
-        "Long-horizon score\n"
-        "mean steps before a collision or off-road",
-    ),
 )
 # Final env/score on each CARLA map. Town10HD is score_town_10.
 TOWN_FIELDS = (
@@ -250,7 +242,7 @@ def metrics_file(metrics_dir, run, log_mtime):
 def load_frames(log_path, metrics_dir):
     log_mtime = log_path.stat().st_mtime
     returns = []
-    rates = []
+    losses = []
     counts = []
     failures = []
     summary = []
@@ -269,7 +261,7 @@ def load_frames(log_path, metrics_dir):
         completion_vals = metric_series(text, "env/completion_rate")
         count_vals = metric_series(text, "env/collision_count")
         gap_vals = metric_series(text, "env/avg_distance_per_infraction")
-        rate_vals = metric_series(text, "env/infractions_per_meter")
+        loss_vals = metric_series(text, "loss/anchor")
         distance_vals = metric_series(text, "env/distance_before_first_failure")
         if not distance_vals:
             distance_vals = metric_series(text, "env/distance_before_failure")
@@ -283,10 +275,10 @@ def load_frames(log_path, metrics_dir):
             continue
         for step, value in zip(steps, return_vals):
             returns.append({"run": run, "steps": step, "episode_return": value})
-        if rate_vals and len(rate_vals) == len(steps):
-            for step, value in zip(steps, rate_vals):
-                rates.append({
-                    "run": run, "steps": step, "infractions_per_meter": value,
+        if loss_vals and len(loss_vals) == len(steps):
+            for step, value in zip(steps, loss_vals):
+                losses.append({
+                    "run": run, "steps": step, "anchor_loss": value,
                 })
         if gap_vals and len(gap_vals) == len(steps):
             for step, value in zip(steps, gap_vals):
@@ -316,11 +308,6 @@ def load_frames(log_path, metrics_dir):
             "wall_min": wall_min,
             "collision_count": (
                 count_vals[-1] if count_vals and len(count_vals) == len(steps) else float("nan")
-            ),
-            "infractions_per_meter": (
-                rate_vals[-1]
-                if rate_vals and len(rate_vals) == len(steps)
-                else float("nan")
             ),
             "distance_before_first_failure": (
                 distance_vals[-1]
@@ -359,7 +346,7 @@ def load_frames(log_path, metrics_dir):
         raise SystemExit(f"no metrics for runs in {log_path}")
     return (
         pd.DataFrame(returns),
-        pd.DataFrame(rates),
+        pd.DataFrame(losses),
         pd.DataFrame(counts),
         pd.DataFrame(failures),
         pd.DataFrame(summary),
@@ -371,16 +358,27 @@ def series_key(run):
     return f"{int(run):04d}"
 
 
+def apply_figure_style():
+    sns.set_style("ticks")
+    sns.set_palette("deep")
+
+
+def style_ax(ax):
+    ax.set_axisbelow(True)
+    ax.grid(True, alpha=0.3)
+    sns.despine(ax=ax)
+
+
 def distinct_colors(count):
-    """ColorBrewer Set1. Extra runs repeat the nine colors."""
-    base = [tuple(color) for color in sns.color_palette("Set1")]
+    """Default seaborn palette. Extra runs repeat its ten colors."""
+    base = [tuple(color) for color in sns.color_palette("deep")]
     if count <= 0:
         return []
     return [base[i % len(base)] for i in range(count)]
 
 
 def categorical_palette(run_ids):
-    """Set1 color per run. The same run keeps that color on every panel."""
+    """One seaborn color per run. The same run keeps that color on every panel."""
     ordered = list(dict.fromkeys(int(run) for run in run_ids))
     colors = distinct_colors(len(ordered))
     return {series_key(run): colors[i] for i, run in enumerate(ordered)}
@@ -428,29 +426,26 @@ def blank_panel(ax, title, message):
 
 
 def figure_axes():
-    """Result panels, failure row, town scores, benchmark, coefficients, sizes."""
-    fig = plt.figure(figsize=(22.4, 28.5), dpi=200, layout="constrained")
+    """Result panels, failure row, anchor and density, coefficients, sizes."""
+    fig = plt.figure(figsize=(22.4, 24.5), dpi=100, layout="constrained")
     outer = fig.add_gridspec(
-        7, 1, height_ratios=[1.0, 1.0, 1.0, 1.0, 0.95, 1.05, 1.15],
+        6, 1, height_ratios=[1.0, 1.0, 1.0, 1.0, 1.05, 1.15],
     )
-    top = outer[0].subgridspec(1, 4, wspace=0.28)
-    mid = outer[1].subgridspec(1, 4, wspace=0.28)
-    axes = [fig.add_subplot(top[0, col]) for col in range(4)]
-    axes += [fig.add_subplot(mid[0, col]) for col in range(4)]
+    top = outer[0].subgridspec(1, 3, wspace=0.28)
+    mid = outer[1].subgridspec(1, 3, wspace=0.28)
+    axes = [fig.add_subplot(top[0, col]) for col in range(3)]
+    axes += [fig.add_subplot(mid[0, col]) for col in range(3)]
     failure_grid = outer[2].subgridspec(1, 3, wspace=0.28)
     failure_axes = [fig.add_subplot(failure_grid[0, col]) for col in range(3)]
-    town_grid = outer[3].subgridspec(1, 1 + len(TOWN_FIELDS), wspace=0.32)
-    town_axes = [
-        fig.add_subplot(town_grid[0, col]) for col in range(1 + len(TOWN_FIELDS))
-    ]
-    bench_grid = outer[4].subgridspec(1, 3, wspace=0.28)
-    bench_axes = [fig.add_subplot(bench_grid[0, col]) for col in range(3)]
-    coef_ax = fig.add_subplot(outer[5])
-    size_grid = outer[6].subgridspec(1, len(SIZE_HYPERS), wspace=0.42)
+    pair = outer[3].subgridspec(1, 3, wspace=0.28)
+    anchor_ax = fig.add_subplot(pair[0, 0])
+    density_ax = fig.add_subplot(pair[0, 1])
+    coef_ax = fig.add_subplot(outer[4])
+    size_grid = outer[5].subgridspec(1, len(SIZE_HYPERS), wspace=0.42)
     size_axes = [
         fig.add_subplot(size_grid[0, i]) for i in range(len(SIZE_HYPERS))
     ]
-    return fig, axes, failure_axes, town_axes, bench_axes, coef_ax, size_axes
+    return fig, axes, failure_axes, anchor_ax, density_ax, coef_ax, size_axes
 
 
 def scatter_metric(summary, x, y, ax, palette, markers=None):
@@ -487,39 +482,6 @@ def draw_score_vs_anchor(ax, summary, palette, markers=None):
     ax.set_xlabel("anchor coef")
     ax.set_ylabel("score")
     ax.set_title(title)
-
-
-def draw_town_scores(axes, summary, palette, x, markers=None):
-    """Final score on each town. Blank when the ini has no town series."""
-    xlabel = "sweep index" if x == "run" else "run order"
-    for ax, (key, title) in zip(axes, TOWN_FIELDS):
-        present = key in summary.columns and bool(summary[key].notna().any())
-        if not present:
-            ax.set_axis_off()
-            ax.set_title(title)
-            ax.text(
-                0.5, 0.5, "no town score",
-                ha="center", va="center", transform=ax.transAxes, color="0.45",
-            )
-            continue
-        scatter_metric(summary, x, key, ax, palette, markers)
-        lo = float(summary[x].min())
-        hi = float(summary[x].max())
-        if lo == hi:
-            lo, hi = lo - 0.5, hi + 0.5
-        else:
-            pad = 0.05 * (hi - lo)
-            lo, hi = lo - pad, hi + pad
-        ax.set_xlim(lo, hi)
-        fit_score_axis(ax, summary[key])
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("score")
-        ax.set_title(title)
-
-
-def draw_town_row(axes, summary, palette, x, markers=None):
-    draw_score_vs_anchor(axes[0], summary, palette, markers)
-    draw_town_scores(axes[1:], summary, palette, x, markers)
 
 
 def draw_gap_vs_score(ax, summary, palette, markers=None):
@@ -625,95 +587,104 @@ def draw_failure(axes, summary, curves, palette, x, markers=None):
     )
 
 
-def draw_replay_vs_coef(ax, summary, palette, markers=None):
-    """Human-replay score against the anchor coefficient."""
-    title = "Human replay score"
-    present = (
-        "replay_score" in summary.columns
-        and "anchor_coef" in summary.columns
-        and bool(summary["replay_score"].notna().any())
-        and bool(summary["anchor_coef"].notna().any())
-    )
-    if not present:
-        ax.set_axis_off()
-        ax.set_title(title)
-        ax.text(
-            0.5, 0.5, "no benchmark report",
-            ha="center", va="center", transform=ax.transAxes, color="0.45",
-        )
+def load_town_density():
+    """128-car centerline density for each town, from config/town_density.json."""
+    path = ROOT / "config" / "town_density.json"
+    if not path.is_file():
+        return []
+    payload = json.loads(path.read_text())
+    if int(payload.get("agents", 0)) != 128:
+        return []
+    score_key = {title: key for key, title in TOWN_FIELDS}
+    rows = []
+    for row in payload.get("towns", []):
+        if int(row.get("agents", 0)) != 128:
+            continue
+        town = row.get("town")
+        if town not in score_key or "centerline_pct" not in row:
+            continue
+        rows.append({
+            "town": town,
+            "score_key": score_key[town],
+            "density": float(row["centerline_pct"]),
+        })
+    return rows
+
+
+def draw_town_density(ax, summary, palette):
+    """Town score against centerline coverage at 128 cars.
+
+    An unfilled violin sits behind each swarm. A dark line marks the mean.
+    """
+    title = "Performance across towns, sorted by density"
+    towns = load_town_density()
+    if not towns:
+        blank_panel(ax, title, "no town density")
         return
-    if markers is None:
-        sns.scatterplot(
-            data=summary, x="anchor_coef", y="replay_score", hue="series",
-            palette=palette, s=58, ax=ax, legend=False,
-            edgecolor="white", linewidth=0.6,
+    rows = []
+    for record in summary.to_dict("records"):
+        for town in towns:
+            score = record.get(town["score_key"])
+            if score is None or score != score:
+                continue
+            rows.append({
+                "series": record["series"],
+                "town": town["town"],
+                "density": town["density"],
+                "score": float(score),
+            })
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        blank_panel(ax, title, "no town score")
+        return
+    placed = (
+        frame[["town", "density"]]
+        .drop_duplicates()
+        .sort_values("density")
+    )
+    densities = [float(value) for value in placed["density"]]
+    gaps = [b - a for a, b in zip(densities, densities[1:])]
+    span = min(gaps) if gaps else densities[0] * 0.4
+    sns.violinplot(
+        data=frame, x="density", y="score",
+        native_scale=True, fill=False, inner=None,
+        color="0.35", linewidth=1.0, width=0.8,
+        cut=0, density_norm="width",
+        ax=ax, legend=False, zorder=1,
+    )
+    sns.swarmplot(
+        data=frame, x="density", y="score", hue="series",
+        palette=palette, dodge=False, native_scale=True,
+        size=3, ax=ax, legend=False,
+        edgecolor="white", linewidth=0.3, zorder=3,
+    )
+    half = 0.32 * span
+    for density, scores in frame.groupby("density")["score"]:
+        mean = float(scores.mean())
+        ax.plot(
+            [float(density) - half, float(density) + half],
+            [mean, mean],
+            color="0.1", linewidth=1.8, solid_capstyle="butt", zorder=4,
         )
-    else:
-        scatter_phases(
-            summary, "anchor_coef", "replay_score", ax, palette, markers,
-        )
-    ax.set_xscale("linear")
-    ax.set_ylim(-0.03, 1.03)
-    ax.set_xlabel("anchor coef")
+    pad = min(gaps) * 0.75 if gaps else densities[0] * 0.2
+    ax.set_xlim(densities[0] - pad, densities[-1] + pad)
+    ax.set_autoscalex_on(False)
+    ax.set_xticks(densities)
+    ax.set_xticklabels([
+        f"{town}\n{density:.2f}"
+        for town, density in zip(placed["town"], densities)
+    ])
+    ax.tick_params(axis="x", labelsize=8)
+    labels = ax.get_xticklabels()
+    for i in range(1, len(densities)):
+        if densities[i] - densities[i - 1] >= 1.5:
+            continue
+        shift = ScaledTranslation(0, -26 / 72, ax.figure.dpi_scale_trans)
+        labels[i].set_transform(labels[i].get_transform() + shift)
+    fit_score_axis(ax, frame["score"])
+    ax.set_xlabel("% of centerline")
     ax.set_ylabel("score")
     ax.set_title(title)
-
-
-def horizon_cap():
-    """Episode length when the benchmark configures one horizon."""
-    path = ROOT / "config" / "benchmark.ini"
-    if not path.is_file():
-        return None
-    raw = section_text(path.read_text(), "horizon", "horizons")
-    if raw is None:
-        return None
-    parts = [part.strip() for part in raw.split(",") if part.strip()]
-    if len(parts) != 1:
-        return None
-    try:
-        cap = float(parts[0])
-    except ValueError:
-        return None
-    if cap <= 0.0:
-        return None
-    return cap
-
-
-def draw_benchmark(axes, summary, palette, x, markers=None):
-    """Replay collision, human-replay score, and the long-horizon score."""
-    xlabel = "sweep index" if x == "run" else "run order"
-    for ax, (key, ylabel, title) in zip(axes, BENCH_PANELS):
-        if key == "replay_score":
-            draw_replay_vs_coef(ax, summary, palette, markers)
-            continue
-        present = key in summary.columns and bool(summary[key].notna().any())
-        if not present:
-            ax.set_axis_off()
-            ax.set_title(title)
-            ax.text(
-                0.5, 0.5, "no benchmark report",
-                ha="center", va="center", transform=ax.transAxes, color="0.45",
-            )
-            continue
-        if markers is None:
-            sns.scatterplot(
-                data=summary, x=x, y=key, hue="series",
-                palette=palette, s=58, ax=ax, legend=False,
-                edgecolor="white", linewidth=0.6,
-            )
-        else:
-            scatter_phases(summary, x, key, ax, palette, markers)
-        if key == "horizon_score":
-            cap = horizon_cap()
-            if cap is None:
-                ax.set_ylim(bottom=0.0)
-            else:
-                ax.set_ylim(0.0, cap)
-        else:
-            ax.set_ylim(-0.03, 1.03)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
 
 
 def draw_hypers(ax, summary, palette, fields):
@@ -841,21 +812,34 @@ def draw_objective(ax, summary, palette, x, markers=None):
     ax.set_title(title)
 
 
-def draw_infraction_rate(ax, rates, palette, markers=None):
-    """Infraction steps per meter over training. Blank when the series is absent."""
-    title = "Infractions per meter"
+def fit_loss_axis(ax, values):
+    """Pad the observed anchor-loss range. Zero is not a meaningful floor."""
+    finite = values.dropna()
+    if len(finite) == 0:
+        return
+    lo = float(finite.min())
+    hi = float(finite.max())
+    span = hi - lo
+    pad = span * 0.08 if span > 0 else max(abs(hi) * 0.08, 0.1)
+    ax.set_ylim(lo - pad, hi + pad)
+
+
+def draw_anchor_loss(ax, losses, palette, markers=None):
+    """Anchor loss over training steps. Blank when the ini has no series."""
+    title = "Anchor loss"
+    column = "anchor_loss"
     has_curve = (
-        rates is not None and len(rates) > 0
-        and "infractions_per_meter" in rates.columns
-        and bool(rates["infractions_per_meter"].notna().any())
+        losses is not None and len(losses) > 0
+        and column in losses.columns
+        and bool(losses[column].notna().any())
     )
     if not has_curve:
-        blank_panel(ax, title, "no infractions per meter")
+        blank_panel(ax, title, "no anchor loss")
         return
-    plotted = rates.dropna(subset=["infractions_per_meter"])
+    plotted = losses.dropna(subset=[column])
     if markers is None:
         sns.lineplot(
-            data=plotted, x="steps", y="infractions_per_meter", hue="series",
+            data=plotted, x="steps", y=column, hue="series",
             palette=palette, estimator=None, linewidth=1.3, ax=ax, legend=False,
         )
     else:
@@ -864,14 +848,14 @@ def draw_infraction_rate(ax, rates, palette, markers=None):
             if len(part) == 0:
                 continue
             sns.lineplot(
-                data=part, x="steps", y="infractions_per_meter", hue="series",
+                data=part, x="steps", y=column, hue="series",
                 palette=palette, estimator=None, linewidth=1.3, linestyle=linestyle,
                 ax=ax, legend=False,
             )
     style_steps(ax)
-    ax.set_ylabel("infractions / m")
+    ax.set_ylabel("anchor loss")
     ax.set_title(title)
-    fit_failure_axis(ax, plotted["infractions_per_meter"])
+    fit_loss_axis(ax, plotted[column])
 
 
 def draw_distance_per_infraction(ax, counts, palette, markers=None):
@@ -908,34 +892,21 @@ def draw_distance_per_infraction(ax, counts, palette, markers=None):
     fit_failure_axis(ax, plotted[column])
 
 
-def draw(returns, rates, counts, failures, summary, out):
-    sns.set_theme(style="whitegrid", context="notebook")
+def draw(returns, losses, counts, failures, summary, out):
+    apply_figure_style()
     palette = categorical_palette(summary["run"])
     summary = with_series(summary)
     returns = with_series(returns)
-    if len(rates):
-        rates = with_series(rates)
+    if len(losses):
+        losses = with_series(losses)
     if len(counts):
         counts = with_series(counts)
     if len(failures):
         failures = with_series(failures)
 
-    fig, axes, failure_axes, town_axes, bench_axes, hyper_ax, size_axes = figure_axes()
+    fig, axes, failure_axes, anchor_ax, density_ax, hyper_ax, size_axes = figure_axes()
 
     draw_objective(axes[0], summary, palette, "run")
-
-    if summary["score"].notna().any() and summary["collision_count"].notna().any():
-        sns.scatterplot(
-            data=summary, x="collision_count", y="score", hue="series",
-            palette=palette, s=58, ax=axes[1], legend=False,
-            edgecolor="white", linewidth=0.6,
-        )
-        fit_score_axis(axes[1], summary["score"])
-    else:
-        axes[1].set_axis_off()
-    axes[1].set_xlabel("collision count")
-    axes[1].set_ylabel("score")
-    axes[1].set_title("Score vs collision count")
 
     lo = float(summary["wall_min"].min())
     hi = float(summary["wall_min"].max())
@@ -944,81 +915,71 @@ def draw(returns, rates, counts, failures, summary, out):
     norm = plt.Normalize(lo, hi)
     sns.scatterplot(
         data=summary, x="run", y="episode_return", hue="wall_min",
-        hue_norm=norm, palette="viridis", s=58, ax=axes[2],
+        hue_norm=norm, palette="viridis", s=58, ax=axes[1],
         legend=False, edgecolor="white", linewidth=0.6,
     )
     colorbar = fig.colorbar(
-        plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[2], pad=0.02,
+        plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[1], pad=0.02,
     )
     colorbar.set_label("wall clock (min)")
-    axes[2].set_xscale("linear")
-    axes[2].set_yscale("linear")
-    axes[2].set_xlabel("sweep index")
-    axes[2].set_ylabel("episode return")
-    axes[2].set_title("Episode return vs sweep index")
+    axes[1].set_xscale("linear")
+    axes[1].set_yscale("linear")
+    axes[1].set_xlabel("sweep index")
+    axes[1].set_ylabel("episode return")
+    axes[1].set_title("Episode return vs sweep index")
 
     sns.lineplot(
         data=returns, x="steps", y="episode_return", hue="series",
-        palette=palette, estimator=None, linewidth=1.3, ax=axes[3], legend=False,
+        palette=palette, estimator=None, linewidth=1.3, ax=axes[2], legend=False,
     )
-    axes[3].set_xscale("linear")
-    axes[3].set_yscale("linear")
-    axes[3].ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
-    axes[3].ticklabel_format(axis="y", style="plain")
-    axes[3].set_xlabel("steps")
-    axes[3].set_ylabel("episode return")
-    axes[3].set_title("Episode return vs steps")
+    axes[2].set_xscale("linear")
+    axes[2].set_yscale("linear")
+    axes[2].ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+    axes[2].ticklabel_format(axis="y", style="plain")
+    axes[2].set_xlabel("steps")
+    axes[2].set_ylabel("episode return")
+    axes[2].set_title("Episode return vs steps")
 
-    sns.scatterplot(
-        data=summary, x="run", y="score", hue="series",
-        palette=palette, s=58, ax=axes[4], legend=False,
-        edgecolor="white", linewidth=0.6,
-    )
-    axes[4].set_xlabel("sweep index")
-    axes[4].set_ylabel("score")
-    axes[4].set_title("Score")
-    fit_score_axis(axes[4], summary["score"])
-
-    draw_infraction_rate(axes[5], rates, palette)
+    draw_anchor_loss(axes[3], losses, palette)
 
     has_jerk = bool(summary["jerk"].notna().all() and summary["smooth"].notna().all())
     if has_jerk:
         sns.scatterplot(
             data=summary, x="jerk", y="score", hue="series",
-            palette=palette, s=58, ax=axes[6], legend=False,
+            palette=palette, s=58, ax=axes[4], legend=False,
             edgecolor="white", linewidth=0.6,
         )
-        axes[6].set_xlabel("jerk")
-        axes[6].set_ylabel("score")
-        axes[6].set_title("Score vs jerk")
-        axes[6].set_ylim(-0.03, 1.03)
+        axes[4].set_xlabel("jerk")
+        axes[4].set_ylabel("score")
+        axes[4].set_title("Score vs jerk")
+        axes[4].set_ylim(-0.03, 1.03)
     else:
-        draw_distance_per_infraction(axes[6], counts, palette)
+        draw_distance_per_infraction(axes[4], counts, palette)
 
     sns.scatterplot(
         data=summary, x="run", y="parameters", hue="series",
-        palette=palette, s=58, ax=axes[7], legend=False,
+        palette=palette, s=58, ax=axes[5], legend=False,
         edgecolor="white", linewidth=0.6,
     )
-    axes[7].set_yscale("log")
-    axes[7].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
-    axes[7].set_xlabel("sweep index")
-    axes[7].set_ylabel("parameters")
-    axes[7].set_title("Network parameters")
+    axes[5].set_yscale("log")
+    axes[5].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
+    axes[5].set_xlabel("sweep index")
+    axes[5].set_ylabel("parameters")
+    axes[5].set_title("Network parameters")
 
     draw_failure(failure_axes, summary, failures, palette, "run")
-    draw_town_row(town_axes, summary, palette, "run")
-    draw_benchmark(bench_axes, summary, palette, "run")
+    draw_score_vs_anchor(anchor_ax, summary, palette)
+    draw_town_density(density_ax, summary, palette)
     draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
     for ax, label in zip(size_axes, SIZE_HYPERS):
         draw_size_panel(ax, summary, palette, label)
     for ax in (
-        list(axes) + list(failure_axes) + list(town_axes) + list(bench_axes)
+        list(axes) + list(failure_axes) + [anchor_ax, density_ax]
         + [hyper_ax] + list(size_axes)
     ):
-        sns.despine(ax=ax)
+        style_ax(ax)
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out)
+    fig.savefig(out, dpi=100)
     plt.close(fig)
 
 
@@ -1032,7 +993,7 @@ def tag_phase(frame, phase):
 
 
 def series_palette(keys):
-    """Set1 color per run. Phase is part of the key so through and bump differ."""
+    """One seaborn color per series. Phase is part of the key so through and bump differ."""
     ordered = list(dict.fromkeys(keys))
     colors = distinct_colors(len(ordered))
     return {key: colors[i] for i, key in enumerate(ordered)}
@@ -1050,28 +1011,19 @@ def scatter_phases(summary, x, y, ax, palette, markers):
         )
 
 
-def draw_overview(returns, rates, counts, failures, summary, out):
+def draw_overview(returns, losses, counts, failures, summary, out):
     """Both physics phases. The sweep objective is the first panel.
 
-    Through runs come first, then bump. Panels use Set1, one color per run,
+    Through runs come first, then bump. Panels use the default seaborn palette, one color per run,
     except episode return against run order, which is colored by wall clock.
     Circles and solid lines are through. Squares and dashed lines are bump.
     """
-    sns.set_theme(style="whitegrid", context="notebook")
+    apply_figure_style()
     palette = series_palette(summary["series"])
-    fig, axes, failure_axes, town_axes, bench_axes, hyper_ax, size_axes = figure_axes()
+    fig, axes, failure_axes, anchor_ax, density_ax, hyper_ax, size_axes = figure_axes()
     markers = {"through": "o", "bump": "s"}
 
     draw_objective(axes[0], summary, palette, "idx", markers)
-
-    if summary["score"].notna().any() and summary["collision_count"].notna().any():
-        scatter_phases(summary, "collision_count", "score", axes[1], palette, markers)
-        fit_score_axis(axes[1], summary["score"])
-    else:
-        axes[1].set_axis_off()
-    axes[1].set_xlabel("collision count")
-    axes[1].set_ylabel("score")
-    axes[1].set_title("Score vs collision count")
 
     lo = float(summary["wall_min"].min())
     hi = float(summary["wall_min"].max())
@@ -1084,21 +1036,21 @@ def draw_overview(returns, rates, counts, failures, summary, out):
             continue
         sns.scatterplot(
             data=part, x="idx", y="episode_return", hue="wall_min",
-            hue_norm=norm, palette="viridis", marker=marker, s=58, ax=axes[2],
+            hue_norm=norm, palette="viridis", marker=marker, s=58, ax=axes[1],
             legend=False, edgecolor="white", linewidth=0.6,
         )
     colorbar = fig.colorbar(
-        plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[2], pad=0.02,
+        plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[1], pad=0.02,
     )
     colorbar.set_label("wall clock (min)")
     bump_idx = summary.loc[summary["phase"] == "bump", "idx"]
     if len(bump_idx):
-        axes[2].axvline(float(bump_idx.min()) - 0.5, color="0.4", linestyle=":", linewidth=0.9)
-    axes[2].set_xscale("linear")
-    axes[2].set_yscale("linear")
-    axes[2].set_xlabel("run order")
-    axes[2].set_ylabel("episode return")
-    axes[2].set_title("Episode return vs sweep index")
+        axes[1].axvline(float(bump_idx.min()) - 0.5, color="0.4", linestyle=":", linewidth=0.9)
+    axes[1].set_xscale("linear")
+    axes[1].set_yscale("linear")
+    axes[1].set_xlabel("run order")
+    axes[1].set_ylabel("episode return")
+    axes[1].set_title("Episode return vs sweep index")
 
     for phase, linestyle in (("through", "solid"), ("bump", "dashed")):
         part = returns[returns["phase"] == phase] if len(returns) else returns
@@ -1107,44 +1059,38 @@ def draw_overview(returns, rates, counts, failures, summary, out):
         sns.lineplot(
             data=part, x="steps", y="episode_return", hue="series",
             palette=palette, estimator=None, linewidth=1.3, linestyle=linestyle,
-            ax=axes[3], legend=False,
+            ax=axes[2], legend=False,
         )
-    axes[3].set_xscale("linear")
-    axes[3].set_yscale("linear")
-    axes[3].ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
-    axes[3].ticklabel_format(axis="y", style="plain")
-    axes[3].set_xlabel("steps")
-    axes[3].set_ylabel("episode return")
-    axes[3].set_title("Episode return vs steps")
+    axes[2].set_xscale("linear")
+    axes[2].set_yscale("linear")
+    axes[2].ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+    axes[2].ticklabel_format(axis="y", style="plain")
+    axes[2].set_xlabel("steps")
+    axes[2].set_ylabel("episode return")
+    axes[2].set_title("Episode return vs steps")
 
-    scatter_phases(summary, "idx", "score", axes[4], palette, markers)
-    axes[4].set_xlabel("run order")
-    axes[4].set_ylabel("score")
-    axes[4].set_title("Score")
-    fit_score_axis(axes[4], summary["score"])
-
-    draw_infraction_rate(axes[5], rates, palette, markers)
+    draw_anchor_loss(axes[3], losses, palette, markers)
 
     has_jerk = bool(summary["jerk"].notna().all() and summary["smooth"].notna().all())
     if has_jerk:
-        scatter_phases(summary, "jerk", "score", axes[6], palette, markers)
-        axes[6].set_xlabel("jerk")
-        axes[6].set_ylabel("score")
-        axes[6].set_title("Score vs jerk")
-        axes[6].set_ylim(-0.03, 1.03)
+        scatter_phases(summary, "jerk", "score", axes[4], palette, markers)
+        axes[4].set_xlabel("jerk")
+        axes[4].set_ylabel("score")
+        axes[4].set_title("Score vs jerk")
+        axes[4].set_ylim(-0.03, 1.03)
     else:
-        draw_distance_per_infraction(axes[6], counts, palette, markers)
+        draw_distance_per_infraction(axes[4], counts, palette, markers)
 
-    scatter_phases(summary, "idx", "parameters", axes[7], palette, markers)
-    axes[7].set_yscale("log")
-    axes[7].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
-    axes[7].set_xlabel("run order")
-    axes[7].set_ylabel("parameters")
-    axes[7].set_title("Network parameters")
+    scatter_phases(summary, "idx", "parameters", axes[5], palette, markers)
+    axes[5].set_yscale("log")
+    axes[5].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
+    axes[5].set_xlabel("run order")
+    axes[5].set_ylabel("parameters")
+    axes[5].set_title("Network parameters")
 
     draw_failure(failure_axes, summary, failures, palette, "idx", markers)
-    draw_town_row(town_axes, summary, palette, "idx", markers)
-    draw_benchmark(bench_axes, summary, palette, "idx", markers)
+    draw_score_vs_anchor(anchor_ax, summary, palette, markers)
+    draw_town_density(density_ax, summary, palette)
     draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
     for ax, label in zip(size_axes, SIZE_HYPERS):
         draw_size_panel(ax, summary, palette, label)
@@ -1157,19 +1103,19 @@ def draw_overview(returns, rates, counts, failures, summary, out):
         loc="upper right", frameon=False,
     )
     for ax in (
-        list(axes) + list(failure_axes) + list(town_axes) + list(bench_axes)
+        list(axes) + list(failure_axes) + [anchor_ax, density_ax]
         + [hyper_ax] + list(size_axes)
     ):
-        sns.despine(ax=ax)
+        style_ax(ax)
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out)
+    fig.savefig(out, dpi=100)
     plt.close(fig)
 
 
 def load_overview(phases):
     """phases is a list of (name, log_path, metrics_dir)."""
     returns = []
-    rates = []
+    losses = []
     counts = []
     failures = []
     summaries = []
@@ -1180,13 +1126,13 @@ def load_overview(phases):
             continue
         try:
             (
-                part_returns, part_rates, part_counts, part_failures,
+                part_returns, part_losses, part_counts, part_failures,
                 part_summary, part_missing,
             ) = load_frames(log_path, Path(metrics_dir))
         except SystemExit:
             continue
         returns.append(tag_phase(part_returns, name))
-        rates.append(tag_phase(part_rates, name))
+        losses.append(tag_phase(part_losses, name))
         counts.append(tag_phase(part_counts, name))
         failures.append(tag_phase(part_failures, name))
         summaries.append(tag_phase(part_summary, name))
@@ -1200,15 +1146,15 @@ def load_overview(phases):
         [frame for frame in returns if frame is not None and len(frame)],
         ignore_index=True,
     )
-    rate_frames = [frame for frame in rates if frame is not None and len(frame)]
-    rates = pd.concat(rate_frames, ignore_index=True) if rate_frames else pd.DataFrame()
+    loss_frames = [frame for frame in losses if frame is not None and len(frame)]
+    losses = pd.concat(loss_frames, ignore_index=True) if loss_frames else pd.DataFrame()
     count_frames = [frame for frame in counts if frame is not None and len(frame)]
     counts = pd.concat(count_frames, ignore_index=True) if count_frames else pd.DataFrame()
     failure_frames = [frame for frame in failures if frame is not None and len(frame)]
     failures = (
         pd.concat(failure_frames, ignore_index=True) if failure_frames else pd.DataFrame()
     )
-    return returns, rates, counts, failures, summary, missing
+    return returns, losses, counts, failures, summary, missing
 
 
 def main():
@@ -1238,13 +1184,13 @@ def main():
     if out.parent.resolve() not in allowed:
         out = ROOT / "logs" / "drive" / out.name
     if args.phase:
-        returns, rates, counts, failures, summary, missing = load_overview(args.phase)
-        draw_overview(returns, rates, counts, failures, summary, out)
+        returns, losses, counts, failures, summary, missing = load_overview(args.phase)
+        draw_overview(returns, losses, counts, failures, summary, out)
     else:
-        returns, rates, counts, failures, summary, missing = load_frames(
+        returns, losses, counts, failures, summary, missing = load_frames(
             args.log, args.metrics_dir,
         )
-        draw(returns, rates, counts, failures, summary, out)
+        draw(returns, losses, counts, failures, summary, out)
     print(f"wrote {out} runs={len(summary)}")
     if missing:
         print("no metrics for runs:", " ".join(str(run) for run in missing))

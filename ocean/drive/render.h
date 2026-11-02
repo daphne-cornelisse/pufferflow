@@ -228,6 +228,8 @@ static const Color STEEL_INK = {53, 94, 121, 255};
 static const Color CORAL = {242, 152, 111, 255};
 static const Color AMBER = {230, 186, 64, 255};
 static const Color CRIMSON = {185, 28, 28, 255};
+// Lane markings. Kind 1 in the observation, distinct from center lanes.
+static const Color ROAD_LINE_PT = {126, 110, 176, 255};
 
 static void sim_draw_button(Rectangle r, const char* label, Color fill, Color edge) {
     DrawRectangleRec(r, fill);
@@ -354,6 +356,46 @@ static void sim_obs_box(float cx, float cy, float ppm,
     sim_obs_seg(cx, cy, ppm, f3, l3, f0, l0, thick, color);
 }
 
+// Signed speed within speed_band of the target. A target of 0 never matches.
+static int obs_speed_in_band(Drive* env, int slot) {
+    if (env->target_speed <= 0.0f || slot < 0
+            || slot >= env->active_agent_count) {
+        return 0;
+    }
+    Entity* ego = &env->entities[slot];
+    float signed_speed = ego->vx * ego->heading_x + ego->vy * ego->heading_y;
+    float err = signed_speed - env->target_speed;
+    if (err < 0.0f) {
+        err = -err;
+    }
+    return err <= env->speed_band;
+}
+
+// Road feature 6 is type minus ROAD_LANE: 0 center lane, 1 line, 2+ edge.
+// Lines draw first, then center lanes, then edges.
+static int obs_road_layer(int kind) {
+    if (kind == 1) {
+        return 0;
+    }
+    if (kind == 0) {
+        return 1;
+    }
+    if (kind >= 2) {
+        return 2;
+    }
+    return -1;
+}
+
+static Color obs_road_color(int kind, int recorded) {
+    if (kind == 1) {
+        return ROAD_LINE_PT;
+    }
+    if (kind >= 2) {
+        return recorded ? AMBER : CORAL;
+    }
+    return recorded ? MUTED : STEEL;
+}
+
 // Decode the selected car's observation. Empty slots stay blank.
 static void sim_obs_draw(Drive* env) {
     if (!env->client || puf_record_enabled()) {
@@ -395,17 +437,22 @@ static void sim_obs_draw(Drive* env) {
     snprintf(cap, sizeof(cap), "v %.1f%s", spd, hit ? "  hit" : "");
     Color cap_c = hit ? CRIMSON : INK;
     DrawText(cap, (int)rect.x + 10, (int)rect.y + 28, 14, cap_c);
+    float target = obs[EGO_TARGET_SPEED] / OBS_SPEED_SCALE;
+    char target_txt[64];
+    snprintf(target_txt, sizeof(target_txt), "target %.1f", target);
+    Color target_c = obs_speed_in_band(env, slot) ? SAGE_INK : CRIMSON;
+    DrawText(target_txt, (int)rect.x + 10, (int)rect.y + 44, 14, target_c);
     char goal_txt[32];
     if (gd >= 10.0f) {
         snprintf(goal_txt, sizeof(goal_txt), "goal %.0f m", gd);
     } else {
         snprintf(goal_txt, sizeof(goal_txt), "goal %.1f m", gd);
     }
-    DrawText(goal_txt, (int)rect.x + 10, (int)rect.y + 44, 14, SAGE_INK);
+    DrawText(goal_txt, (int)rect.x + 10, (int)rect.y + 60, 14, SAGE_INK);
 
     Rectangle plot = {
-        rect.x + 10.0f, rect.y + 64.0f,
-        rect.width - 20.0f, rect.height - 74.0f
+        rect.x + 10.0f, rect.y + 78.0f,
+        rect.width - 20.0f, rect.height - 88.0f
     };
     float side = plot.width;
     if (plot.height < side) {
@@ -421,24 +468,20 @@ static void sim_obs_draw(Drive* env) {
         LINE);
 
     int road0 = EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS;
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass < 3; pass++) {
         for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
             float* road = obs + road0 + k * ROAD_FEATURES;
             if (road[0] == 0.0f && road[1] == 0.0f && road[2] == 0.0f) {
                 continue;
             }
-            int edge = (int)(road[6] + 0.5f) >= 2;
-            if (edge != pass) {
+            int kind = (int)(road[6] + 0.5f);
+            if (obs_road_layer(kind) != pass) {
                 continue;
             }
             float mid_f = road[0] / OBS_POSITION_SCALE;
             float mid_l = road[1] / OBS_POSITION_SCALE;
-            Color pt = STEEL;
-            if (edge) {
-                pt = CORAL;
-            }
             DrawCircleV((Vector2){cx - mid_l * ppm, cy - mid_f * ppm},
-                2.2f, pt);
+                2.2f, obs_road_color(kind, 0));
         }
     }
 
@@ -910,10 +953,10 @@ static Camera3D pov_camera(Drive* env) {
 
 // Top-right of a recorded frame. The selected agent's observation, in
 // that car's frame. Forward is up and left is left. The crop is a fixed
-// 20 m half-width centered on the car, so it does not zoom. Lane points
-// are muted, edges are amber. Road lines are not drawn. Boxes are filled
-// after the points so the cars cover them. Speed and destination sit
-// under the crop.
+// 20 m half-width centered on the car, so it does not zoom. Center lanes
+// are muted, lane lines are purple, edges are amber. Boxes are filled
+// after the points so the cars cover them. Speed, target, and destination
+// sit under the crop. The target is green inside the speed band, red outside.
 static float record_scale(Drive* env) {
     float h = 704.0f;
     if (env->client && env->client->height > 1.0f) {
@@ -925,7 +968,7 @@ static float record_scale(Drive* env) {
 static Rectangle record_agent_view(Drive* env) {
     float ui = record_scale(env);
     const float box_w = 300.0f * ui;
-    const float box_h = 348.0f * ui;
+    const float box_h = 366.0f * ui;
     float screen_w = 1600.0f;
     if (env->client && env->client->width > box_w + 24.0f * ui) {
         screen_w = env->client->width;
@@ -957,8 +1000,8 @@ static Rectangle record_agent_view(Drive* env) {
 
     int road0 = EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS;
     const float range = 20.0f;
-    // Title on top. Speed, destination, and timestep sit under the crop.
-    const float foot = 62.0f * ui;
+    // Title on top. Speed, target, destination, and timestep sit under the crop.
+    const float foot = 80.0f * ui;
     Rectangle plot = {
         rect.x + 8.0f * ui, rect.y + 30.0f * ui,
         rect.width - 16.0f * ui, rect.height - 38.0f * ui - foot
@@ -973,28 +1016,20 @@ static Rectangle record_agent_view(Drive* env) {
 
     BeginScissorMode((int)plot.x, (int)plot.y,
         (int)plot.width, (int)plot.height);
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0; pass < 3; pass++) {
         for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
             float* road = obs + road0 + k * ROAD_FEATURES;
             if (road[0] == 0.0f && road[1] == 0.0f && road[2] == 0.0f) {
                 continue;
             }
             int kind = (int)(road[6] + 0.5f);
-            int edge = kind >= 2;
-            if (edge != pass) {
-                continue;
-            }
-            if (kind == 1) {
+            if (obs_road_layer(kind) != pass) {
                 continue;
             }
             float mid_f = road[0] / OBS_POSITION_SCALE;
             float mid_l = road[1] / OBS_POSITION_SCALE;
-            Color col = MUTED;
-            if (edge) {
-                col = AMBER;
-            }
             DrawCircleV((Vector2){cx - mid_l * ppm, cy - mid_f * ppm},
-                3.4f * ui, col);
+                3.4f * ui, obs_road_color(kind, 1));
         }
     }
     for (int j = 0; j < MAX_AGENTS; j++) {
@@ -1042,16 +1077,21 @@ static Rectangle record_agent_view(Drive* env) {
     char cap[64];
     snprintf(cap, sizeof(cap), "v %.1f%s", spd, hit ? "  hit" : "");
     sim_sans(env, cap, tx, ty, 15.0f * ui, hit ? CRIMSON : INK);
+    float target = obs[EGO_TARGET_SPEED] / OBS_SPEED_SCALE;
+    char target_txt[64];
+    snprintf(target_txt, sizeof(target_txt), "target %.1f", target);
+    Color target_c = obs_speed_in_band(env, slot) ? SAGE_INK : CRIMSON;
+    sim_sans(env, target_txt, tx, ty + 18.0f * ui, 15.0f * ui, target_c);
     char goal_txt[64];
     if (gd >= 10.0f) {
         snprintf(goal_txt, sizeof(goal_txt), "distance to dest. [%.0f m]", gd);
     } else {
         snprintf(goal_txt, sizeof(goal_txt), "distance to dest. [%.1f m]", gd);
     }
-    sim_sans(env, goal_txt, tx, ty + 18.0f * ui, 13.0f * ui, SAGE_INK);
+    sim_sans(env, goal_txt, tx, ty + 36.0f * ui, 13.0f * ui, SAGE_INK);
     char step_txt[32];
     snprintf(step_txt, sizeof(step_txt), "t %d", env->timestep);
-    sim_sans(env, step_txt, tx, ty + 36.0f * ui, 15.0f * ui, INK);
+    sim_sans(env, step_txt, tx, ty + 54.0f * ui, 15.0f * ui, INK);
     return rect;
 }
 
