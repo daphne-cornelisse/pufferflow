@@ -279,6 +279,10 @@ if [ "$STANDALONE" = "1" ]; then
     exit 0
 fi
 if [ "$MODE" = "cpu" ]; then
+    # Density eval places 512 cars. The trainer binary keeps 256.
+    if [ "$ENV" = "drive" ]; then
+        EXTRA_CFLAGS+=(-DDRIVE_AGENT_MAX=512)
+    fi
     STANDALONE_SOURCE="src/puffercpu.c"
     STANDALONE_DEFINES=()
     case "$ENV" in
