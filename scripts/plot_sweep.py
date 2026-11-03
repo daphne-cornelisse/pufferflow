@@ -4,7 +4,9 @@
 The figure is six rows. The sweep objective against sweep index is the
 first panel, colored by run. Episode return against sweep index is next,
 colored by trial wall clock, then the return curve. Every other panel
-uses the default seaborn palette. The next row is anchor loss over training steps,
+uses the default seaborn palette. The best sweep objective is green on
+every panel and a star on each scatter. An ini with sweep.goal = minimize
+picks the lowest objective; otherwise the highest wins. The next row is anchor loss over training steps,
 score against jerk when those series exist (otherwise meters per
 infraction), and parameter count.
 The next row is final meters per infraction against score, completion
@@ -43,9 +45,14 @@ import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
 from matplotlib.transforms import ScaledTranslation
 import pandas as pd
 import seaborn as sns
+
+# Seaborn's deep green. Other runs skip this color so only the best is green.
+BEST_COLOR = "#55A868"
+BEST_STAR_SIZE = 220
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_LINE = re.compile(
@@ -342,6 +349,8 @@ def load_frames(log_path, metrics_dir):
         summary[-1]["anchor_coef"] = (
             float(coef) if coef is not None else float("nan")
         )
+        goal = section_text(text, "sweep", "goal")
+        summary[-1]["goal"] = goal if goal in ("maximize", "minimize") else "maximize"
     if not summary:
         raise SystemExit(f"no metrics for runs in {log_path}")
     return (
@@ -369,19 +378,97 @@ def style_ax(ax):
     sns.despine(ax=ax)
 
 
+def same_color(color, target):
+    try:
+        return mcolors.to_rgb(color) == mcolors.to_rgb(target)
+    except (ValueError, TypeError):
+        return False
+
+
 def distinct_colors(count):
-    """Default seaborn palette. Extra runs repeat its ten colors."""
-    base = [tuple(color) for color in sns.color_palette("deep")]
-    if count <= 0:
+    """Default seaborn palette without its green. Extra runs repeat."""
+    base = [
+        tuple(color) for color in sns.color_palette("deep")
+        if not same_color(color, BEST_COLOR)
+    ]
+    if count <= 0 or not base:
         return []
     return [base[i % len(base)] for i in range(count)]
 
 
-def categorical_palette(run_ids):
+def assign_palette(ordered, best):
+    """One seaborn color per series. The best series is green."""
+    best = set(best or ())
+    others = [key for key in ordered if key not in best]
+    colors = distinct_colors(len(others))
+    palette = {key: colors[i] for i, key in enumerate(others)}
+    green = mcolors.to_rgb(BEST_COLOR)
+    for key in ordered:
+        if key in best:
+            palette[key] = green
+    return palette
+
+
+def categorical_palette(run_ids, best=()):
     """One seaborn color per run. The same run keeps that color on every panel."""
-    ordered = list(dict.fromkeys(int(run) for run in run_ids))
-    colors = distinct_colors(len(ordered))
-    return {series_key(run): colors[i] for i, run in enumerate(ordered)}
+    ordered = list(dict.fromkeys(series_key(run) for run in run_ids))
+    return assign_palette(ordered, best)
+
+
+def best_series(summary):
+    """Series keys that hold the best sweep objective."""
+    if summary is None or len(summary) == 0 or "objective" not in summary.columns:
+        return set()
+    if "series" not in summary.columns:
+        return set()
+    finite = summary.dropna(subset=["objective"])
+    if finite.empty:
+        return set()
+    if "goal" in finite.columns:
+        minimize = bool(finite["goal"].map(lambda goal: goal == "minimize").all())
+    else:
+        minimize = False
+    target = float(finite["objective"].min() if minimize else finite["objective"].max())
+    close = (finite["objective"] - target).abs() <= 1e-8
+    return set(finite.loc[close, "series"])
+
+
+def split_best(summary, best):
+    best = set(best or ())
+    empty = summary.iloc[0:0]
+    if not best or summary is None or len(summary) == 0 or "series" not in summary.columns:
+        return empty, summary
+    stars = summary[summary["series"].isin(best)]
+    rest = summary[~summary["series"].isin(best)]
+    return stars, rest
+
+
+def scatter_stars(frame, x, y, ax):
+    """Best run on a scatter panel."""
+    if frame is None or len(frame) == 0:
+        return
+    plotted = frame.dropna(subset=[x, y])
+    if plotted.empty:
+        return
+    ax.scatter(
+        plotted[x], plotted[y],
+        marker="*", s=BEST_STAR_SIZE, c=[mcolors.to_rgb(BEST_COLOR)],
+        edgecolors="0.1", linewidths=0.45, zorder=6,
+    )
+
+
+def lift_best(ax):
+    """Keep the green series above the other runs, and heavier so it stays visible."""
+    for line in ax.lines:
+        if same_color(line.get_color(), BEST_COLOR):
+            line.set_zorder(5)
+            line.set_linewidth(2.4)
+    for coll in ax.collections:
+        facecolors = coll.get_facecolors()
+        if len(facecolors) == 0:
+            continue
+        if all(same_color(color, BEST_COLOR) for color in facecolors):
+            coll.set_zorder(6)
 
 
 def with_series(frame):
@@ -448,18 +535,21 @@ def figure_axes():
     return fig, axes, failure_axes, anchor_ax, density_ax, coef_ax, size_axes
 
 
-def scatter_metric(summary, x, y, ax, palette, markers=None):
-    if markers is None:
-        sns.scatterplot(
-            data=summary, x=x, y=y, hue="series",
-            palette=palette, s=58, ax=ax, legend=False,
-            edgecolor="white", linewidth=0.6,
-        )
-        return
-    scatter_phases(summary, x, y, ax, palette, markers)
+def scatter_metric(summary, x, y, ax, palette, markers=None, best=()):
+    stars, rest = split_best(summary, best)
+    if len(rest):
+        if markers is None:
+            sns.scatterplot(
+                data=rest, x=x, y=y, hue="series",
+                palette=palette, s=58, ax=ax, legend=False,
+                edgecolor="white", linewidth=0.6,
+            )
+        else:
+            scatter_phases(rest, x, y, ax, palette, markers)
+    scatter_stars(stars, x, y, ax)
 
 
-def draw_score_vs_anchor(ax, summary, palette, markers=None):
+def draw_score_vs_anchor(ax, summary, palette, markers=None, best=()):
     """Training score against the anchor coefficient."""
     title = "Score vs anchor coef"
     present = (
@@ -476,7 +566,7 @@ def draw_score_vs_anchor(ax, summary, palette, markers=None):
             ha="center", va="center", transform=ax.transAxes, color="0.45",
         )
         return
-    scatter_metric(summary, "anchor_coef", "score", ax, palette, markers)
+    scatter_metric(summary, "anchor_coef", "score", ax, palette, markers, best)
     ax.set_xscale("linear")
     fit_score_axis(ax, summary["score"])
     ax.set_xlabel("anchor coef")
@@ -484,7 +574,7 @@ def draw_score_vs_anchor(ax, summary, palette, markers=None):
     ax.set_title(title)
 
 
-def draw_gap_vs_score(ax, summary, palette, markers=None):
+def draw_gap_vs_score(ax, summary, palette, markers=None, best=()):
     """Final meters per infraction against the training score."""
     title = "Distance per infraction (m) vs score"
     key = "avg_distance_per_infraction"
@@ -497,7 +587,7 @@ def draw_gap_vs_score(ax, summary, palette, markers=None):
     if not present:
         blank_panel(ax, title, "no distance per infraction")
         return
-    scatter_metric(summary, "score", key, ax, palette, markers)
+    scatter_metric(summary, "score", key, ax, palette, markers, best)
     scores = summary["score"].dropna()
     if len(scores) and float(scores.max()) <= 1.0:
         ax.set_xlim(-0.03, 1.03)
@@ -507,7 +597,7 @@ def draw_gap_vs_score(ax, summary, palette, markers=None):
     fit_failure_axis(ax, summary[key])
 
 
-def draw_completion_vs_score(ax, summary, palette, markers=None):
+def draw_completion_vs_score(ax, summary, palette, markers=None, best=()):
     """Final completion rate against the training score."""
     title = "Completion rate vs score"
     key = "completion_rate"
@@ -520,7 +610,7 @@ def draw_completion_vs_score(ax, summary, palette, markers=None):
     if not present:
         blank_panel(ax, title, "no completion rate")
         return
-    scatter_metric(summary, "score", key, ax, palette, markers)
+    scatter_metric(summary, "score", key, ax, palette, markers, best)
     scores = summary["score"].dropna()
     if len(scores) and float(scores.max()) <= 1.0:
         ax.set_xlim(-0.03, 1.03)
@@ -533,14 +623,14 @@ def draw_completion_vs_score(ax, summary, palette, markers=None):
 
 
 def draw_failure_metric(scatter_ax, curve_ax, summary, curves, key, ylabel,
-        title, message, x, palette, markers=None, draw_scatter=True):
+        title, message, x, palette, markers=None, draw_scatter=True, best=()):
     """Final value against the sweep, then the same series over training."""
     xlabel = "sweep index" if x == "run" else "run order"
     present = key in summary.columns and bool(summary[key].notna().any())
     if draw_scatter and not present:
         blank_panel(scatter_ax, title, message)
     elif draw_scatter:
-        scatter_metric(summary, x, key, scatter_ax, palette, markers)
+        scatter_metric(summary, x, key, scatter_ax, palette, markers, best)
         scatter_ax.set_xlabel(xlabel)
         scatter_ax.set_ylabel(ylabel)
         scatter_ax.set_title(title)
@@ -575,15 +665,15 @@ def draw_failure_metric(scatter_ax, curve_ax, summary, curves, key, ylabel,
     fit_failure_axis(curve_ax, plotted[key])
 
 
-def draw_failure(axes, summary, curves, palette, x, markers=None):
+def draw_failure(axes, summary, curves, palette, x, markers=None, best=()):
     """Meters per infraction and completion against score, then meters before failure."""
-    draw_gap_vs_score(axes[0], summary, palette, markers)
-    draw_completion_vs_score(axes[1], summary, palette, markers)
+    draw_gap_vs_score(axes[0], summary, palette, markers, best)
+    draw_completion_vs_score(axes[1], summary, palette, markers, best)
     draw_failure_metric(
         axes[0], axes[2], summary, curves,
         "distance_before_first_failure", "meters before first failure",
         "Distance before first failure", "no distance before first failure",
-        x, palette, markers, draw_scatter=False,
+        x, palette, markers, draw_scatter=False, best=best,
     )
 
 
@@ -781,7 +871,7 @@ def objective_label(names):
     return name.replace("_", " ")
 
 
-def draw_objective(ax, summary, palette, x, markers=None):
+def draw_objective(ax, summary, palette, x, markers=None, best=()):
     """Protein's trial score. The benchmark report names it when one exists."""
     title = "Sweep objective"
     present = (
@@ -792,14 +882,7 @@ def draw_objective(ax, summary, palette, x, markers=None):
         ax.set_axis_off()
         ax.set_title(title)
         return
-    if markers is None:
-        sns.scatterplot(
-            data=summary, x=x, y="objective", hue="series",
-            palette=palette, s=58, ax=ax, legend=False,
-            edgecolor="white", linewidth=0.6,
-        )
-    else:
-        scatter_phases(summary, x, "objective", ax, palette, markers)
+    scatter_metric(summary, x, "objective", ax, palette, markers, best)
     values = summary["objective"].dropna()
     if len(values) and bool(((values >= 0.0) & (values <= 1.0)).all()):
         ax.set_ylim(-0.03, 1.03)
@@ -892,9 +975,31 @@ def draw_distance_per_infraction(ax, counts, palette, markers=None):
     fit_failure_axis(ax, plotted[column])
 
 
+def scatter_wallclock(summary, x, y, ax, norm, markers=None, best=()):
+    """Episode return colored by wall clock. The best run is still a green star."""
+    stars, rest = split_best(summary, best)
+    if len(rest):
+        if markers is None:
+            sns.scatterplot(
+                data=rest, x=x, y=y, hue="wall_min",
+                hue_norm=norm, palette="viridis", s=58, ax=ax,
+                legend=False, edgecolor="white", linewidth=0.6,
+            )
+        else:
+            for phase, marker in markers.items():
+                part = rest[rest["phase"] == phase]
+                if len(part) == 0:
+                    continue
+                sns.scatterplot(
+                    data=part, x=x, y=y, hue="wall_min",
+                    hue_norm=norm, palette="viridis", marker=marker, s=58, ax=ax,
+                    legend=False, edgecolor="white", linewidth=0.6,
+                )
+    scatter_stars(stars, x, y, ax)
+
+
 def draw(returns, losses, counts, failures, summary, out):
     apply_figure_style()
-    palette = categorical_palette(summary["run"])
     summary = with_series(summary)
     returns = with_series(returns)
     if len(losses):
@@ -903,21 +1008,19 @@ def draw(returns, losses, counts, failures, summary, out):
         counts = with_series(counts)
     if len(failures):
         failures = with_series(failures)
+    best = best_series(summary)
+    palette = categorical_palette(summary["run"], best)
 
     fig, axes, failure_axes, anchor_ax, density_ax, hyper_ax, size_axes = figure_axes()
 
-    draw_objective(axes[0], summary, palette, "run")
+    draw_objective(axes[0], summary, palette, "run", best=best)
 
     lo = float(summary["wall_min"].min())
     hi = float(summary["wall_min"].max())
     if lo == hi:
         lo, hi = lo - 1.0, hi + 1.0
     norm = plt.Normalize(lo, hi)
-    sns.scatterplot(
-        data=summary, x="run", y="episode_return", hue="wall_min",
-        hue_norm=norm, palette="viridis", s=58, ax=axes[1],
-        legend=False, edgecolor="white", linewidth=0.6,
-    )
+    scatter_wallclock(summary, "run", "episode_return", axes[1], norm, best=best)
     colorbar = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[1], pad=0.02,
     )
@@ -944,11 +1047,7 @@ def draw(returns, losses, counts, failures, summary, out):
 
     has_jerk = bool(summary["jerk"].notna().all() and summary["smooth"].notna().all())
     if has_jerk:
-        sns.scatterplot(
-            data=summary, x="jerk", y="score", hue="series",
-            palette=palette, s=58, ax=axes[4], legend=False,
-            edgecolor="white", linewidth=0.6,
-        )
+        scatter_metric(summary, "jerk", "score", axes[4], palette, best=best)
         axes[4].set_xlabel("jerk")
         axes[4].set_ylabel("score")
         axes[4].set_title("Score vs jerk")
@@ -956,19 +1055,15 @@ def draw(returns, losses, counts, failures, summary, out):
     else:
         draw_distance_per_infraction(axes[4], counts, palette)
 
-    sns.scatterplot(
-        data=summary, x="run", y="parameters", hue="series",
-        palette=palette, s=58, ax=axes[5], legend=False,
-        edgecolor="white", linewidth=0.6,
-    )
+    scatter_metric(summary, "run", "parameters", axes[5], palette, best=best)
     axes[5].set_yscale("log")
     axes[5].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
     axes[5].set_xlabel("sweep index")
     axes[5].set_ylabel("parameters")
     axes[5].set_title("Network parameters")
 
-    draw_failure(failure_axes, summary, failures, palette, "run")
-    draw_score_vs_anchor(anchor_ax, summary, palette)
+    draw_failure(failure_axes, summary, failures, palette, "run", best=best)
+    draw_score_vs_anchor(anchor_ax, summary, palette, best=best)
     draw_town_density(density_ax, summary, palette)
     draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
     for ax, label in zip(size_axes, SIZE_HYPERS):
@@ -978,6 +1073,7 @@ def draw(returns, losses, counts, failures, summary, out):
         + [hyper_ax] + list(size_axes)
     ):
         style_ax(ax)
+        lift_best(ax)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=100)
     plt.close(fig)
@@ -992,11 +1088,10 @@ def tag_phase(frame, phase):
     return out
 
 
-def series_palette(keys):
+def series_palette(keys, best=()):
     """One seaborn color per series. Phase is part of the key so through and bump differ."""
     ordered = list(dict.fromkeys(keys))
-    colors = distinct_colors(len(ordered))
-    return {key: colors[i] for i, key in enumerate(ordered)}
+    return assign_palette(ordered, best)
 
 
 def scatter_phases(summary, x, y, ax, palette, markers):
@@ -1017,28 +1112,24 @@ def draw_overview(returns, losses, counts, failures, summary, out):
     Through runs come first, then bump. Panels use the default seaborn palette, one color per run,
     except episode return against run order, which is colored by wall clock.
     Circles and solid lines are through. Squares and dashed lines are bump.
+    The best objective is green, and a star on each scatter.
     """
     apply_figure_style()
-    palette = series_palette(summary["series"])
+    best = best_series(summary)
+    palette = series_palette(summary["series"], best)
     fig, axes, failure_axes, anchor_ax, density_ax, hyper_ax, size_axes = figure_axes()
     markers = {"through": "o", "bump": "s"}
 
-    draw_objective(axes[0], summary, palette, "idx", markers)
+    draw_objective(axes[0], summary, palette, "idx", markers, best)
 
     lo = float(summary["wall_min"].min())
     hi = float(summary["wall_min"].max())
     if lo == hi:
         lo, hi = lo - 1.0, hi + 1.0
     norm = plt.Normalize(lo, hi)
-    for phase, marker in markers.items():
-        part = summary[summary["phase"] == phase]
-        if len(part) == 0:
-            continue
-        sns.scatterplot(
-            data=part, x="idx", y="episode_return", hue="wall_min",
-            hue_norm=norm, palette="viridis", marker=marker, s=58, ax=axes[1],
-            legend=False, edgecolor="white", linewidth=0.6,
-        )
+    scatter_wallclock(
+        summary, "idx", "episode_return", axes[1], norm, markers, best,
+    )
     colorbar = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[1], pad=0.02,
     )
@@ -1073,7 +1164,7 @@ def draw_overview(returns, losses, counts, failures, summary, out):
 
     has_jerk = bool(summary["jerk"].notna().all() and summary["smooth"].notna().all())
     if has_jerk:
-        scatter_phases(summary, "jerk", "score", axes[4], palette, markers)
+        scatter_metric(summary, "jerk", "score", axes[4], palette, markers, best)
         axes[4].set_xlabel("jerk")
         axes[4].set_ylabel("score")
         axes[4].set_title("Score vs jerk")
@@ -1081,32 +1172,35 @@ def draw_overview(returns, losses, counts, failures, summary, out):
     else:
         draw_distance_per_infraction(axes[4], counts, palette, markers)
 
-    scatter_phases(summary, "idx", "parameters", axes[5], palette, markers)
+    scatter_metric(summary, "idx", "parameters", axes[5], palette, markers, best)
     axes[5].set_yscale("log")
     axes[5].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
     axes[5].set_xlabel("run order")
     axes[5].set_ylabel("parameters")
     axes[5].set_title("Network parameters")
 
-    draw_failure(failure_axes, summary, failures, palette, "idx", markers)
-    draw_score_vs_anchor(anchor_ax, summary, palette, markers)
+    draw_failure(failure_axes, summary, failures, palette, "idx", markers, best)
+    draw_score_vs_anchor(anchor_ax, summary, palette, markers, best)
     draw_town_density(density_ax, summary, palette)
     draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
     for ax, label in zip(size_axes, SIZE_HYPERS):
         draw_size_panel(ax, summary, palette, label)
     from matplotlib.lines import Line2D
-    fig.legend(
-        handles=[
-            Line2D([0], [0], marker="o", color="0.2", linestyle="None", label="through"),
-            Line2D([0], [0], marker="s", color="0.2", linestyle="None", label="bump"),
-        ],
-        loc="upper right", frameon=False,
-    )
+    handles = [
+        Line2D([0], [0], marker="o", color="0.2", linestyle="None", label="through"),
+        Line2D([0], [0], marker="s", color="0.2", linestyle="None", label="bump"),
+        Line2D(
+            [0], [0], marker="*", color=BEST_COLOR, linestyle="None",
+            markersize=12, label="best",
+        ),
+    ]
+    fig.legend(handles=handles, loc="upper right", frameon=False)
     for ax in (
         list(axes) + list(failure_axes) + [anchor_ax, density_ax]
         + [hyper_ax] + list(size_axes)
     ):
         style_ax(ax)
+        lift_best(ax)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=100)
     plt.close(fig)

@@ -3909,10 +3909,9 @@ static int puf_log_metric(const char* key) {
     return 0;
 }
 
-// Config plus the binned train curve. last_log is included as the final
-// sample and then removed, so a later eval can append its own snapshot.
-// Called before post-train eval: that eval reopens every map, and an abort
-// there used to discard a finished run because this file was written after.
+// Config plus the binned train curve. last_log is included for this write
+// and then removed so the final metrics append records it once.
+// Written before the trainer is closed: a later abort still leaves the curve.
 static void write_run_log(Ini* ini, const char* log_path, PufLogHistory* hist,
         Dict* last_log, const char* target_key, int points) {
     assert(hist->size == 0 || dict_find(last_log, target_key));
@@ -4274,40 +4273,21 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     int bot_ladder = use_selfplay && bot_games > 0 && final_checkpoint[0];
     int pool_eval = !bot_ladder && use_selfplay && max_opp > 0
         && pool_games > 0 && final_checkpoint[0];
-    long eval_episodes = puf_ini_get(ini, "base", "eval_episodes");
-    int eval_epoch = (int)pufferl->epoch;
-    char eval_ckpt[4096] = {0};
     if (final_checkpoint[0]) {
-        snprintf(eval_ckpt, sizeof(eval_ckpt), "%s", final_checkpoint);
-        puf_ini_put(ini, "base.load_model_path", eval_ckpt);
+        puf_ini_put(ini, "base.load_model_path", final_checkpoint);
     }
-    // Eval reopens the maps. A missing file used to abort here, after the
+    // Write the curve before close. A missing map used to abort after the
     // checkpoint was saved and before this log existed.
     char log_path[4096];
     snprintf(log_path, sizeof(log_path), "%s/%s.ini", log_dir, run_id);
     if (ctx->artifact_owner) {
         write_run_log(ini, log_path, &log_history, &last_log, target_key, points);
     }
-    // Close every rank before rank-0 eval. Eval on the live DP trainer leaves
-    // child vec workers in BUF_RUNNING/BUF_WAITING while rank 0 waitpid()s
-    // (and previously poisoned rank-0 CUDA graphs if children exited early).
+    // Close every rank before a bot-ladder eval. Eval on the live DP trainer
+    // leaves child vec workers in BUF_RUNNING/BUF_WAITING while rank 0
+    // waitpid()s (and previously poisoned rank-0 CUDA graphs if children
+    // exited early).
     close_pufferl(pufferl);
-    if (ctx->artifact_owner && !bot_ladder && !pool_eval && eval_episodes > 0
-            && eval_ckpt[0]) {
-        puf_ini_put(ini, "base.load_model_path", eval_ckpt);
-        TrainContext eval_ctx = {
-            .rank = 0,
-            .world_size = 1,
-            .gpu_id = ctx->gpu_id,
-            .artifact_owner = 1,
-            .nccl_id = NULL,
-        };
-        PuffeRL* ep = eval_make(ini, &eval_ctx, EVAL_SCORE, 0);
-        EvalResult r = eval_loop(ini, ep, EVAL_SCORE, 1, 0, eval_episodes,
-            &last_log, eval_epoch);
-        result.score = result.scores[result.points - 1] = r.score;
-        close_pufferl(ep);
-    }
 
     if (ctx->artifact_owner) {
         FILE* fp = fopen(log_path, "w");
@@ -4606,9 +4586,9 @@ TrainResult launch_train(Ini* ini) {
                 .nccl_id = &nccl_id,
             };
             run_train(ini, &child);
-            // Rank 0 may still be in post-train eval. Stay alive until it
-            // closes the pipe; exiting earlier aborts NCCL and poisons rank 0
-            // CUDA graphs (cudaGraphLaunch fails in pufferl_forward).
+            // Stay alive until rank 0 closes the pipe. Exiting earlier aborts
+            // NCCL and poisons rank 0 CUDA graphs (cudaGraphLaunch fails in
+            // pufferl_forward).
             char b;
             ssize_t n = read(nccl_pipe[0], &b, 1);
             assert(n >= 0);
