@@ -27,16 +27,17 @@ min and max. Hidden size, layer count, horizon, minibatch size, and
 timestep budget each have their own panel, in the units they
 were swept, with one swarm point per run.
 
-A benchmark report can still name the sweep objective. That report is a
-[benchmark] section in the run ini, or logs/drive/<run_id>.benchmark.txt
-written by ./drive --benchmark.
+An older run can still name the sweep objective from a [benchmark]
+section in the run ini, or from logs/drive/<run_id>.benchmark.txt.
 
     python scripts/plot_sweep.py logs/drive/sweep.log -o logs/drive/sweep-panels.png
 
-Wall clock is the trial cost in the sweep log, in minutes. Goal score and
-collision rate come from the binned env/ metrics written at the end of each
-run. Runs that failed before writing metrics are left out. Figures go under
-logs/drive, or logs/replay_sweep when that directory is the output.
+Each sweep_*.ini in the metrics directory is one trial, ordered by its
+filename stamp. Wall clock is the last uptime, in minutes. Goal score and
+collision rate come from the binned env/ metrics. Runs whose final score
+is below 0.25 are left out, as are runs that failed before writing metrics.
+Figures go under logs/drive, or logs/replay_sweep when that directory is
+the output.
 """
 
 import argparse
@@ -58,7 +59,9 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_LINE = re.compile(
     r"sweep run=(\d+) score=([0-9.eE+-]+) cost=([0-9.eE+-]+)"
 )
-# Names written by ./drive --benchmark. Anything else is shown as-is.
+# Final env/score. Runs under this are left off the panel.
+SCORE_MIN = 0.25
+# Names an older benchmark report may use. Anything else is shown as-is.
 OBJECTIVE_LABELS = {
     "score": "score",
     "replay_score": "replay score",
@@ -235,33 +238,33 @@ def policy_params(hidden, layers):
     return hidden * POLICY_PARAMS_PER_HIDDEN + layers * 3 * hidden * hidden
 
 
-def metrics_file(metrics_dir, run, log_mtime):
-    """Newest ini for this run index that belongs to this sweep log."""
-    hits = []
-    for path in metrics_dir.glob(f"sweep_*_{run:04d}.ini"):
-        if path.stat().st_mtime <= log_mtime + 1.0:
-            hits.append(path)
-    if not hits:
-        return None
-    return max(hits, key=lambda path: path.stat().st_mtime)
+def sweep_ini_paths(metrics_dir):
+    """Every finished sweep log, oldest stamp first."""
+    paths = [path for path in metrics_dir.glob("sweep_*.ini") if path.is_file()]
+    return sorted(paths, key=lambda path: path.name)
 
 
 def load_frames(log_path, metrics_dir):
-    log_mtime = log_path.stat().st_mtime
     returns = []
     losses = []
     counts = []
     failures = []
     summary = []
     missing = []
-    for run, objective, wall_min in parse_sweep_log(log_path):
-        path = metrics_file(metrics_dir, run, log_mtime)
-        if path is None:
+    for path in sweep_ini_paths(metrics_dir):
+        series_id = path.stem
+        run = int(series_id.rsplit("_", 1)[-1])
+        text = path.read_text(errors="replace")
+        score_vals = metric_series(text, "env/score")
+        if not score_vals:
             missing.append(run)
             continue
-        text = path.read_text(errors="replace")
+        if score_vals[-1] < SCORE_MIN:
+            continue
+        uptime = metric_series(text, "uptime")
+        wall_min = uptime[-1] / 60.0 if uptime else float("nan")
+        objective = score_vals[-1]
         return_vals = metric_series(text, "env/episode_return")
-        score_vals = metric_series(text, "env/score")
         collision_vals = metric_series(text, "env/collision_rate")
         jerk_vals = metric_series(text, "env/jerk")
         smooth_vals = metric_series(text, "env/smooth")
@@ -281,28 +284,33 @@ def load_frames(log_path, metrics_dir):
             missing.append(run)
             continue
         for step, value in zip(steps, return_vals):
-            returns.append({"run": run, "steps": step, "episode_return": value})
+            returns.append({
+                "run": run, "series_id": series_id,
+                "steps": step, "episode_return": value,
+            })
         if loss_vals and len(loss_vals) == len(steps):
             for step, value in zip(steps, loss_vals):
                 losses.append({
-                    "run": run, "steps": step, "anchor_loss": value,
+                    "run": run, "series_id": series_id,
+                    "steps": step, "anchor_loss": value,
                 })
         if gap_vals and len(gap_vals) == len(steps):
             for step, value in zip(steps, gap_vals):
                 counts.append({
-                    "run": run,
+                    "run": run, "series_id": series_id,
                     "steps": step,
                     "avg_distance_per_infraction": value,
                 })
         if distance_vals and len(distance_vals) == len(steps):
             for step, value in zip(steps, distance_vals):
                 failures.append({
-                    "run": run,
+                    "run": run, "series_id": series_id,
                     "steps": step,
                     "distance_before_first_failure": value,
                 })
         summary.append({
             "run": run,
+            "series_id": series_id,
             "score": score_vals[-1],
             "objective": objective,
             "objective_name": "score",
@@ -352,7 +360,9 @@ def load_frames(log_path, metrics_dir):
         goal = section_text(text, "sweep", "goal")
         summary[-1]["goal"] = goal if goal in ("maximize", "minimize") else "maximize"
     if not summary:
-        raise SystemExit(f"no metrics for runs in {log_path}")
+        raise SystemExit(f"no metrics for runs in {metrics_dir}")
+    for i, row in enumerate(summary):
+        row["order"] = i
     return (
         pd.DataFrame(returns),
         pd.DataFrame(losses),
@@ -473,7 +483,10 @@ def lift_best(ax):
 
 def with_series(frame):
     out = frame.copy()
-    out["series"] = out["run"].map(series_key)
+    if "series_id" in out.columns:
+        out["series"] = out["series_id"]
+    else:
+        out["series"] = out["run"].map(series_key)
     return out
 
 
@@ -871,6 +884,31 @@ def objective_label(names):
     return name.replace("_", " ")
 
 
+def mark_best_objective(ax, summary, x):
+    """Dashed guide from the best objective to the y-axis."""
+    rows = summary.dropna(subset=[x, "objective"])
+    if rows.empty or "series" not in rows.columns:
+        return
+    best = best_series(rows)
+    if not best:
+        return
+    chosen = rows[rows["series"].isin(best)]
+    chosen = chosen.loc[[chosen[x].idxmin()]]
+    y = float(chosen["objective"].iloc[0])
+    x_best = float(chosen[x].iloc[0])
+    left, right = ax.get_xlim()
+    ax.plot(
+        [left, x_best], [y, y],
+        linestyle=(0, (2, 1.5)), color="black",
+        linewidth=0.8, zorder=4, solid_capstyle="butt",
+    )
+    ax.set_xlim(left, right)
+    ax.text(
+        left, y, f" {y:.4f}",
+        color="black", fontsize=7, ha="left", va="bottom",
+    )
+
+
 def draw_objective(ax, summary, palette, x, markers=None, best=()):
     """Protein's trial score. The benchmark report names it when one exists."""
     title = "Sweep objective"
@@ -893,6 +931,7 @@ def draw_objective(ax, summary, palette, x, markers=None, best=()):
     ax.set_xlabel(xlabel)
     ax.set_ylabel(objective_label(names))
     ax.set_title(title)
+    mark_best_objective(ax, summary, x)
 
 
 def fit_loss_axis(ax, values):
@@ -1009,27 +1048,27 @@ def draw(returns, losses, counts, failures, summary, out):
     if len(failures):
         failures = with_series(failures)
     best = best_series(summary)
-    palette = categorical_palette(summary["run"], best)
+    palette = series_palette(summary["series"], best)
 
     fig, axes, failure_axes, anchor_ax, density_ax, hyper_ax, size_axes = figure_axes()
 
-    draw_objective(axes[0], summary, palette, "run", best=best)
+    draw_objective(axes[0], summary, palette, "order", best=best)
 
     lo = float(summary["wall_min"].min())
     hi = float(summary["wall_min"].max())
     if lo == hi:
         lo, hi = lo - 1.0, hi + 1.0
     norm = plt.Normalize(lo, hi)
-    scatter_wallclock(summary, "run", "episode_return", axes[1], norm, best=best)
+    scatter_wallclock(summary, "order", "episode_return", axes[1], norm, best=best)
     colorbar = fig.colorbar(
         plt.cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axes[1], pad=0.02,
     )
     colorbar.set_label("wall clock (min)")
     axes[1].set_xscale("linear")
     axes[1].set_yscale("linear")
-    axes[1].set_xlabel("sweep index")
+    axes[1].set_xlabel("run order")
     axes[1].set_ylabel("episode return")
-    axes[1].set_title("Episode return vs sweep index")
+    axes[1].set_title("Episode return vs run order")
 
     sns.lineplot(
         data=returns, x="steps", y="episode_return", hue="series",
@@ -1055,14 +1094,14 @@ def draw(returns, losses, counts, failures, summary, out):
     else:
         draw_distance_per_infraction(axes[4], counts, palette)
 
-    scatter_metric(summary, "run", "parameters", axes[5], palette, best=best)
+    scatter_metric(summary, "order", "parameters", axes[5], palette, best=best)
     axes[5].set_yscale("log")
     axes[5].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
-    axes[5].set_xlabel("sweep index")
+    axes[5].set_xlabel("run order")
     axes[5].set_ylabel("parameters")
     axes[5].set_title("Network parameters")
 
-    draw_failure(failure_axes, summary, failures, palette, "run", best=best)
+    draw_failure(failure_axes, summary, failures, palette, "order", best=best)
     draw_score_vs_anchor(anchor_ax, summary, palette, best=best)
     draw_town_density(density_ax, summary, palette)
     draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
@@ -1285,7 +1324,7 @@ def main():
             args.log, args.metrics_dir,
         )
         draw(returns, losses, counts, failures, summary, out)
-    print(f"wrote {out} runs={len(summary)}")
+    print(f"wrote {out} runs={len(summary)} min_score={SCORE_MIN}")
     if missing:
         print("no metrics for runs:", " ".join(str(run) for run in missing))
 
