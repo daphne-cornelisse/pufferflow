@@ -3436,7 +3436,242 @@ typedef struct {
     char key[64];
 } SweepParam;
 
+typedef struct {
+    long stamp;
+    int run;
+    char name[256];
+} SweepHist;
+
 extern char** environ;
+
+static Dict* find_section(Ini* ini, const char* name) {
+    for (int i = 0; i < ini->num_sections; i++) {
+        if (strcmp(ini->sections[i].name, name) == 0) {
+            return &ini->sections[i];
+        }
+    }
+    return NULL;
+}
+
+static int sweep_values_match(DictItem* a, DictItem* b) {
+    double av = 0;
+    double bv = 0;
+    int a_num = a->str && puf_ini_parse_val(a->str, &av);
+    int b_num = b->str && puf_ini_parse_val(b->str, &bv);
+    if (a_num && b_num) {
+        double scale = fabs(av) + fabs(bv) + 1.0;
+        return fabs(av - bv) <= 1e-4 * scale;
+    }
+    if (!a->str || !b->str) {
+        return 0;
+    }
+    return strcmp(a->str, b->str) == 0;
+}
+
+static int sweep_param_index(SweepParam* params, int n_params,
+        const char* section, const char* key) {
+    for (int i = 0; i < n_params; i++) {
+        if (strcmp(params[i].section, section) == 0
+                && strcmp(params[i].key, key) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Same driving task. Swept values are samples, so they are not compared.
+static int sweep_task_matches(Ini* cur, Ini* hist,
+        SweepParam* params, int n_params) {
+    const char* sections[] = {"env", "policy", "train", "vec"};
+    for (int s = 0; s < 4; s++) {
+        Dict* left = find_section(cur, sections[s]);
+        Dict* right = find_section(hist, sections[s]);
+        if (!left || !right) {
+            return 0;
+        }
+        for (int i = 0; i < left->size; i++) {
+            DictItem* item = &left->items[i];
+            if (sweep_param_index(params, n_params, sections[s], item->key) >= 0) {
+                continue;
+            }
+            DictItem* other = dict_find(right, item->key);
+            if (!other || !sweep_values_match(item, other)) {
+                return 0;
+            }
+        }
+    }
+    Dict* left = find_section(cur, "sweep");
+    Dict* right = find_section(hist, "sweep");
+    if (!left || !right) {
+        return 0;
+    }
+    const char* keys[] = {"metric", "goal"};
+    for (int i = 0; i < 2; i++) {
+        DictItem* a = dict_find(left, keys[i]);
+        DictItem* b = dict_find(right, keys[i]);
+        if (!a || !b || !sweep_values_match(a, b)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int parse_sweep_log_name(const char* name, long* stamp, int* run) {
+    if (strncmp(name, "sweep_", 6) != 0) {
+        return 0;
+    }
+    const char* us = strrchr(name, '_');
+    const char* dot = strrchr(name, '.');
+    if (!us || !dot || strcmp(dot, ".ini") != 0 || us <= name + 6) {
+        return 0;
+    }
+    for (const char* p = name + 6; p < us; p++) {
+        if (*p < '0' || *p > '9') {
+            return 0;
+        }
+    }
+    for (const char* p = us + 1; p < dot; p++) {
+        if (*p < '0' || *p > '9') {
+            return 0;
+        }
+    }
+    *stamp = strtol(name + 6, NULL, 10);
+    *run = atoi(us + 1);
+    return 1;
+}
+
+static int sweep_hist_cmp(const void* a, const void* b) {
+    const SweepHist* ha = (const SweepHist*)a;
+    const SweepHist* hb = (const SweepHist*)b;
+    if (ha->stamp < hb->stamp) {
+        return -1;
+    }
+    if (ha->stamp > hb->stamp) {
+        return 1;
+    }
+    return ha->run - hb->run;
+}
+
+static int metric_last(DictItem* item, double* out) {
+    if (item->len > 0) {
+        *out = item->values[item->len - 1];
+        return 1;
+    }
+    if (item->str && puf_ini_parse_val(item->str, out)) {
+        return 1;
+    }
+    return 0;
+}
+
+// Finished sweep_*.ini logs seed Protein so a restart keeps the search.
+// A log counts when the task matches and every swept value is in range.
+// The next run index is past every sweep log already in the directory.
+static int seed_sweep_history(Ini* ini, ProteinSweep* protein,
+        SweepSpace* space, SweepParam* params, int n_params) {
+    char log_dir[2048];
+    snprintf(log_dir, sizeof(log_dir), "%s/%s",
+        puf_ini_get_str(ini, "base", "log_dir"),
+        puf_ini_get_str(ini, "base", "env_name"));
+    DIR* dp = opendir(log_dir);
+    if (!dp) {
+        return 0;
+    }
+    int cap = 0;
+    int n = 0;
+    SweepHist* logs = NULL;
+    struct dirent* ent = NULL;
+    while ((ent = readdir(dp))) {
+        long stamp = 0;
+        int run = 0;
+        if (!parse_sweep_log_name(ent->d_name, &stamp, &run)) {
+            continue;
+        }
+        if (n == cap) {
+            cap = cap ? cap * 2 : 16;
+            logs = (SweepHist*)realloc(logs, cap * sizeof(SweepHist));
+            assert(logs && "sweep history alloc failed");
+        }
+        logs[n].stamp = stamp;
+        logs[n].run = run;
+        snprintf(logs[n].name, sizeof(logs[n].name), "%s", ent->d_name);
+        n++;
+    }
+    closedir(dp);
+    if (n == 0) {
+        free(logs);
+        return 0;
+    }
+    qsort(logs, n, sizeof(SweepHist), sweep_hist_cmp);
+
+    const char* metric = puf_ini_get_str(ini, "sweep", "metric");
+    char metric_key[128];
+    snprintf(metric_key, sizeof(metric_key), "%s%s",
+        strchr(metric, '/') ? "" : "env/", metric);
+    float* sample = (float*)calloc(n_params, sizeof(float));
+    int loaded = 0;
+    int next_run = n;
+    for (int i = 0; i < n; i++) {
+        if (logs[i].run + 1 > next_run) {
+            next_run = logs[i].run + 1;
+        }
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", log_dir, logs[i].name);
+        Ini hist = {0};
+        puf_ini_load_file(&hist, path);
+        if (!sweep_task_matches(ini, &hist, params, n_params)) {
+            puf_ini_free(&hist);
+            continue;
+        }
+        Dict* metrics = find_section(&hist, "metrics");
+        DictItem* score_item = metrics ? dict_find(metrics, metric_key) : NULL;
+        DictItem* cost_item = metrics ? dict_find(metrics, "uptime") : NULL;
+        double score = 0;
+        double cost = 0;
+        if (!score_item || !cost_item
+                || !metric_last(score_item, &score)
+                || !metric_last(cost_item, &cost)
+                || !isfinite(score) || !isfinite(cost)) {
+            puf_ini_free(&hist);
+            continue;
+        }
+        int in_range = 1;
+        for (int p = 0; p < n_params; p++) {
+            Dict* section = find_section(&hist, params[p].section);
+            DictItem* item = section ? dict_find(section, params[p].key) : NULL;
+            double raw = 0;
+            if (!item || !item->str || !puf_ini_parse_val(item->str, &raw)) {
+                in_range = 0;
+                break;
+            }
+            Space* sp = &space->spaces[p];
+            float tol = 1e-4f * (fabsf(sp->min) + fabsf(sp->max) + 1.0f);
+            if (raw < sp->min - tol || raw > sp->max + tol) {
+                in_range = 0;
+                break;
+            }
+            float val = fmaxf(sp->min, fminf(sp->max, (float)raw));
+            float norm = space_normalize(sp, val);
+            if (!isfinite(norm) || norm < -1.0f || norm > 1.0f) {
+                in_range = 0;
+                break;
+            }
+            sample[p] = norm;
+        }
+        if (!in_range) {
+            puf_ini_free(&hist);
+            continue;
+        }
+        protein_sweep_observe(protein, sample, (float)score, (float)cost, 0);
+        loaded++;
+        puf_ini_free(&hist);
+    }
+    printf("sweep history %s loaded=%d kept=%d next_run=%d\n",
+        log_dir, loaded, protein->succ_n, next_run);
+    fflush(stdout);
+    free(sample);
+    free(logs);
+    return next_run;
+}
 
 typedef struct {
     int run;
@@ -3527,14 +3762,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
     int use_logit = strcmp(metric_dist, "logit") == 0;
     float max_cost = puf_ini_get(ini, "sweep", "max_suggestion_cost");
     float early_stop_quantile = puf_ini_get(ini, "sweep", "early_stop_quantile");
-    const char* sweep_init = puf_ini_get_str(ini, "sweep", "init");
-    assert((strcmp(sweep_init, "random") == 0 || strcmp(sweep_init, "current") == 0)
-        && "sweep.init must be random or current");
-    int random_init = strcmp(sweep_init, "random") == 0;
-    const char* sweep_focus = puf_ini_get_str(ini, "sweep", "focus");
-    assert((strcmp(sweep_focus, "pareto") == 0 || strcmp(sweep_focus, "score") == 0)
-        && "sweep.focus must be pareto or score");
-    int score_focus = strcmp(sweep_focus, "score") == 0;
+    int use_history = puf_ini_get(ini, "sweep", "use_history");
     assert(max_runs >= 1 && "sweep.max_runs must be >= 1");
     assert(downsample >= 1 && downsample <= TRAIN_RESULT_MAX_POINTS
         && "sweep.downsample must be in [1, TRAIN_RESULT_MAX_POINTS]");
@@ -3556,8 +3784,6 @@ void run_sweep(Ini* ini, const char* exe_path) {
     ProteinSweep* protein = protein_sweep_create((ProteinSweep){
         .space = space,
         .num_random_samples = 10,
-        .random_init = random_init,
-        .score_focus = score_focus,
         .suggestions_per_pareto = 256,
         .gp_training_iter = 50,
         .gp_learning_rate = 0.001f,
@@ -3586,16 +3812,8 @@ void run_sweep(Ini* ini, const char* exe_path) {
     int next_run_id = 0;
     int completed = 0;
     int active = 0;
-    for (int j = 0; j < space->num; j++) {
-        float val = puf_ini_get(ini, params[j].section, params[j].key);
-        float norm = space_normalize(&space->spaces[j], val);
-        if (!(isfinite(norm) && norm >= -1.0f && norm <= 1.0f)) {
-            fprintf(stderr,
-                "default sweep value outside its sweep range: %s.%s\n",
-                params[j].section, params[j].key);
-            exit(1);
-        }
-        protein->origin[j] = norm;
+    if (use_history) {
+        next_run_id = seed_sweep_history(ini, protein, space, params, n_params);
     }
     // Free-list: slot i owns GPUs [i*train_gpus, (i+1)*train_gpus). Refill as
     // soon as any trial exits (waitpid -1), so finished GPUs are never idle
@@ -3608,7 +3826,17 @@ void run_sweep(Ini* ini, const char* exe_path) {
 
             ProteinSweepInfo info = {0};
             if (!next_run_id) {
-                memcpy(samples, protein->origin, space->num * sizeof(float));
+                for (int j = 0; j < space->num; j++) {
+                    float val = puf_ini_get(ini, params[j].section, params[j].key);
+                    float norm = space_normalize(&space->spaces[j], val);
+                    if (!(isfinite(norm) && norm >= -1.0f && norm <= 1.0f)) {
+                        fprintf(stderr,
+                            "default sweep value outside its sweep range: %s.%s\n",
+                            params[j].section, params[j].key);
+                        exit(1);
+                    }
+                    samples[j] = norm;
+                }
             } else {
                 // Invalid jobs die and produce "fail" obs
                 info = protein_sweep_suggest(protein, samples, NAN);
@@ -4416,125 +4644,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     return result;
 }
 
-// Human-replay score from config/benchmark.ini. Empty sweep_metric skips
-// the launch. after_train runs it after ./puffer train. A sweep worker
-// (result_fd > 0) does not: its meta-objective is [sweep] metric.
-static int bench_cfg_metric(char* metric, int n, int* after_train) {
-    Ini bench = {0};
-    const char* name;
-    if (access("config/benchmark.ini", R_OK) != 0) {
-        return 0;
-    }
-    puf_ini_load_file(&bench, "config/benchmark.ini");
-    name = puf_ini_get_str(&bench, "benchmark", "sweep_metric");
-    snprintf(metric, (size_t)n, "%s", name ? name : "");
-    *after_train = (int)puf_ini_get(&bench, "benchmark", "after_train");
-    puf_ini_free(&bench);
-    return metric[0] != 0;
-}
-
-static float bench_report_value(const char* path, const char* metric) {
-    FILE* fp = fopen(path, "r");
-    char line[256];
-    float value = 0.0f;
-    int found = 0;
-    if (!fp) {
-        fprintf(stderr, "replay objective: missing %s\n", path);
-        exit(1);
-    }
-    while (fgets(line, (int)sizeof(line), fp)) {
-        char key[64];
-        float v = 0.0f;
-        if (sscanf(line, "sweep %63s %f", key, &v) == 2
-                && strcmp(key, metric) == 0) {
-            value = v;
-            found = 1;
-        }
-    }
-    fclose(fp);
-    if (!found) {
-        fprintf(stderr, "replay objective: %s not in %s\n", metric, path);
-        exit(1);
-    }
-    return value;
-}
-
-static void apply_replay_objective(Ini* ini, TrainResult* result) {
-    char metric[64];
-    char out_dir[512];
-    char report[576];
-    char bench_arg[1024];
-    char out_arg[576];
-    char hidden_arg[64];
-    char layers_arg[64];
-    char* argv[6];
-    const char* ckpt;
-    const char* run_id;
-    int after_train = 0;
-    int result_fd;
-    int status = 0;
-    pid_t pid = 0;
-    float score;
-    if (!bench_cfg_metric(metric, (int)sizeof(metric), &after_train)) {
-        return;
-    }
-    result_fd = (int)puf_ini_get(ini, "base", "result_fd");
-    // Sweep workers report env/<sweep.metric> and return. The benchmark
-    // is a separate ./drive --benchmark launch, or after_train on a
-    // normal train.
-    if (result_fd > 0 || !after_train) {
-        return;
-    }
-    ckpt = puf_ini_get_str(ini, "base", "load_model_path");
-    if (!ckpt || !ckpt[0] || strcmp(ckpt, "None") == 0
-            || strcmp(ckpt, "'None'") == 0) {
-        fprintf(stderr, "replay objective: no checkpoint\n");
-        exit(1);
-    }
-    run_id = puf_ini_get_str(ini, "base", "run_id");
-    snprintf(out_dir, sizeof(out_dir), "analysis/benchmark/%s", run_id);
-    snprintf(bench_arg, sizeof(bench_arg), "--benchmark=%s", ckpt);
-    snprintf(out_arg, sizeof(out_arg), "--benchmark-out=%s", out_dir);
-    snprintf(hidden_arg, sizeof(hidden_arg), "--policy.hidden_size=%d",
-        (int)puf_ini_get(ini, "policy", "hidden_size"));
-    snprintf(layers_arg, sizeof(layers_arg), "--policy.num_layers=%d",
-        (int)puf_ini_get(ini, "policy", "num_layers"));
-    argv[0] = (char*)"./drive";
-    argv[1] = bench_arg;
-    argv[2] = out_arg;
-    argv[3] = hidden_arg;
-    argv[4] = layers_arg;
-    argv[5] = NULL;
-    fprintf(stderr, "replay objective %s %s\n", metric, ckpt);
-    if (posix_spawn(&pid, "./drive", NULL, NULL, argv, environ) != 0) {
-        perror("replay objective");
-        exit(1);
-    }
-    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status)
-            || WEXITSTATUS(status) != 0) {
-        fprintf(stderr, "replay objective benchmark failed\n");
-        exit(1);
-    }
-    snprintf(report, sizeof(report), "%s/report.txt", out_dir);
-    // "score" still logs replay and horizon, and protein keeps env/score.
-    if (strcmp(metric, "score") == 0) {
-        if (access(report, R_OK) != 0) {
-            fprintf(stderr, "replay objective: missing %s\n", report);
-            exit(1);
-        }
-        fprintf(stderr, "replay objective kept training score\n");
-        return;
-    }
-    score = bench_report_value(report, metric);
-    // One protein point. The training curve stays in the run ini.
-    result->score = score;
-    result->scores[0] = score;
-    result->points = 1;
-    result->costs[0] = result->cost;
-    result->step_points[0] = result->steps;
-    fprintf(stderr, "replay objective %s=%.6f\n", metric, score);
-}
-
 // Fork DP workers before any CUDA/NCCL call (those start runtime threads;
 // fork after that SIGSEGVs children and rank 0 hangs in ncclCommInitRank).
 // Rank 0 generates the NCCL id after fork and pipes it. Sweep trials occupy
@@ -4619,7 +4728,6 @@ TrainResult launch_train(Ini* ini) {
         .nccl_id = nccl_ptr,
     };
     TrainResult result = run_train(ini, &host);
-    apply_replay_objective(ini, &result);
     if (world_size > 1) {
         close(nccl_pipe[1]);
     }
