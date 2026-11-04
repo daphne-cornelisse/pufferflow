@@ -76,12 +76,13 @@ def pivot(rows, columns):
 
 
 def draw(ax, table, cmap, cbar_label):
+    shown = table * 100.0
     norm = Normalize(
-        vmin=float(table.min().min()),
-        vmax=float(table.max().max()),
+        vmin=float(shown.min().min()),
+        vmax=float(shown.max().max()),
     )
     sns.heatmap(
-        table,
+        shown,
         ax=ax,
         cmap=cmap,
         vmin=norm.vmin,
@@ -91,13 +92,13 @@ def draw(ax, table, cmap, cbar_label):
         xticklabels=True,
         yticklabels=True,
     )
-    for i, density in enumerate(table.index):
-        for j, horizon in enumerate(table.columns):
-            value = float(table.loc[density, horizon])
+    for i, density in enumerate(shown.index):
+        for j, horizon in enumerate(shown.columns):
+            value = float(shown.loc[density, horizon])
             red, green, blue, _ = cmap(norm(value))
             lum = 0.2126 * red + 0.7152 * green + 0.0722 * blue
             ax.text(
-                j + 0.5, i + 0.5, f"{value:.2f}",
+                j + 0.5, i + 0.5, f"{value:.0f}%",
                 ha="center", va="center", fontsize=5,
                 color="black" if lum > 0.55 else "white",
             )
@@ -121,8 +122,8 @@ def main():
     cmap = sns.color_palette("rocket_r", as_cmap=True)
     sns.set_style("ticks")
     fig, axes = plt.subplots(1, 2, figsize=(32.0, 7.2), dpi=200)
-    draw(axes[0], left, cmap, "cumulative collisions per agent")
-    draw(axes[1], right, cmap, "collisions per agent in bin")
+    draw(axes[0], left, cmap, "cumulative collisions per 100 agents")
+    draw(axes[1], right, cmap, "collisions per 100 agents in bin")
     axes[0].set_xlabel(
         "horizon (mean cumulative collisions per agent through end of bin)"
     )

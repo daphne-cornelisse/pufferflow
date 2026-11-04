@@ -47,6 +47,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
+from matplotlib import ticker as mticker
 from matplotlib.transforms import ScaledTranslation
 import pandas as pd
 import seaborn as sns
@@ -884,9 +885,9 @@ def objective_label(names):
     return name.replace("_", " ")
 
 
-def mark_best_objective(ax, summary, x):
+def mark_best_objective(ax, summary, x, y="objective"):
     """Dashed guide from the best objective to the y-axis."""
-    rows = summary.dropna(subset=[x, "objective"])
+    rows = summary.dropna(subset=[x, y])
     if rows.empty or "series" not in rows.columns:
         return
     best = best_series(rows)
@@ -894,17 +895,17 @@ def mark_best_objective(ax, summary, x):
         return
     chosen = rows[rows["series"].isin(best)]
     chosen = chosen.loc[[chosen[x].idxmin()]]
-    y = float(chosen["objective"].iloc[0])
+    height = float(chosen[y].iloc[0])
     x_best = float(chosen[x].iloc[0])
     left, right = ax.get_xlim()
     ax.plot(
-        [left, x_best], [y, y],
+        [left, x_best], [height, height],
         linestyle=(0, (2, 1.5)), color="black",
         linewidth=0.8, zorder=4, solid_capstyle="butt",
     )
     ax.set_xlim(left, right)
     ax.text(
-        left, y, f" {y:.4f}",
+        left, height, f" {height:.4f}",
         color="black", fontsize=7, ha="left", va="bottom",
     )
 
@@ -1035,6 +1036,109 @@ def scatter_wallclock(summary, x, y, ax, norm, markers=None, best=()):
                     legend=False, edgecolor="white", linewidth=0.6,
                 )
     scatter_stars(stars, x, y, ax)
+
+
+def scatter_score_band(summary, x, y, ax):
+    """Runs at 0.85 and above are blue. The rest are red."""
+    plotted = summary.dropna(subset=[x, y, "score"])
+    high = plotted[plotted["score"] >= 0.85]
+    low = plotted[plotted["score"] < 0.85]
+    blue = sns.color_palette("deep")[0]
+    red = sns.color_palette("deep")[3]
+    if len(low):
+        ax.scatter(
+            low[x], low[y], s=58, c=[red],
+            edgecolors="white", linewidths=0.6, zorder=3,
+        )
+    if len(high):
+        ax.scatter(
+            high[x], high[y], s=58, c=[blue],
+            edgecolors="white", linewidths=0.6, zorder=4,
+        )
+
+
+def draw_split(summary, out_dir):
+    """Objective against run order, and score against wall clock."""
+    apply_figure_style()
+    summary = with_series(summary)
+    paths = []
+    panels = (
+        ("sweep-objective.png", "order", "objective", "Sweep objective", "run order"),
+        ("sweep-score-wall.png", "wall_min", "score", "Score vs wall clock", "wall clock (min)"),
+    )
+    for name, x, y, title, xlabel in panels:
+        fig, ax = plt.subplots(figsize=(7.4, 4.6), dpi=200)
+        scatter_score_band(summary, x, y, ax)
+        fit_score_axis(ax, summary[y])
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("score")
+        ax.set_title(title)
+        mark_best_objective(ax, summary, x, y)
+        style_ax(ax)
+        fig.tight_layout()
+        path = out_dir / name
+        fig.savefig(path, dpi=200)
+        plt.close(fig)
+        paths.append(path)
+    return paths
+
+
+def scatter_band_markers(frame, x, y, ax):
+    """Score above 0.85 is blue. A run under 30 minutes is a star."""
+    plotted = frame.dropna(subset=[x, y, "score"])
+    blue = sns.color_palette("deep")[0]
+    red = sns.color_palette("deep")[3]
+    fast = plotted["wall_min"] < 30
+    high = plotted["score"] > 0.85
+    groups = (
+        (~high & ~fast, red, "o", 36, 3),
+        (high & ~fast, blue, "o", 36, 4),
+        (~high & fast, red, "*", 120, 5),
+        (high & fast, blue, "*", 120, 6),
+    )
+    for mask, color, marker, size, zorder in groups:
+        part = plotted[mask]
+        if part.empty:
+            continue
+        ax.scatter(
+            part[x], part[y], s=size, c=[color], marker=marker,
+            edgecolors="white", linewidths=0.45, zorder=zorder,
+        )
+
+
+def draw_hyper_scores(summary, out_dir):
+    """Each hyperparameter against score. No boxplot."""
+    apply_figure_style()
+    fields = list(SCALED_HYPERS) + list(SIZE_HYPERS)
+    cols = 5
+    rows = (len(fields) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(18.0, 10.2), dpi=100)
+    flat = list(axes.ravel())
+    for ax, label in zip(flat, fields):
+        values = summary[label]
+        scatter_band_markers(summary, label, "score", ax)
+        fit_score_axis(ax, summary["score"])
+        finite = values.dropna()
+        lo = float(finite.min())
+        hi = float(finite.max())
+        if lo > 0 and hi / lo >= 20:
+            ax.set_xscale("log")
+            ax.xaxis.set_major_locator(mticker.LogLocator(numticks=4))
+            ax.xaxis.set_major_formatter(mticker.LogFormatterSciNotation())
+            ax.tick_params(axis="x", labelrotation=25)
+            for tick in ax.get_xticklabels():
+                tick.set_ha("right")
+        ax.tick_params(axis="x", labelsize=7)
+        ax.set_xlabel(label.replace("_", " "))
+        ax.set_ylabel("score")
+        style_ax(ax)
+    for ax in flat[len(fields):]:
+        ax.set_axis_off()
+    fig.tight_layout()
+    path = out_dir / "sweep-hypers.png"
+    fig.savefig(path, dpi=100)
+    plt.close(fig)
+    return path
 
 
 def draw(returns, losses, counts, failures, summary, out):
@@ -1324,6 +1428,9 @@ def main():
             args.log, args.metrics_dir,
         )
         draw(returns, losses, counts, failures, summary, out)
+        for path in draw_split(summary, out.parent):
+            print(f"wrote {path}")
+        print(f"wrote {draw_hyper_scores(summary, out.parent)}")
     print(f"wrote {out} runs={len(summary)} min_score={SCORE_MIN}")
     if missing:
         print("no metrics for runs:", " ".join(str(run) for run in missing))
