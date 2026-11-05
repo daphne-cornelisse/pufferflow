@@ -3,8 +3,9 @@
 // Drive entity encoder. Included by src/ocean.cu.
 //
 // Each ego, partner, and road token goes through its own
-// Linear -> LayerNorm -> Linear. There is no activation between the
-// two linears. The last road feature is a class in 0..6 and becomes a
+// Linear -> LayerNorm -> GELU -> Linear. The GELU is what makes the
+// second linear a layer: without it the two maps are one affine map.
+// The last road feature is a class in 0..6 and becomes a
 // 7-way one-hot; the first 6 features stay continuous.
 //
 // Those tokens are not pooled. Four learned queries cross-attend to the
@@ -557,6 +558,28 @@ __global__ void drive_tanh_bwd_kernel(precision_t* dy, const precision_t* y,
     }
 }
 
+// Exact GELU. dy is read and overwritten; x is the pre-activation.
+__global__ void drive_gelu_kernel(precision_t* y, const precision_t* x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = to_float(x[i]);
+        float cdf = 0.5f * (1.0f + erff(v * 0.7071067811865476f));
+        y[i] = from_float(v * cdf);
+    }
+}
+
+__global__ void drive_gelu_bwd_kernel(precision_t* dy, const precision_t* x,
+        int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = to_float(x[i]);
+        float g = to_float(dy[i]);
+        float cdf = 0.5f * (1.0f + erff(v * 0.7071067811865476f));
+        float pdf = expf(-0.5f * v * v) * 0.3989422804014327f;
+        dy[i] = from_float(g * (cdf + v * pdf));
+    }
+}
+
 __global__ void drive_dq_sum_kernel(float* sum, const precision_t* dQ,
         int rows, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -794,6 +817,8 @@ static void drive_zero_prec(Prec* t, cudaStream_t stream) {
     cudaMemsetAsync(t->data, 0,
         numel(t->shape) * sizeof(precision_t), stream);
 }
+
+
 
 static int drive_partial_cap(int H) {
     long bytes = (long)DRIVE_ENC_CHUNK * MAX_ROAD_SEGMENT_OBSERVATIONS
@@ -1054,14 +1079,16 @@ static void drive_project(Prec w, Prec b, precision_t* x, precision_t* y,
     drive_bias(y, b.data, rows, H, stream);
 }
 
-// h1 lands in buf0, ln in buf1, h2 in dest. dest must not alias those.
+// h1 lands in buf0, ln in buf1, gelu in gelu, h2 in dest. None may alias.
 static void drive_mlp_fwd(Prec w1, Prec b1, Prec gamma, Prec beta,
         Prec w2, Prec b2, precision_t* x, precision_t* h1,
-        precision_t* ln, precision_t* dest, int tokens, int feat, int H,
-        cudaStream_t stream) {
+        precision_t* ln, precision_t* gelu, precision_t* dest,
+        int tokens, int feat, int H, cudaStream_t stream) {
     drive_project(w1, b1, x, h1, tokens, feat, H, stream);
     drive_ln_fwd(ln, h1, gamma.data, beta.data, tokens, H, stream);
-    drive_project(w2, b2, ln, dest, tokens, H, H, stream);
+    int n = tokens * H;
+    drive_gelu_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(gelu, ln, n);
+    drive_project(w2, b2, gelu, dest, tokens, H, H, stream);
 }
 
 static precision_t* drive_ego_ptr(precision_t* base, int H) {
@@ -1083,12 +1110,12 @@ static void drive_embed_group(Prec w1, Prec b1, Prec gamma, Prec beta,
         const precision_t* obs, int rows, int obs_size, int off,
         int slots, int raw, int one_hot, int H,
         precision_t* pack, precision_t* h1, precision_t* ln,
-        precision_t* h2, precision_t* K, precision_t* V,
+        precision_t* gelu, precision_t* h2, precision_t* K, precision_t* V,
         cudaStream_t stream) {
     int feat = one_hot ? DRIVE_ROAD_IN : raw;
     int tokens = rows * slots;
     drive_pack(pack, obs, rows, obs_size, off, slots, raw, one_hot, stream);
-    drive_mlp_fwd(w1, b1, gamma, beta, w2, b2, pack, h1, ln, h2,
+    drive_mlp_fwd(w1, b1, gamma, beta, w2, b2, pack, h1, ln, gelu, h2,
         tokens, feat, H, stream);
     drive_project(wk, bk, h2, K, tokens, H, H, stream);
     drive_project(wv, bv, h2, V, tokens, H, H, stream);
@@ -1103,7 +1130,7 @@ static void drive_fill_kv(DriveEncWeights* ew, DriveEncActs* a,
     drive_embed_group(ew->ego_w1, ew->ego_b1, ew->ego_lng, ew->ego_lnb,
         ew->ego_w2, ew->ego_b2, ew->wk, ew->bk, ew->wv, ew->bv,
         row, rows, obs_size, 0, 1, EGO_FEATURES, 0, H,
-        a->pack.data, a->buf0.data, a->buf1.data,
+        a->pack.data, a->buf0.data, a->buf1.data, a->buf3.data,
         drive_ego_ptr(a->tok.data, H),
         drive_ego_ptr(a->ktok.data, H),
         drive_ego_ptr(a->vtok.data, H), stream);
@@ -1111,14 +1138,14 @@ static void drive_fill_kv(DriveEncWeights* ew, DriveEncActs* a,
         ew->road_w2, ew->road_b2, ew->wk, ew->bk, ew->wv, ew->bv,
         row, rows, obs_size, EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS,
         MAX_ROAD_SEGMENT_OBSERVATIONS, ROAD_FEATURES, 1, H,
-        a->pack.data, a->buf0.data, a->buf1.data,
+        a->pack.data, a->buf0.data, a->buf1.data, a->buf3.data,
         drive_road_ptr(a->tok.data, H),
         drive_road_ptr(a->ktok.data, H),
         drive_road_ptr(a->vtok.data, H), stream);
     drive_embed_group(ew->part_w1, ew->part_b1, ew->part_lng, ew->part_lnb,
         ew->part_w2, ew->part_b2, ew->wk, ew->bk, ew->wv, ew->bv,
         row, rows, obs_size, EGO_FEATURES, MAX_AGENTS, PARTNER_FEATURES, 0,
-        H, a->pack.data, a->buf0.data, a->buf1.data,
+        H, a->pack.data, a->buf0.data, a->buf1.data, a->buf3.data,
         drive_part_ptr(a->tok.data, H),
         drive_part_ptr(a->ktok.data, H),
         drive_part_ptr(a->vtok.data, H), stream);
@@ -1167,6 +1194,7 @@ static void drive_chunk_fwd(DriveEncWeights* ew, DriveEncActs* a,
 }
 
 // Dense tower backward. dh is the grad of h2 and must outlive the w2 grad.
+// buf2 holds the GELU activation, then its gradient. buf1 is the layer-norm.
 static void drive_tower_bwd(Prec w1, Prec b1, Prec gamma, Prec beta,
         Prec w2, Prec b2, Prec w1g, Prec w2g,
         Float acc_b1, Float acc_be, Float acc_g, Float acc_b2,
@@ -1176,25 +1204,30 @@ static void drive_tower_bwd(Prec w1, Prec b1, Prec gamma, Prec beta,
         precision_t* buf2, precision_t* buf3, cudaStream_t stream) {
     int feat = one_hot ? DRIVE_ROAD_IN : raw;
     int tokens = rows * slots;
+    int nact = tokens * H;
+    int partial_n = drive_partial_cap(H);
     drive_pack(pack, obs, rows, obs_size, off, slots, raw, one_hot, stream);
-    Prec ln = drive_view(buf1, tokens, H);
     drive_project(w1, b1, pack, buf0, tokens, feat, H, stream);
     drive_ln_fwd(buf1, buf0, gamma.data, beta.data, tokens, H, stream);
-    int partial_n = drive_partial_cap(H);
-    drive_dw(w2g.data, dh, buf1, (float*)buf3, tokens, H, H,
+    drive_gelu_kernel<<<grid_size(nact), BLOCK_SIZE, 0, stream>>>(
+        buf2, buf1, nact);
+    drive_dw(w2g.data, dh, buf2, (float*)buf3, tokens, H, H,
         partial_n, stream);
     drive_colsum(acc_b2.data, dh, tokens, H, stream);
     Prec dhv = drive_view(dh, tokens, H);
-    puf_mm_nn(&dhv, &w2, &ln, stream);
-    drive_colsum(acc_be.data, buf1, tokens, H, stream);
+    Prec dg = drive_view(buf2, tokens, H);
+    puf_mm_nn(&dhv, &w2, &dg, stream);
+    drive_gelu_bwd_kernel<<<grid_size(nact), BLOCK_SIZE, 0, stream>>>(
+        buf2, buf1, nact);
+    drive_colsum(acc_be.data, buf2, tokens, H, stream);
     dim3 ln_block(32, DRIVE_LN_ROWS);
     dim3 ln_grid((tokens + DRIVE_LN_ROWS - 1) / DRIVE_LN_ROWS);
     drive_ln_bwd_kernel<<<ln_grid, ln_block, 0, stream>>>(
-        buf2, buf3, buf1, buf0, gamma.data, H, tokens);
+        buf1, buf3, buf2, buf0, gamma.data, H, tokens);
     drive_colsum(acc_g.data, buf3, tokens, H, stream);
-    drive_dw(w1g.data, buf2, pack, (float*)buf3, tokens, H, feat,
+    drive_dw(w1g.data, buf1, pack, (float*)buf3, tokens, H, feat,
         partial_n, stream);
-    drive_colsum(acc_b1.data, buf2, tokens, H, stream);
+    drive_colsum(acc_b1.data, buf1, tokens, H, stream);
 }
 
 static void drive_group_bwd(Prec wk, Prec wv, Prec wkg, Prec wvg,
