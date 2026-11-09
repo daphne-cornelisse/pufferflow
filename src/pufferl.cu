@@ -560,6 +560,18 @@ typedef struct {
     int skip_rollout_time;
 } Profile;
 
+// Fixed edges so a CUDA graph can histogram without a host rescale.
+#define ADV_BINS 32
+#define ADV_LO (-32.f)
+#define ADV_HI 32.f
+
+typedef struct {
+    double step;
+    double mean_abs;
+    double var;
+    unsigned int bin[ADV_BINS];
+} AdvSnap;
+
 typedef struct PuffeRL {
     Policy* policies;        // [num_policies]; policies[0] trainable, rest frozen
     int num_policies;
@@ -586,6 +598,19 @@ typedef struct PuffeRL {
     cudaStream_t train_stream;    // dedicated learner stream (always non-default)
     int* act_sizes;        // device ACT_SIZES (NUM_ATNS ints)
     float* losses;         // device loss accumulator (NUM_LOSSES)
+    // Advantage windows, each sum / |sum| / sq.
+    // 0 is the log window. 3 is the snapshot window.
+    // count matches those two. hist is ADV_BINS.
+    // Bin 0 is below ADV_LO, ADV_BINS-1 is at or above ADV_HI.
+    double* adv_mom;
+    unsigned long long* adv_count;
+    unsigned int* adv_hist;
+    AdvSnap* adv_snaps;
+    int adv_snap_n;
+    int adv_snap_cap;
+    int adv_every;
+    FILE* adv_fp;
+    char adv_path[1024];
     PPOBufs ppo_bufs; // Pre-allocated buffers for ppo_loss_fwd_bwd
     Anchor anchor;
     Prec actor_param;      // async flat actor params
@@ -1017,33 +1042,6 @@ static Env* puf_vec_create(int, Dict*, obs_t*, float*, float*, float*) {
 #endif
 
 
-// Map index for env_i of nenvs copies. The first (nenvs % num_maps)
-// maps get one extra copy. Returns -1 when every copy uses map_id.
-static int env_map_slot(int env_i, int nenvs, int num_maps) {
-    if (num_maps <= 1 || nenvs <= 1) {
-        return -1;
-    }
-    if (env_i < 0) {
-        env_i = 0;
-    }
-    if (env_i >= nenvs) {
-        env_i = nenvs - 1;
-    }
-    int extra = nenvs % num_maps;
-    int big = nenvs / num_maps + 1;
-    if (extra == 0) {
-        return env_i / (nenvs / num_maps);
-    }
-    if (env_i < extra * big) {
-        return env_i / big;
-    }
-    int small = nenvs / num_maps;
-    if (small < 1) {
-        return env_i;
-    }
-    return extra + (env_i - extra * big) / small;
-}
-
 static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     if (PUF_BACKEND == PUF_GPU) {
         assert(vec->buffers == 1 && "GPU env: num_buffers must be 1");
@@ -1072,35 +1070,39 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
 #else
     Env* envs = (Env*)calloc(total_agents, sizeof(Env));
     int agents_created = 0;
-    int num_maps = 1;
-    DictItem* maps_item = dict_find(ek, "num_maps");
-    if (maps_item && maps_item->value > 1.0) {
-        num_maps = (int)maps_item->value;
+    // num_maps 1 leaves map_id alone. Above that, copy i loads map i % num_maps.
+    int num_maps = (int)dict_get(ek, "num_maps");
+    int map_counts[8];
+    double saved_map_id = 0.0;
+    int restore_map_id = 0;
+    memset(map_counts, 0, sizeof(map_counts));
+    if (num_maps < 1) {
+        num_maps = 1;
     }
-    int agents_per = 1;
-    DictItem* agents_item = dict_find(ek, "num_agents");
-    if (agents_item && agents_item->value >= 1.0) {
-        agents_per = (int)agents_item->value;
-    }
-    int nenvs_est = (total_agents + agents_per - 1) / agents_per;
-    if (nenvs_est < 1) {
-        nenvs_est = 1;
+    if (num_maps > 1) {
+        saved_map_id = dict_get(ek, "map_id");
+        restore_map_id = 1;
     }
     while (agents_created < total_agents) {
         envs[num_envs].rng = num_envs;
-        Dict* ek_i = ek;
-        int slot = env_map_slot(num_envs, nenvs_est, num_maps);
-        if (slot >= 0) {
-            ek_i = (Dict*)calloc(1, sizeof(Dict));
-            assert(ek_i);
-            dict_copy(ek_i, ek);
-            // Files are map_000.bin .. map_{num_maps-1}.bin. Each copy
-            // keeps this dict so a later env cannot change its map_id.
-            dict_set(ek_i, "map_id", (double)slot);
+        if (num_maps > 1) {
+            int map_id = num_envs % num_maps;
+            dict_set(ek, "map_id", (double)map_id);
+            if (map_id < 8) {
+                map_counts[map_id]++;
+            }
         }
-        puf_init(&envs[num_envs], ek_i);
+        puf_init(&envs[num_envs], ek);
         agents_created += envs[num_envs].num_agents;
         num_envs++;
+    }
+    if (restore_map_id) {
+        dict_set(ek, "map_id", saved_map_id);
+        fprintf(stderr, "maps copies=%d num_maps=%d", num_envs, num_maps);
+        for (int m = 0; m < num_maps && m < 8; m++) {
+            fprintf(stderr, " m%d=%d", m, map_counts[m]);
+        }
+        fprintf(stderr, "\n");
     }
     envs = (Env*)realloc(envs, num_envs * sizeof(Env));
     int buf = 0, buf_agents = 0;
@@ -1697,6 +1699,151 @@ static void anchor_open_stream(Anchor* a) {
         &a->done_ev, cudaEventDisableTiming) == cudaSuccess);
 }
 
+// Last horizon index is left 0 by puff_advantage. Skip it so the
+// histogram is not a spike at zero. Bin 0 and the last bin are overflow.
+// Moments are stored twice: [0, 3) is the log window, [3, 6) is the snapshot.
+__global__ void adv_stats(const precision_t* adv, int n, int horizon,
+        double* mom, unsigned long long* count, unsigned int* hist) {
+    __shared__ double red[3][BLOCK_SIZE];
+    __shared__ int rn[BLOCK_SIZE];
+    __shared__ unsigned int local[ADV_BINS];
+    int tid = threadIdx.x;
+    if (tid < ADV_BINS) {
+        local[tid] = 0;
+    }
+    __syncthreads();
+
+    double ls = 0;
+    double la = 0;
+    double lq = 0;
+    int ln = 0;
+    int i = blockIdx.x * BLOCK_SIZE + tid;
+    int live = i < n && (horizon <= 1 || (i % horizon) != horizon - 1);
+    if (live) {
+        float a = to_float(adv[i]);
+        int bin = ADV_BINS - 1;
+        ls = a;
+        la = fabsf(a);
+        lq = (double)a * (double)a;
+        ln = 1;
+        if (a < ADV_LO) {
+            bin = 0;
+        } else if (a < ADV_HI) {
+            float u = (a - ADV_LO) / (ADV_HI - ADV_LO);
+            bin = 1 + (int)(u * (float)(ADV_BINS - 2));
+            if (bin > ADV_BINS - 2) {
+                bin = ADV_BINS - 2;
+            }
+        }
+        atomicAdd(local + bin, 1u);
+    }
+    red[0][tid] = ls;
+    red[1][tid] = la;
+    red[2][tid] = lq;
+    rn[tid] = ln;
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            red[0][tid] += red[0][tid + stride];
+            red[1][tid] += red[1][tid + stride];
+            red[2][tid] += red[2][tid + stride];
+            rn[tid] += rn[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0 && rn[0]) {
+        atomicAdd(mom + 0, red[0][0]);
+        atomicAdd(mom + 1, red[1][0]);
+        atomicAdd(mom + 2, red[2][0]);
+        atomicAdd(mom + 3, red[0][0]);
+        atomicAdd(mom + 4, red[1][0]);
+        atomicAdd(mom + 5, red[2][0]);
+        atomicAdd(count + 0, (unsigned long long)rn[0]);
+        atomicAdd(count + 1, (unsigned long long)rn[0]);
+    }
+    __syncthreads();
+    if (tid < ADV_BINS && local[tid]) {
+        atomicAdd(hist + tid, local[tid]);
+    }
+}
+
+static void adv_reduce(double sum, double sum_abs, double sum_sq,
+        unsigned long long n, double* mean_abs, double* var) {
+    *mean_abs = 0;
+    *var = 0;
+    if (!n) {
+        return;
+    }
+    double mean = sum / (double)n;
+    *mean_abs = sum_abs / (double)n;
+    *var = sum_sq / (double)n - mean * mean;
+    if (*var < 0) {
+        *var = 0;
+    }
+}
+
+// Copy the snapshot window to the host and clear it. The log window stays.
+static void adv_window_take(double* mom, unsigned long long* count,
+        unsigned int* hist, double out_mom[3], unsigned long long* out_n,
+        unsigned int* out_bins) {
+    cudaMemcpy(out_mom, mom, 3 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_n, count, sizeof(*out_n), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_bins, hist, ADV_BINS * sizeof(unsigned int),
+        cudaMemcpyDeviceToHost);
+    cudaMemset(mom, 0, 3 * sizeof(double));
+    cudaMemset(count, 0, sizeof(*out_n));
+    cudaMemset(hist, 0, ADV_BINS * sizeof(unsigned int));
+}
+
+static void adv_json_line(PuffeRL* p, long steps, const char* group,
+        double mean_abs, double var, const unsigned int* bins) {
+    FILE* fp;
+    if (!p->adv_path[0]) {
+        return;
+    }
+    fp = p->adv_fp;
+    if (!fp) {
+        fp = fopen(p->adv_path, "a");
+        if (!fp) {
+            fprintf(stderr, "advantage log open failed %s\n", p->adv_path);
+            p->adv_path[0] = 0;
+            return;
+        }
+        p->adv_fp = fp;
+    }
+    fprintf(fp,
+        "{\"steps\":%ld,\"group\":\"%s\",\"mean_abs\":%.6g,\"var\":%.6g,"
+        "\"bins\":[",
+        steps, group, mean_abs, var);
+    for (int i = 0; i < ADV_BINS; i++) {
+        fprintf(fp, "%s%u", i ? "," : "", bins[i]);
+    }
+    fprintf(fp, "]}\n");
+    fflush(fp);
+}
+
+// Histogram window. The log window (mom[0..2], count[0]) stays put.
+static void adv_snap(PuffeRL* p) {
+    double mom[3];
+    unsigned long long cnt = 0;
+    unsigned int bins[ADV_BINS];
+    long steps;
+    if (!p->adv_snaps || p->adv_snap_n >= p->adv_snap_cap) {
+        return;
+    }
+    adv_window_take(p->adv_mom + 3, p->adv_count + 1, p->adv_hist,
+        mom, &cnt, bins);
+    if (!cnt) {
+        return;
+    }
+    steps = p->global_step * p->hypers.world_size;
+    AdvSnap* s = &p->adv_snaps[p->adv_snap_n++];
+    adv_reduce(mom[0], mom[1], mom[2], cnt, &s->mean_abs, &s->var);
+    s->step = (double)steps;
+    memcpy(s->bin, bins, sizeof(bins));
+    adv_json_line(p, steps, "all", s->mean_abs, s->var, bins);
+}
+
 static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         cudaStream_t stream) {
     Hypers* hypers = &pufferl->hypers;
@@ -1785,6 +1932,9 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             graph.mb_advantages.data, graph.mb_gae_v.data,
             hypers->gamma, hypers->gae_lambda,
             hypers->vtrace_rho_clip, hypers->vtrace_c_clip, Nmb, Tmb);
+        adv_stats<<<grid_size(Nmb * Tmb), BLOCK_SIZE, 0, stream>>>(
+            graph.mb_advantages.data, Nmb * Tmb, Tmb,
+            pufferl->adv_mom, pufferl->adv_count, pufferl->adv_hist);
         graph.mb_returns = graph.mb_gae_v;
 
         ppo_loss_fwd_bwd(dec, p_logstd, graph,
@@ -1906,6 +2056,9 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
             (float)(h[TE_E] - h[TE_MID]) * 1e-6f;
     }
     pufferl->epoch += 1;
+    if (pufferl->adv_every > 0 && pufferl->epoch % pufferl->adv_every == 0) {
+        adv_snap(pufferl);
+    }
 }
 
 // Load policy weights (flat fp32 checkpoint). Safe between rollouts —
@@ -2679,6 +2832,16 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 
     PuffeRL* pufferl = (PuffeRL*)calloc(1, sizeof(PuffeRL));
     pufferl->hypers = hypers;
+    if (ctx->artifact_owner) {
+        char dir[512];
+        const char* run_id = puf_ini_get_str(ini, "base", "run_id");
+        snprintf(dir, sizeof(dir), "%s/%s",
+            puf_ini_get_str(ini, "base", "log_dir"),
+            puf_ini_get_str(ini, "base", "env_name"));
+        mkdir_p(dir);
+        snprintf(pufferl->adv_path, sizeof(pufferl->adv_path),
+            "%s/%s-advantages.jsonl", dir, run_id);
+    }
     snprintf(pufferl->env_name, sizeof(pufferl->env_name), "%s", PUFFER_ENV_NAME);
 
     cudaSetDevice(hypers.gpu_id);
@@ -2852,6 +3015,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemset(pufferl->rng_offset, 0, (num_buffers + 1) * sizeof(long));
     cudaMalloc((void**)&pufferl->act_sizes, num_action_heads * sizeof(int));
     cudaMalloc((void**)&pufferl->losses, NUM_LOSSES * sizeof(float));
+    cudaMalloc((void**)&pufferl->adv_mom, 6 * sizeof(double));
+    cudaMalloc((void**)&pufferl->adv_count, 2 * sizeof(unsigned long long));
+    cudaMalloc((void**)&pufferl->adv_hist, ADV_BINS * sizeof(unsigned int));
+    cudaMemset(pufferl->adv_mom, 0, 6 * sizeof(double));
+    cudaMemset(pufferl->adv_count, 0, 2 * sizeof(unsigned long long));
+    cudaMemset(pufferl->adv_hist, 0, ADV_BINS * sizeof(unsigned int));
 
     muon_init(&pufferl->muon, &primary->params_alloc, hypers.momentum, acts);
 
@@ -3062,7 +3231,8 @@ static double dash_num(Dict* log, const char* key, double fallback) {
     return it ? it->value : fallback;
 }
 
-// Last finished episode. A log with only env/n leaves these in place.
+// Last finished episode. A log with only env/n leaves these in place,
+// so the score rows stay on the terminal between episode ends.
 #define DASH_ENV_KEEP (2 * PUF_DASH_MAX_USER_ROWS)
 static char dash_env_key[DASH_ENV_KEEP][32];
 static double dash_env_val[DASH_ENV_KEEP];
@@ -4315,6 +4485,15 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     long local_timesteps = total_timesteps / ctx->world_size;
     long train_epochs = local_timesteps / batch_size;
     long checkpoint_interval = puf_ini_get(ini, "base", "checkpoint_interval");
+    // About 64 advantage histograms across the run, at least one rollout apart.
+    pufferl->adv_snap_cap = 65;
+    pufferl->adv_every = (int)((train_epochs + 63) / 64);
+    if (pufferl->adv_every < 1) {
+        pufferl->adv_every = 1;
+    }
+    pufferl->adv_snaps = (AdvSnap*)calloc(
+        pufferl->adv_snap_cap, sizeof(AdvSnap));
+    pufferl->adv_snap_n = 0;
     char target_key[128];
     sweep_metric_key(ini, target_key, sizeof(target_key));
     Dict last_log = {0};
@@ -4422,6 +4601,19 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         }
         cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
 
+        double mom[3];
+        unsigned long long adv_n = 0;
+        double adv_abs = 0;
+        double adv_var = 0;
+        cudaMemcpy(mom, pufferl->adv_mom, sizeof(mom), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&adv_n, pufferl->adv_count, sizeof(adv_n),
+            cudaMemcpyDeviceToHost);
+        cudaMemset(pufferl->adv_mom, 0, sizeof(mom));
+        cudaMemset(pufferl->adv_count, 0, sizeof(adv_n));
+        adv_reduce(mom[0], mom[1], mom[2], adv_n, &adv_abs, &adv_var);
+        dict_set(&new_log, "adv/mean_abs", adv_abs);
+        dict_set(&new_log, "adv/var", adv_var);
+
         log_util(pufferl, &new_log);
 
         float train_total = 0;
@@ -4462,6 +4654,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         }
         dict_clear(&new_log);
     }
+    adv_snap(pufferl);
 
     // TrainResult curve: bin-mean over log_history (same as artifact metrics).
     DictItem* target = dict_find(&last_log, target_key);
@@ -4622,9 +4815,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             Dict* key_src = &log_history.items[log_history.size - 1];
             for (int k = 0; k < key_src->size; k++) {
                 const char* key = key_src->items[k].key;
-                if (!puf_log_metric(key)) {
-                    continue;
-                }
                 log_history_bin_mean(&log_history, key, metric_points, out);
                 fprintf(fp, "%s = ", key);
                 for (int i = 0; i < metric_points; i++) {
@@ -4633,6 +4823,33 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
                 fputc('\n', fp);
             }
             free(out);
+        }
+        if (pufferl->adv_snap_n > 0) {
+            int nsnap = pufferl->adv_snap_n;
+            fprintf(fp, "\n[advantage]\n");
+            fprintf(fp, "lo = %g\nhi = %g\nbins = %d\n",
+                ADV_LO, ADV_HI, ADV_BINS);
+            fprintf(fp, "step = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "", pufferl->adv_snaps[i].step);
+            }
+            fprintf(fp, "\nmean_abs = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->adv_snaps[i].mean_abs);
+            }
+            fprintf(fp, "\nvar = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "", pufferl->adv_snaps[i].var);
+            }
+            for (int b = 0; b < ADV_BINS; b++) {
+                fprintf(fp, "\nbin_%d = ", b);
+                for (int i = 0; i < nsnap; i++) {
+                    fprintf(fp, "%s%u", i ? "," : "",
+                        pufferl->adv_snaps[i].bin[b]);
+                }
+            }
+            fputc('\n', fp);
         }
         fclose(fp);
     }
