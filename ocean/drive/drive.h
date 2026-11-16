@@ -320,6 +320,9 @@ struct Env {
     float reward_speed;
     unsigned int rng;
     int agent_initialization;
+    // Move logged actors directly through their recorded states. Policy
+    // actions, collision responses, goal rewards, and respawns are bypassed.
+    int replay_logged_agents;
     // 1 after ./drive loads a checkpoint that matches this network.
     int checkpoint_ok;
     char checkpoint_error[256];
@@ -745,6 +748,38 @@ void move_expert(Drive* env, float* actions, int agent_idx) {
     agent->heading = agent->traj_heading[t];
     agent->heading_x = cosf(agent->heading);
     agent->heading_y = sinf(agent->heading);
+}
+
+// Exact logged-state playback. move_expert is intentionally left unchanged
+// because its zero-velocity/static behavior is part of the normal simulator.
+static void replay_logged_actor(Drive* env, int actor_idx) {
+    Entity* actor = &env->entities[actor_idx];
+    int t = env->timestep;
+    if (t < 0 || t >= actor->array_size || actor->traj_valid[t] == 0) {
+        actor->x = INVALID_POSITION;
+        actor->y = INVALID_POSITION;
+        actor->vx = 0.0f;
+        actor->vy = 0.0f;
+        actor->vz = 0.0f;
+        actor->valid = 0;
+        actor->collision_state = NO_COLLISION;
+        return;
+    }
+    move_expert(env, NULL, actor_idx);
+    actor->vx = actor->traj_vx[t];
+    actor->vy = actor->traj_vy[t];
+    actor->vz = actor->traj_vz[t];
+    actor->valid = 1;
+    actor->collision_state = NO_COLLISION;
+}
+
+static void replay_logged_actors(Drive* env) {
+    for (int i = 0; i < env->num_objects; i++) {
+        int type = env->entities[i].type;
+        if (type == VEHICLE || type == PEDESTRIAN || type == CYCLIST) {
+            replay_logged_actor(env, i);
+        }
+    }
 }
 
 // Collision Detection
@@ -1906,8 +1941,9 @@ static void drive_load_world(Drive* env) {
     cache_neighbor_offsets(env);
     set_active_agents(env);
     // Logged agents are replayed once so a partner that overlaps the log can be
-    // dropped. Structured vehicles have no future trajectory to replay.
-    if (env->agent_initialization != AGENT_INIT_STRUCTURED) {
+    // dropped. Exact replay preserves the source data instead.
+    if (env->agent_initialization != AGENT_INIT_STRUCTURED
+            && !env->replay_logged_agents) {
         remove_bad_trajectories(env);
     }
     set_start_position(env);
@@ -1933,6 +1969,7 @@ static void drive_load_world(Drive* env) {
 void init(Drive* env) {
     env->timestep = 0;
     env->episode_length = TRAJECTORY_LENGTH;
+    env->replay_logged_agents = 0;
     if (env->cfg) {
         DictItem* item = dict_find(env->cfg, "episode_length");
         if (item) {
@@ -1942,8 +1979,25 @@ void init(Drive* env) {
             }
             env->episode_length = (int)item->value;
         }
+        item = dict_find(env->cfg, "replay_logged_agents");
+        if (item) {
+            env->replay_logged_agents = item->value != 0.0f;
+        }
+    }
+    if (env->replay_logged_agents
+            && env->agent_initialization != AGENT_INIT_LOGS) {
+        fprintf(stderr,
+            "env.replay_logged_agents requires env.agent_initialization=0\n");
+        exit(1);
     }
     drive_load_world(env);
+    if (env->replay_logged_agents && env->active_agent_count > 0) {
+        Entity* ego = &env->entities[env->active_agent_indices[0]];
+        // A replay dataset defines its own duration. A 91-state binary still
+        // loops after 91 steps; a full-length binary uses every stored state.
+        env->episode_length = ego->array_size;
+        replay_logged_actors(env);
+    }
 }
 
 void puf_close(Drive* env) {
@@ -2124,6 +2178,9 @@ void puf_reset(Drive* env) {
 
         collision_check(env, agent_idx);
     }
+    if (env->replay_logged_agents) {
+        replay_logged_actors(env);
+    }
     compute_observations(env);
     flow_diagram_clear(env);
     flow_diagram_record(env);
@@ -2250,9 +2307,21 @@ void puf_step(Drive* env) {
     env->timestep++;
 
     // Infinite keeps driving past the configured length. Headless stays finite.
-    if (!env->sim_infinite && env->timestep == env->episode_length) {
+    if ((!env->sim_infinite || env->replay_logged_agents)
+            && env->timestep == env->episode_length) {
         add_log(env);
         puf_reset(env);
+        return;
+    }
+
+    if (env->replay_logged_agents) {
+        replay_logged_actors(env);
+        for (int i = 0; i < env->active_agent_count; i++) {
+            env->logs[i].score = 0.0f;
+            env->logs[i].episode_length += 1;
+        }
+        compute_observations(env);
+        flow_diagram_record(env);
         return;
     }
 
@@ -3475,11 +3544,13 @@ static void drive_record_camera(Drive* env, Client* client) {
     Entity* agent = &env->entities[env->active_agent_indices[slot]];
     float hx = cosf(agent->heading);
     float hy = sinf(agent->heading);
-    const float back = 12.0f;
-    const float height = 7.0f;
-    const float ahead = 6.0f;
+    // Keep enough roadway and neighboring traffic in frame for trajectory
+    // review. This is intentionally wider and higher than a driving camera.
+    const float back = 35.0f;
+    const float height = 25.0f;
+    const float ahead = 15.0f;
     client->camera.up = (Vector3){0.0f, 0.0f, 1.0f};
-    client->camera.fovy = 30.0f;
+    client->camera.fovy = 50.0f;
     client->camera.position = (Vector3){
         agent->x - back * hx,
         agent->y - back * hy,
@@ -4143,7 +4214,15 @@ void puf_render(Drive* env) {
                 }
             }
 
-            if (!is_active_agent && !is_static_agent) {
+            int is_replay_actor = env->replay_logged_agents
+                && i < env->num_objects
+                && (env->entities[i].type == VEHICLE
+                    || env->entities[i].type == PEDESTRIAN
+                    || env->entities[i].type == CYCLIST);
+            if (!is_active_agent && !is_static_agent && !is_replay_actor) {
+                continue;
+            }
+            if (env->replay_logged_agents && env->entities[i].valid == 0) {
                 continue;
             }
 
@@ -4305,33 +4384,6 @@ void puf_render(Drive* env) {
         puf_record_capture((int)client->width, (int)client->height);
     }
     puf_web_vsync();
-    // TEMP diag: first frames of the focused car. Removed after the check.
-    if (!puf_record_enabled() && env->active_agent_count > 0) {
-        static int diag_frame = 0;
-        int slot = env->human_agent_idx;
-        if (slot < 0 || slot >= env->active_agent_count) slot = 0;
-        int idx = env->active_agent_indices[slot];
-        Entity* e = &env->entities[idx];
-        float lon = e->vx * e->heading_x + e->vy * e->heading_y;
-        float lat = -e->vx * e->heading_y + e->vy * e->heading_x;
-        float gx = e->goal_position_x - e->x;
-        float gy = e->goal_position_y - e->y;
-        float gf = gx * e->heading_x + gy * e->heading_y;
-        float gl = -gx * e->heading_y + gy * e->heading_x;
-        if (diag_frame < 8 || diag_frame == 20 || diag_frame == 40) {
-            fprintf(stderr,
-                "DIAG f=%d t=%d slot=%d spd=%.2f lon=%.2f lat=%.2f "
-                "gf=%.1f gl=%.1f hdg=%.3f vx=%.2f vy=%.2f\n",
-                diag_frame, env->timestep, slot,
-                sqrtf(e->vx * e->vx + e->vy * e->vy), lon, lat,
-                gf, gl, e->heading, e->vx, e->vy);
-            TakeScreenshot(TextFormat("/tmp/obs_frame_%d.png", diag_frame));
-        }
-        diag_frame++;
-        if (diag_frame > 45) {
-            exit(0);
-        }
-    }
 }
 
 void close_client(Client* client) {
@@ -4563,4 +4615,3 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "completion_rate", log->completion_rate);
     dict_set(out, "clean_collision_rate", log->clean_collision_rate);
 }
-

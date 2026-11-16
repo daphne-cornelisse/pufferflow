@@ -138,6 +138,14 @@ def save_map_binary(map_data, output_file, unique_map_id):
 
         # Write objects
         for obj in map_data.get("objects", []):
+            trajectory_length = max(
+                len(obj.get("position", [])),
+                len(obj.get("velocity", [])),
+                len(obj.get("heading", [])),
+                len(obj.get("valid", [])),
+            )
+            if trajectory_length == 0:
+                trajectory_length = TRAJECTORY_LENGTH
             obj_type = obj.get("type", 1)
             if obj_type == "vehicle":
                 obj_type = 1
@@ -146,11 +154,11 @@ def save_map_binary(map_data, output_file, unique_map_id):
             elif obj_type == "cyclist":
                 obj_type = 3
             f.write(struct.pack("i", obj_type))
-            f.write(struct.pack("i", TRAJECTORY_LENGTH))
+            f.write(struct.pack("i", trajectory_length))
 
             positions = obj.get("position", [])
             for coord in ["x", "y", "z"]:
-                for i in range(TRAJECTORY_LENGTH):
+                for i in range(trajectory_length):
                     pos = (
                         positions[i]
                         if i < len(positions)
@@ -160,7 +168,7 @@ def save_map_binary(map_data, output_file, unique_map_id):
 
             velocities = obj.get("velocity", [])
             for coord in ["x", "y", "z"]:
-                for i in range(TRAJECTORY_LENGTH):
+                for i in range(trajectory_length):
                     vel = (
                         velocities[i]
                         if i < len(velocities)
@@ -171,10 +179,10 @@ def save_map_binary(map_data, output_file, unique_map_id):
             headings = obj.get("heading", [])
             f.write(
                 struct.pack(
-                    f"{TRAJECTORY_LENGTH}f",
+                    f"{trajectory_length}f",
                     *[
                         float(headings[i]) if i < len(headings) else 0.0
-                        for i in range(TRAJECTORY_LENGTH)
+                        for i in range(trajectory_length)
                     ],
                 )
             )
@@ -182,10 +190,10 @@ def save_map_binary(map_data, output_file, unique_map_id):
             valids = obj.get("valid", [])
             f.write(
                 struct.pack(
-                    f"{TRAJECTORY_LENGTH}i",
+                    f"{trajectory_length}i",
                     *[
                         int(valids[i]) if i < len(valids) else 0
-                        for i in range(TRAJECTORY_LENGTH)
+                        for i in range(trajectory_length)
                     ],
                 )
             )
