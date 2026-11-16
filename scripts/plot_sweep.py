@@ -126,6 +126,7 @@ TOWN_FIELDS = (
     ("score_town_02", "Town02"),
     ("score_town_06", "Town06"),
     ("score_town_10", "Town10HD"),
+    ("score_bottleneck", "Bottleneck"),
 )
 
 

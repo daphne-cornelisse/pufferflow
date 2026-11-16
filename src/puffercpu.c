@@ -580,7 +580,10 @@ typedef struct PufferNet {
 #define DRIVE_ROAD_IN (DRIVE_ROAD_CONT + DRIVE_ROAD_CLASSES)
 
 #define DRIVE_ATTN_Q 4
-#define DRIVE_ATTN_HEADS 4
+
+static int drive_attn_heads(int H) {
+    return H >= 128 ? 4 : 2;
+}
 
 struct DriveEnc {
     int hidden;
@@ -591,8 +594,8 @@ struct DriveEnc {
     float* part_w2; float* part_b2;
     float* road_w1; float* road_b1; float* road_g; float* road_be;
     float* road_w2; float* road_b2;
-    float* q_lat; float* wq; float* bq; float* wk; float* bk;
-    float* wv; float* bv; float* wo; float* bo;
+    float* q_lat; float* wq; float* bq;
+    float* wo; float* bo;
     float* attn_g; float* attn_be; float* fc_w; float* fc_b;
     float* qproj;
     float* scratch;
@@ -619,10 +622,6 @@ static int drive_encoder_nfloats(int H) {
     n = drive_tower_nfloats(n, H, PARTNER_FEATURES);
     n = drive_tower_nfloats(n, H, DRIVE_ROAD_IN);
     n = drive_align8(n + Q * H);
-    n = drive_align8(n + H * H);
-    n = drive_align8(n + H);
-    n = drive_align8(n + H * H);
-    n = drive_align8(n + H);
     n = drive_align8(n + H * H);
     n = drive_align8(n + H);
     n = drive_align8(n + H * H);
@@ -665,10 +664,6 @@ static DriveEnc* drive_enc_load(Weights* w, int batch, int H) {
     d->q_lat = drive_take(w, DRIVE_ATTN_Q * H);
     d->wq = drive_take(w, H * H);
     d->bq = drive_take(w, H);
-    d->wk = drive_take(w, H * H);
-    d->bk = drive_take(w, H);
-    d->wv = drive_take(w, H * H);
-    d->bv = drive_take(w, H);
     d->wo = drive_take(w, H * H);
     d->bo = drive_take(w, H);
     d->attn_g = drive_take(w, H);
@@ -677,7 +672,7 @@ static DriveEnc* drive_enc_load(Weights* w, int batch, int H) {
     d->fc_b = drive_take(w, H);
     d->qproj = calloc((size_t)DRIVE_ATTN_Q * H, sizeof(float));
     int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
-    int stride = (3 + 2 * S + 2 * DRIVE_ATTN_Q) * H + S;
+    int stride = (3 + S + 2 * DRIVE_ATTN_Q) * H + S;
     d->scratch = calloc((size_t)batch * (size_t)stride, sizeof(float));
     return d;
 }
@@ -706,7 +701,9 @@ static void drive_token(float* h2, const float* x, int F,
     var /= (float)H;
     float inv = 1.0f / sqrtf(var + 1.0e-5f);
     for (int i = 0; i < H; i++) {
-        ln[i] = (h1[i] - mean) * inv * g[i] + be[i];
+        float v = (h1[i] - mean) * inv * g[i] + be[i];
+        float sig = 1.0f / (1.0f + expf(-v));
+        ln[i] = v * sig;
     }
     for (int o = 0; o < H; o++) {
         const float* wr = w2 + (size_t)o * H;
@@ -750,21 +747,25 @@ static void drive_ln_vec(float* y, const float* x, const float* g,
     }
 }
 
-// One token into K[s], V[s]. Padding is a real key, same as the CUDA path.
-static void drive_kv_token(DriveEnc* d, float* K, float* V, int s,
+// MLP output is both the key and the value. Padding stays in the
+// sequence; the score loop masks an all-zero slot.
+static void drive_put_token(DriveEnc* d, float* tok, int s,
         const float* x, int F, const float* w1, const float* b1,
         const float* g, const float* be, const float* w2, const float* b2,
         float* h1, float* ln, float* h2) {
     int H = d->hidden;
+    int i;
     drive_token(h2, x, F, w1, b1, g, be, w2, b2, h1, ln, H);
-    drive_project(K + (size_t)s * H, h2, d->wk, d->bk, H, H);
-    drive_project(V + (size_t)s * H, h2, d->wv, d->bv, H, H);
+    for (i = 0; i < H; i++) {
+        tok[(size_t)s * H + i] = h2[i];
+    }
 }
 
-static void drive_kv_slots(DriveEnc* d, float* K, float* V, int* s,
+static void drive_put_slots(DriveEnc* d, float* tok, int* s,
         const float* row, int off, int slots, int raw, int one_hot,
         const float* w1, const float* b1, const float* g, const float* be,
-        const float* w2, const float* b2, float* h1, float* ln, float* h2) {
+        const float* w2, const float* b2,
+        float* h1, float* ln, float* h2) {
     int n;
     for (n = 0; n < slots; n++) {
         const float* rawf = row + off + n * raw;
@@ -790,9 +791,34 @@ static void drive_kv_slots(DriveEnc* d, float* K, float* V, int* s,
             x = feat;
             F = DRIVE_ROAD_IN;
         }
-        drive_kv_token(d, K, V, *s, x, F, w1, b1, g, be, w2, b2, h1, ln, h2);
+        drive_put_token(d, tok, *s, x, F, w1, b1, g, be, w2, b2,
+            h1, ln, h2);
         *s += 1;
     }
+}
+
+static int drive_slot_live(const float* row, int s) {
+    const float* f;
+    int nfeat;
+    int k;
+    if (s == 0) {
+        return 1;
+    }
+    if (s <= MAX_ROAD_SEGMENT_OBSERVATIONS) {
+        f = row + EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS
+            + (s - 1) * ROAD_FEATURES;
+        nfeat = ROAD_FEATURES;
+    } else {
+        int slot = s - 1 - MAX_ROAD_SEGMENT_OBSERVATIONS;
+        f = row + EGO_FEATURES + slot * PARTNER_FEATURES;
+        nfeat = PARTNER_FEATURES;
+    }
+    for (k = 0; k < nfeat; k++) {
+        if (f[k] != 0.0f) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // One car. y is the encoder output (H). sc is that car's scratch row.
@@ -803,34 +829,33 @@ static void drive_encode_row(DriveEnc* d, const float* row, float* y, float* sc)
     int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
     int part_off = EGO_FEATURES;
     int road_off = EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS;
-    int head_dim = H / DRIVE_ATTN_HEADS;
+    int head_dim = H / drive_attn_heads(H);
     float scale = 1.0f / sqrtf((float)head_dim);
     float* h1 = sc;
     float* ln = sc + H;
     float* h2 = sc + 2 * H;
-    float* K = sc + 3 * H;
-    float* V = K + (size_t)S * H;
-    float* ctx = V + (size_t)S * H;
+    float* tok = sc + 3 * H;
+    float* ctx = tok + (size_t)S * H;
     float* pre = ctx + (size_t)Q * H;
     float* scores = pre + (size_t)Q * H;
     int s = 0;
     int h;
     int head;
-    drive_kv_slots(d, K, V, &s, row, 0, 1, EGO_FEATURES, 0,
+    drive_put_slots(d, tok, &s, row, 0, 1, EGO_FEATURES, 0,
         d->ego_w1, d->ego_b1, d->ego_g, d->ego_be,
         d->ego_w2, d->ego_b2, h1, ln, h2);
-    drive_kv_slots(d, K, V, &s, row, road_off,
+    drive_put_slots(d, tok, &s, row, road_off,
         MAX_ROAD_SEGMENT_OBSERVATIONS, ROAD_FEATURES, 1,
         d->road_w1, d->road_b1, d->road_g, d->road_be,
         d->road_w2, d->road_b2, h1, ln, h2);
-    drive_kv_slots(d, K, V, &s, row, part_off, MAX_AGENTS,
+    drive_put_slots(d, tok, &s, row, part_off, MAX_AGENTS,
         PARTNER_FEATURES, 0,
         d->part_w1, d->part_b1, d->part_g, d->part_be,
         d->part_w2, d->part_b2, h1, ln, h2);
     for (h = 0; h < Q * H; h++) {
         ctx[h] = 0.0f;
     }
-    for (head = 0; head < DRIVE_ATTN_HEADS; head++) {
+    for (head = 0; head < drive_attn_heads(H); head++) {
         int h0 = head * head_dim;
         for (int q = 0; q < Q; q++) {
             float m;
@@ -840,9 +865,12 @@ static void drive_encode_row(DriveEnc* d, const float* row, float* y, float* sc)
             for (t = 0; t < S; t++) {
                 float dot = 0.0f;
                 for (i = 0; i < head_dim; i++) {
-                    dot += d->qproj[q * H + h0 + i] * K[t * H + h0 + i];
+                    dot += d->qproj[q * H + h0 + i] * tok[t * H + h0 + i];
                 }
                 scores[t] = dot * scale;
+                if (!drive_slot_live(row, t)) {
+                    scores[t] = -1.0e30f;
+                }
             }
             m = scores[0];
             for (t = 1; t < S; t++) {
@@ -860,7 +888,7 @@ static void drive_encode_row(DriveEnc* d, const float* row, float* y, float* sc)
             for (i = 0; i < head_dim; i++) {
                 float acc = 0.0f;
                 for (t = 0; t < S; t++) {
-                    acc += scores[t] * V[t * H + h0 + i];
+                    acc += scores[t] * tok[t * H + h0 + i];
                 }
                 ctx[q * H + h0 + i] = acc;
             }
@@ -887,7 +915,7 @@ static void drive_encode(PufferNet* net, float* obs) {
     int H = d->hidden;
     int Q = DRIVE_ATTN_Q;
     int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
-    int stride = (3 + 2 * S + 2 * Q) * H + S;
+    int stride = (3 + S + 2 * Q) * H + S;
     int q;
     for (q = 0; q < Q; q++) {
         drive_project(d->qproj + (size_t)q * H, d->q_lat + (size_t)q * H,
@@ -981,7 +1009,7 @@ static float puffernet_value(PufferNet* net, const float* obs, int agent) {
     int H = d->hidden;
     int Q = DRIVE_ATTN_Q;
     int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
-    int stride = (3 + 2 * S + 2 * Q) * H + S;
+    int stride = (3 + S + 2 * Q) * H + S;
     static float* scratch = NULL;
     static int scratch_n = 0;
     static float* hid = NULL;

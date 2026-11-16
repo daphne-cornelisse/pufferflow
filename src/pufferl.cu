@@ -355,6 +355,7 @@ struct RolloutBuf {
     Prec rewards;
     Prec terminals;
     Prec action_mask;   // (horizon, agents, mask_size)
+    Int episode_step;   // same layout as rewards: time-major, then (agents, time)
 };
 
 // Buffers are initialized as raw structs with only shape information.
@@ -370,6 +371,7 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
     bufs->rewards      = {.shape = {T, B}};
     bufs->terminals    = {.shape = {T, B}};
     bufs->action_mask  = {.shape = {T, B, mask_size}};
+    bufs->episode_step = {.shape = {T, B}};
     Prec* prec_fields[] = {
         &bufs->observations, &bufs->values, &bufs->logprobs,
         &bufs->rewards, &bufs->terminals, &bufs->action_mask,
@@ -378,6 +380,7 @@ void register_rollout_buffers(RolloutBuf* bufs, Allocator* alloc,
         alloc_register(alloc, prec_fields[i]);
     }
     alloc_register(alloc, &bufs->actions);
+    alloc_register(alloc, &bufs->episode_step);
 }
 
 // Rank-2 or rank-3 time-major tensor. F==0 means rank-2 (zero-terminated shape);
@@ -402,6 +405,14 @@ Float puf_time_view(Float p, int start_t, int T) {
     };
 }
 
+Int puf_time_view(Int p, int start_t, int T) {
+    long B = p.shape[1];
+    return {
+        .data = p.data + (long)start_t * B,
+        .shape = {T, B},
+    };
+}
+
 RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
     RolloutBuf view = *base;
     view.observations = puf_time_view(base->observations, start_t, T);
@@ -411,6 +422,7 @@ RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
     view.rewards      = puf_time_view(base->rewards,      start_t, T);
     view.terminals    = puf_time_view(base->terminals,    start_t, T);
     view.action_mask  = puf_time_view(base->action_mask,  start_t, T);
+    view.episode_step = puf_time_view(base->episode_step, start_t, T);
     return view;
 }
 
@@ -428,10 +440,14 @@ struct VecEnv {
     // CPU pins / workers (unused on GPU)
     int* env_starts;
     int* env_counts;
+    // Host scratch for the advantage curriculum. Sized once at setup.
+    float* curr_xi;
+    int* curr_order;
     obs_t* observations;
     float* actions;
     float* rewards;
     float* terminals;
+    int* episode_step;
     unsigned char* action_mask;
     int* worker_state;
     int shutdown;
@@ -447,6 +463,7 @@ struct EnvBuf {
     Float actions;    // (total_agents, num_atns)
     Float rewards;    // (total_agents,)
     Float terminals;  // (total_agents,)
+    int* episode_step; // (total_agents,) clock of the obs in this buffer
     Byte action_mask; // (total_agents, mask_size); always allocated
 };
 
@@ -565,6 +582,13 @@ typedef struct {
 #define ADV_LO (-32.f)
 #define ADV_HI 32.f
 
+// Advantage diagnostics. Bins are 20 episode steps. 160 covers a 3200-step
+// horizon. Cadence is train.advantage_every, outside the graph.
+#define DIAG_SAMPLES 1024
+#define DIAG_EP_BIN 20
+#define DIAG_EP_BINS 160
+#define DIAG_SNAP_CAP 64
+
 typedef struct {
     double step;
     double mean_abs;
@@ -572,11 +596,125 @@ typedef struct {
     unsigned int bin[ADV_BINS];
 } AdvSnap;
 
+typedef struct {
+    double step;
+    double ep0_mean;
+    double ep_last_mean;
+    unsigned long long ep0_n;
+    unsigned long long ep_last_n;
+    int ep_last;
+    int nbins;
+    int grad_ready;
+    double pearson_shared;
+    double spearman_shared;
+    double pearson_actor;
+    double spearman_actor;
+    double pearson_critic;
+    double spearman_critic;
+    double mean_shared;
+    double mean_actor;
+    double mean_critic;
+    double clip_frac;
+    double explained_var;
+    double ratio_trunk;
+    double share_top;
+    double mean_abs[DIAG_EP_BINS];
+    double signed_mean[DIAG_EP_BINS];
+    float max_abs[DIAG_EP_BINS];
+    unsigned int count[DIAG_EP_BINS];
+} DiagSnap;
+
+// group: 0 shared encoder+trunk, 1 actor head, 2 critic head.
+#define DIAG_SPAN_CAP 64
+struct DiagSpan {
+    precision_t* data;
+    int n;
+    int group;
+};
+
+// Host scratch for one diagnostic. Device pointers are allocated at init.
+struct AdvDiag {
+    int episode_length;
+    unsigned rng;
+    int pending_grad;
+    int bins_ready;
+    int grad_ready;
+    double ep0_mean;
+    double ep_last_mean;
+    double pearson_shared;
+    double spearman_shared;
+    double pearson_actor;
+    double spearman_actor;
+    double pearson_critic;
+    double spearman_critic;
+    double mean_shared;
+    double mean_actor;
+    double mean_critic;
+    double clip_frac;
+    double ratio_trunk;
+    double share_top;
+    FILE* fp;
+    char path[1024];
+    double* ep_sum_abs;
+    double* ep_sum;
+    float* ep_max_abs;
+    unsigned long long* ep_count;
+    double* ep_edge_sum;
+    unsigned long long* ep_edge_n;
+    DiagSnap* snaps;
+    int snap_n;
+    int snap_cap;
+    Prec state;
+    float* losses;
+    int* rows_d;
+    int* picks_d;
+    float* abs_d;
+    float* shared_d;
+    float* actor_d;
+    float* critic_d;
+    float* sq_d;
+    float* clip_sum;
+    float* trunk_a;
+    float* trunk_c;
+    float* trunk_sq;
+    float* vgrad_saved;
+    int* trunk_off_d;
+    int trunk_n;
+    int output_dim;
+    int* clip_d;
+    Prec one_state;
+    Prec one_term;
+    Prec one_v;
+    Prec one_imp;
+    precision_t** scans_d;
+    DiagSpan* spans_d;
+    int nspan;
+    int nlayer;
+    int* order_h;
+    int* rows_h;
+    int* perm_h;
+    int* picks_h;
+    int* rank_h;
+    float* abs_h;
+    float* shared_h;
+    float* actor_h;
+    float* critic_h;
+    int* clip_h;
+    float* rank_a;
+    float* rank_b;
+    precision_t* sample_adv_h;
+    int* sample_step_h;
+    FILE* sample_fp;
+};
+
 typedef struct PuffeRL {
     Policy* policies;        // [num_policies]; policies[0] trainable, rest frozen
     int num_policies;
     Weights actor_weights; // async rollout snapshot of policies[0]; unused when async=0
     Activations train_activs;
+    Activations diag_acts;       // B=1, T=1; not in the train graph
+    Allocator diag_act_alloc;
+    Allocator diag_grad_alloc;   // not the muon grad buffer
     Allocator weight_alloc;      // async actor weights
     Allocator grads_alloc;
     Allocator activ_alloc;       // train + primary rollout (shared)
@@ -605,10 +743,18 @@ typedef struct PuffeRL {
     double* adv_mom;
     unsigned long long* adv_count;
     unsigned int* adv_hist;
+    // Per epoch: sum(A), sum(A^2), sum(G), sum(G^2), count.
+    // G is the lambda return, A is G - V. Cleared outside the graph.
+    double* ev_mom;
+    double explained_var;
+    Prec adv_saved;    // (agents, horizon) GAE copied out of each minibatch
+    precision_t* curr_adv_h; // host copy, allocated once
+    AdvDiag diag;
     AdvSnap* adv_snaps;
     int adv_snap_n;
     int adv_snap_cap;
     int adv_every;
+    int diag_every;
     FILE* adv_fp;
     char adv_path[1024];
     PPOBufs ppo_bufs; // Pre-allocated buffers for ppo_loss_fwd_bwd
@@ -882,6 +1028,11 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
     cast_rew_term<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
         rew_dst.data, env->rewards.data + start,
         term_dst.data, env->terminals.data + start, block_size);
+    cudaMemcpyAsync(
+        rollouts.episode_step.data + (long)t * rollouts.episode_step.shape[1]
+            + start,
+        env->episode_step + start,
+        block_size * sizeof(int), cudaMemcpyDeviceToDevice, stream);
 
     // Mask always allocated (env-written or synthetic all-ones). Continuous ignores it in sample.
     int mask_size = rollouts.action_mask.shape[2];
@@ -1118,6 +1269,14 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     vec->envs = envs;
 #endif
     vec->size = num_envs;
+    {
+        for (int i = 0; i < num_envs; i++) {
+            vec->envs[i].curr_standard = 1;
+        }
+        vec->curr_xi = (float*)calloc((size_t)num_envs, sizeof(float));
+        vec->curr_order = (int*)calloc((size_t)num_envs, sizeof(int));
+        assert(vec->curr_xi && vec->curr_order);
+    }
 
     size_t obs_bytes = total_agents * OBS_SIZE * sizeof(obs_t);
     size_t mask_bytes = total_agents * vec->mask_size * sizeof(unsigned char);
@@ -1128,6 +1287,9 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
         cudaHostAllocPortable);
     cudaHostAlloc((void**)&vec->terminals, total_agents * sizeof(float),
         cudaHostAllocPortable);
+    cudaHostAlloc((void**)&vec->episode_step, total_agents * sizeof(int),
+        cudaHostAllocPortable);
+    memset(vec->episode_step, 0, total_agents * sizeof(int));
     cudaHostAlloc((void**)&vec->action_mask, mask_bytes, cudaHostAllocPortable);
     memset(vec->action_mask, 1, mask_bytes);
 
@@ -1174,11 +1336,13 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
                     tag = policy;
                 }
                 int phys = cursors[policy]++;
+                eptr->slot_of[s] = phys;
                 Agent* a = &eptr->agents[s];
                 a->observations = vec->observations + (size_t)phys * OBS_SIZE;
                 a->actions = vec->actions + (size_t)phys * NUM_ATNS;
                 a->rewards = vec->rewards + phys;
                 a->terminals = vec->terminals + phys;
+                a->episode_step = vec->episode_step + phys;
                 a->action_mask = vec->action_mask + (size_t)phys * vec->mask_size;
             }
             eptr->tag = tag;
@@ -1200,6 +1364,8 @@ static void cpu_upload(PuffeRL* p, int start, int n, cudaStream_t stream) {
         n * sizeof(float), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(e->terminals.data + start, v->terminals + start,
         n * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(e->episode_step + start, v->episode_step + start,
+        n * sizeof(int), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(e->action_mask.data + (size_t)start * mask,
         v->action_mask + (size_t)start * mask,
         n * mask * sizeof(unsigned char), cudaMemcpyHostToDevice, stream);
@@ -1464,13 +1630,13 @@ static void env_close(VecEnv* vec) {
 
 void vec_log(VecEnv* vec, Dict* out, int clear) {
     // Mean score of finished episodes on each town, before the sum clears logs.
-    float town_score[4] = {0};
-    float town_n[4] = {0};
-    int town_seen[4] = {0};
+    float town_score[DRIVE_SCORE_MAPS] = {0};
+    float town_n[DRIVE_SCORE_MAPS] = {0};
+    int town_seen[DRIVE_SCORE_MAPS] = {0};
     if (PUF_BACKEND != PUF_GPU) {
         for (int i = 0; i < vec->size; i++) {
             int id = vec->envs[i].map_id;
-            if (id < 0 || id > 3 || !drive_score_town_key(id)) {
+            if (id < 0 || id >= DRIVE_SCORE_MAPS || !drive_score_town_key(id)) {
                 continue;
             }
             town_seen[id] = 1;
@@ -1489,7 +1655,7 @@ void vec_log(VecEnv* vec, Dict* out, int clear) {
             acc[j] /= n;
         }
         puf_log(&aggregate, &env_out);
-        for (int id = 0; id < 4; id++) {
+        for (int id = 0; id < DRIVE_SCORE_MAPS; id++) {
             if (!town_seen[id]) {
                 continue;
             }
@@ -1501,6 +1667,59 @@ void vec_log(VecEnv* vec, Dict* out, int clear) {
         }
     }
     dict_set(&env_out, "n", n);
+    if (PUF_BACKEND != PUF_GPU && vec->envs) {
+        float sr = 0, sc = 0, sl = 0, ss = 0, sn = 0, sa = 0, sen = 0;
+        float hr = 0, hc = 0, hl = 0, hs = 0, hn = 0, ha = 0, hen = 0;
+        for (int i = 0; i < vec->size; i++) {
+            Env* env = &vec->envs[i];
+            if (env->curr_standard) {
+                sr += env->grp_return;
+                sc += env->grp_coll;
+                sl += env->grp_len;
+                ss += env->grp_score;
+                sn += env->grp_n;
+                sa += env->curr_abs;
+                sen += 1.0f;
+            } else {
+                hr += env->grp_return;
+                hc += env->grp_coll;
+                hl += env->grp_len;
+                hs += env->grp_score;
+                hn += env->grp_n;
+                ha += env->curr_abs;
+                hen += 1.0f;
+            }
+            if (clear) {
+                env->grp_return = 0.0f;
+                env->grp_coll = 0.0f;
+                env->grp_len = 0.0f;
+                env->grp_score = 0.0f;
+                env->grp_n = 0.0f;
+            }
+        }
+        dict_set(&env_out, "standard_mean_reward", sn > 0.0f ? sr / sn : 0.0);
+        dict_set(&env_out, "standard_collision_rate",
+            sn > 0.0f ? sc / sn : 0.0);
+        dict_set(&env_out, "standard_episode_length",
+            sn > 0.0f ? sl / sn : 0.0);
+        dict_set(&env_out, "standard_score", sn > 0.0f ? ss / sn : 0.0);
+        dict_set(&env_out, "standard_mean_abs_adv",
+            sen > 0.0f ? sa / sen : 0.0);
+        dict_set(&env_out, "hard_mean_reward", hn > 0.0f ? hr / hn : 0.0);
+        dict_set(&env_out, "hard_collision_rate",
+            hn > 0.0f ? hc / hn : 0.0);
+        dict_set(&env_out, "hard_episode_length",
+            hn > 0.0f ? hl / hn : 0.0);
+        dict_set(&env_out, "hard_score", hn > 0.0f ? hs / hn : 0.0);
+        dict_set(&env_out, "hard_mean_abs_adv",
+            hen > 0.0f ? ha / hen : 0.0);
+        // Share of copies. Easy means the standard ini settings.
+        float copies = sen + hen;
+        dict_set(&env_out, "easy_frac",
+            copies > 0.0f ? sen / copies : 0.0);
+        dict_set(&env_out, "hard_frac",
+            copies > 0.0f ? hen / copies : 0.0);
+    }
     for (int i = 0; i < env_out.size; i++) {
         char key[256];
         snprintf(key, sizeof(key), "env/%s", env_out.items[i].key);
@@ -1702,9 +1921,10 @@ static void anchor_open_stream(Anchor* a) {
 // Last horizon index is left 0 by puff_advantage. Skip it so the
 // histogram is not a spike at zero. Bin 0 and the last bin are overflow.
 // Moments are stored twice: [0, 3) is the log window, [3, 6) is the snapshot.
-__global__ void adv_stats(const precision_t* adv, int n, int horizon,
-        double* mom, unsigned long long* count, unsigned int* hist) {
-    __shared__ double red[3][BLOCK_SIZE];
+__global__ void adv_stats(const precision_t* adv, const precision_t* ret,
+        int n, int horizon, double* mom, unsigned long long* count,
+        unsigned int* hist, double* ev) {
+    __shared__ double red[5][BLOCK_SIZE];
     __shared__ int rn[BLOCK_SIZE];
     __shared__ unsigned int local[ADV_BINS];
     int tid = threadIdx.x;
@@ -1716,15 +1936,20 @@ __global__ void adv_stats(const precision_t* adv, int n, int horizon,
     double ls = 0;
     double la = 0;
     double lq = 0;
+    double gs = 0;
+    double gq = 0;
     int ln = 0;
     int i = blockIdx.x * BLOCK_SIZE + tid;
     int live = i < n && (horizon <= 1 || (i % horizon) != horizon - 1);
     if (live) {
         float a = to_float(adv[i]);
+        float g = to_float(ret[i]);
         int bin = ADV_BINS - 1;
         ls = a;
         la = fabsf(a);
         lq = (double)a * (double)a;
+        gs = g;
+        gq = (double)g * (double)g;
         ln = 1;
         if (a < ADV_LO) {
             bin = 0;
@@ -1740,6 +1965,8 @@ __global__ void adv_stats(const precision_t* adv, int n, int horizon,
     red[0][tid] = ls;
     red[1][tid] = la;
     red[2][tid] = lq;
+    red[3][tid] = gs;
+    red[4][tid] = gq;
     rn[tid] = ln;
     __syncthreads();
     for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
@@ -1747,6 +1974,8 @@ __global__ void adv_stats(const precision_t* adv, int n, int horizon,
             red[0][tid] += red[0][tid + stride];
             red[1][tid] += red[1][tid + stride];
             red[2][tid] += red[2][tid + stride];
+            red[3][tid] += red[3][tid + stride];
+            red[4][tid] += red[4][tid + stride];
             rn[tid] += rn[tid + stride];
         }
         __syncthreads();
@@ -1760,11 +1989,41 @@ __global__ void adv_stats(const precision_t* adv, int n, int horizon,
         atomicAdd(mom + 5, red[2][0]);
         atomicAdd(count + 0, (unsigned long long)rn[0]);
         atomicAdd(count + 1, (unsigned long long)rn[0]);
+        if (ev) {
+            atomicAdd(ev + 0, red[0][0]);
+            atomicAdd(ev + 1, red[2][0]);
+            atomicAdd(ev + 2, red[3][0]);
+            atomicAdd(ev + 3, red[4][0]);
+            atomicAdd(ev + 4, (double)rn[0]);
+        }
     }
     __syncthreads();
     if (tid < ADV_BINS && local[tid]) {
         atomicAdd(hist + tid, local[tid]);
     }
+}
+
+// 1 - Var(G - V) / Var(G). Residual is the advantage. 0 if Var(G) is 0.
+static double explained_variance(const double* ev) {
+    double n = ev[4];
+    double var_a;
+    double var_g;
+    double mean_a;
+    double mean_g;
+    if (n < 1.0) {
+        return 0;
+    }
+    mean_a = ev[0] / n;
+    mean_g = ev[2] / n;
+    var_a = ev[1] / n - mean_a * mean_a;
+    var_g = ev[3] / n - mean_g * mean_g;
+    if (var_a < 0) {
+        var_a = 0;
+    }
+    if (var_g < 1e-12) {
+        return 0;
+    }
+    return 1.0 - var_a / var_g;
 }
 
 static void adv_reduce(double sum, double sum_abs, double sum_sq,
@@ -1842,6 +2101,961 @@ static void adv_snap(PuffeRL* p) {
     s->step = (double)steps;
     memcpy(s->bin, bins, sizeof(bins));
     adv_json_line(p, steps, "all", s->mean_abs, s->var, bins);
+}
+
+__device__ void diag_atomic_max(float* addr, float val) {
+    int* bits = (int*)addr;
+    int old = *bits;
+    int assumed;
+    do {
+        assumed = old;
+        if (__int_as_float(assumed) >= val) {
+            return;
+        }
+        old = atomicCAS(bits, assumed, __float_as_int(val));
+    } while (assumed != old);
+}
+
+// |adv| by episode step. Skip the last horizon index: puff_advantage
+// leaves it at 0. Bin width is DIAG_EP_BIN. Edges are the signed mean
+// at step 0 and at episode_length - 1.
+__global__ void diag_ep_bins(const precision_t* adv, const int* ep,
+        int n_agents, int horizon, int ep_len, int bin_w,
+        double* sum_abs, double* sum_signed, float* max_abs,
+        unsigned long long* count,
+        double* edge_sum, unsigned long long* edge_n) {
+    int n = n_agents * horizon;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    int t = idx % horizon;
+    if (horizon > 1 && t == horizon - 1) {
+        return;
+    }
+    float a = to_float(adv[idx]);
+    int step = ep[idx];
+    if (step < 0) {
+        step = 0;
+    }
+    int bin = step / bin_w;
+    if (bin >= DIAG_EP_BINS) {
+        bin = DIAG_EP_BINS - 1;
+    }
+    float mag = fabsf(a);
+    atomicAdd(sum_abs + bin, (double)mag);
+    atomicAdd(sum_signed + bin, (double)a);
+    atomicAdd(count + bin, 1ull);
+    diag_atomic_max(max_abs + bin, mag);
+    if (step == 0) {
+        atomicAdd(edge_sum + 0, (double)a);
+        atomicAdd(edge_n + 0, 1ull);
+    }
+    int last = ep_len - 1;
+    if (last < 0) {
+        last = 0;
+    }
+    if (step == last) {
+        atomicAdd(edge_sum + 1, (double)a);
+        atomicAdd(edge_n + 1, 1ull);
+    }
+}
+
+__global__ void transpose_int_102(int* dst, const int* src,
+        int A, int B, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = A * B * C;
+    if (idx >= total) {
+        return;
+    }
+    int a = idx / (B * C);
+    int rem = idx % (B * C);
+    int b = rem / C;
+    int c = rem % C;
+    dst[b * A * C + a * C + c] = src[idx];
+}
+
+__global__ void diag_gather_prec(precision_t* dst, const precision_t* src,
+        const int* rows, int R, int T, int B, int F) {
+    int n = R * T * F;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    int f = idx % F;
+    int tmp = idx / F;
+    int t = tmp % T;
+    int r = tmp / T;
+    int agent = rows[r];
+    dst[idx] = src[((long)t * B + agent) * F + f];
+}
+
+__global__ void diag_gather_f32(float* dst, const float* src,
+        const int* rows, int R, int T, int B, int F) {
+    int n = R * T * F;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    int f = idx % F;
+    int tmp = idx / F;
+    int t = tmp % T;
+    int r = tmp / T;
+    int agent = rows[r];
+    dst[idx] = src[((long)t * B + agent) * F + f];
+}
+
+__global__ void diag_gather_state(precision_t* dst, const precision_t* src,
+        const int* rows, int R, int A, int L, int H) {
+    int n = L * R * H;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    int h = idx % H;
+    int tmp = idx / H;
+    int r = tmp % R;
+    int layer = tmp / R;
+    dst[((long)layer * R + r) * H + h] =
+        src[((long)layer * A + rows[r]) * H + h];
+}
+
+__global__ void diag_zero_spans(const DiagSpan* spans, int nspan) {
+    int s = blockIdx.x;
+    if (s >= nspan) {
+        return;
+    }
+    precision_t* p = spans[s].data;
+    int n = spans[s].n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        p[i] = from_float(0.0f);
+    }
+}
+
+// One block per span. out3[group] is the sum of squares.
+__global__ void diag_group_sq(const DiagSpan* spans, int nspan,
+        float* out3) {
+    int s = blockIdx.x;
+    if (s >= nspan) {
+        return;
+    }
+    DiagSpan sp = spans[s];
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < sp.n; i += blockDim.x) {
+        float g = to_float(sp.data[i]);
+        local += g * g;
+    }
+    __shared__ float buf[BLOCK_SIZE];
+    buf[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            buf[threadIdx.x] += buf[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(out3 + sp.group, buf[0]);
+    }
+}
+
+// Add the shared-encoder span grads into a flat accumulator.
+__global__ void diag_accum_shared(const DiagSpan* spans, int nspan,
+        float* acc, const int* off) {
+    int s = blockIdx.x;
+    int o;
+    int n;
+    if (s >= nspan) {
+        return;
+    }
+    o = off[s];
+    if (o < 0) {
+        return;
+    }
+    n = spans[s].n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        acc[o + i] += to_float(spans[s].data[i]);
+    }
+}
+
+__global__ void diag_flat_sq(const float* acc, int n, float* out) {
+    __shared__ float buf[BLOCK_SIZE];
+    float local = 0.0f;
+    int tid = threadIdx.x;
+    for (int i = tid; i < n; i += BLOCK_SIZE) {
+        float g = acc[i];
+        local += g * g;
+    }
+    buf[tid] = local;
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            buf[tid] += buf[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        *out = buf[0];
+    }
+}
+
+// scan_h is (row, time, hidden). nt = row * horizon + time.
+__global__ void diag_load_state(precision_t* dst,
+        precision_t* const* scans, int nt, int hidden, int layers) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = layers * hidden;
+    if (idx >= n) {
+        return;
+    }
+    int layer = idx / hidden;
+    dst[idx] = scans[layer][(long)nt * hidden + (idx % hidden)];
+}
+
+__global__ void diag_store_norms(const float* sq, float* shared,
+        float* actor, float* critic, float* abs_out, int* clipped,
+        const precision_t* adv, const float* losses, int i) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    shared[i] = sqrtf(sq[0]);
+    actor[i] = sqrtf(sq[1]);
+    critic[i] = sqrtf(sq[2]);
+    abs_out[i] = fabsf(to_float(adv[0]));
+    clipped[i] = losses[LOSS_CLIPFRAC] >= 0.5f ? 1 : 0;
+}
+
+__global__ void diag_add_clip(float* sum, const float* losses) {
+    if (threadIdx.x == 0) {
+        *sum += losses[LOSS_CLIPFRAC];
+    }
+}
+
+static unsigned diag_rnd(unsigned* s) {
+    *s = *s * 1664525u + 1013904223u;
+    return *s;
+}
+
+static void diag_sort_idx(int* order, const float* v, int n) {
+    for (int i = 1; i < n; i++) {
+        int key = order[i];
+        float kv = v[key];
+        int j = i - 1;
+        while (j >= 0 && (v[order[j]] > kv
+                || (v[order[j]] == kv && order[j] > key))) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = key;
+    }
+}
+
+static void diag_ranks(const float* v, int n, int* order, float* rank) {
+    for (int i = 0; i < n; i++) {
+        order[i] = i;
+    }
+    diag_sort_idx(order, v, n);
+    int i = 0;
+    while (i < n) {
+        int j = i + 1;
+        while (j < n && v[order[j]] == v[order[i]]) {
+            j++;
+        }
+        float avg = 0.5f * (float)(i + (j - 1));
+        for (int k = i; k < j; k++) {
+            rank[order[k]] = avg;
+        }
+        i = j;
+    }
+}
+
+static double diag_pearson(const float* x, const float* y, int n) {
+    double sx = 0;
+    double sy = 0;
+    double sxx = 0;
+    double syy = 0;
+    double sxy = 0;
+    for (int i = 0; i < n; i++) {
+        double a = x[i];
+        double b = y[i];
+        sx += a;
+        sy += b;
+        sxx += a * a;
+        syy += b * b;
+        sxy += a * b;
+    }
+    double dn = (double)n;
+    double vx = dn * sxx - sx * sx;
+    double vy = dn * syy - sy * sy;
+    double cov = dn * sxy - sx * sy;
+    if (vx <= 0 || vy <= 0) {
+        return 0;
+    }
+    return cov / sqrt(vx * vy);
+}
+
+static double diag_spearman(AdvDiag* d, const float* x, const float* y,
+        int n) {
+    diag_ranks(x, n, d->rank_h, d->rank_a);
+    diag_ranks(y, n, d->rank_h, d->rank_b);
+    return diag_pearson(d->rank_a, d->rank_b, n);
+}
+
+// One cell of a packed (row, time, feat) tensor. feat <= 1 is rank 2.
+static Prec diag_step(Prec src, int nt, int feat) {
+    Prec v = src;
+    int f = feat > 1 ? feat : 1;
+    v.data = src.data + (long)nt * f;
+    v.shape[0] = 1;
+    v.shape[1] = 1;
+    v.shape[2] = feat > 1 ? feat : 0;
+    for (int i = 3; i < PUF_MAX_DIMS; i++) {
+        v.shape[i] = 0;
+    }
+    return v;
+}
+
+static Float diag_step_f(Float src, int nt, int feat) {
+    Float v = src;
+    int f = feat > 1 ? feat : 1;
+    v.data = src.data + (long)nt * f;
+    v.shape[0] = 1;
+    v.shape[1] = 1;
+    v.shape[2] = feat > 1 ? feat : 0;
+    for (int i = 3; i < PUF_MAX_DIMS; i++) {
+        v.shape[i] = 0;
+    }
+    return v;
+}
+
+// Per-cell CSVs are for one training run. Sweep ids start with sweep_
+// and keep the jsonl plus the ini series, which is what the panel reads.
+static int diag_dump_cells(const AdvDiag* d) {
+    const char* slash = strrchr(d->path, '/');
+    const char* name = slash ? slash + 1 : d->path;
+    return strncmp(name, "sweep_", 6) != 0;
+}
+
+// Final pass overwrites raw_grad_samples_final.csv. Every pass appends
+// raw_grad_samples.csv so the scatter can be colored by iteration.
+static void diag_write_raw(AdvDiag* d, int iteration, int n) {
+    char raw[1100];
+    const char* slash;
+    FILE* fp;
+    int dirlen;
+    long pos;
+    if (!d->path[0] || n < 1 || !diag_dump_cells(d)) {
+        return;
+    }
+    slash = strrchr(d->path, '/');
+    dirlen = slash ? (int)(slash - d->path) : 0;
+    if (dirlen <= 0 || dirlen > 1000) {
+        return;
+    }
+    memcpy(raw, d->path, dirlen);
+    raw[dirlen] = 0;
+    snprintf(raw + dirlen, sizeof(raw) - dirlen,
+        "/raw_grad_samples_final.csv");
+    fp = fopen(raw, "w");
+    if (fp) {
+        fprintf(fp,
+            "abs_adv,grad_norm_shared,grad_norm_actor_head,"
+            "grad_norm_critic_head,is_clipped\n");
+        for (int i = 0; i < n; i++) {
+            fprintf(fp, "%.8g,%.8g,%.8g,%.8g,%d\n",
+                d->abs_h[i], d->shared_h[i], d->actor_h[i], d->critic_h[i],
+                d->clip_h[i]);
+        }
+        fclose(fp);
+    }
+    snprintf(raw + dirlen, sizeof(raw) - dirlen, "/raw_grad_samples.csv");
+    fp = fopen(raw, "a");
+    if (!fp) {
+        return;
+    }
+    pos = ftell(fp);
+    if (pos == 0) {
+        fprintf(fp,
+            "iteration,abs_adv,grad_norm_shared,grad_norm_actor_head,"
+            "grad_norm_critic_head,is_clipped\n");
+    }
+    for (int i = 0; i < n; i++) {
+        fprintf(fp, "%d,%.8g,%.8g,%.8g,%.8g,%d\n",
+            iteration, d->abs_h[i], d->shared_h[i], d->actor_h[i],
+            d->critic_h[i], d->clip_h[i]);
+    }
+    fclose(fp);
+}
+
+// Fraction of per-sample grad norm held by the top 20% of |A|.
+static double diag_share_top(const float* abs_v, const float* shared,
+        const float* actor, const float* critic, int n) {
+    int order[DIAG_SAMPLES];
+    float gn[DIAG_SAMPLES];
+    double den = 0;
+    double num = 0;
+    int top;
+    if (n < 1) {
+        return 0;
+    }
+    if (n > DIAG_SAMPLES) {
+        n = DIAG_SAMPLES;
+    }
+    for (int i = 0; i < n; i++) {
+        gn[i] = sqrtf(shared[i] * shared[i] + actor[i] * actor[i]
+            + critic[i] * critic[i]);
+        order[i] = i;
+        den += gn[i];
+    }
+    for (int i = 1; i < n; i++) {
+        int key = order[i];
+        int j = i;
+        while (j > 0 && abs_v[order[j - 1]] < abs_v[key]) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = key;
+    }
+    top = n / 5;
+    if (top < 1) {
+        top = 1;
+    }
+    for (int i = 0; i < top; i++) {
+        num += gn[order[i]];
+    }
+    if (den <= 0) {
+        return 0;
+    }
+    return num / den;
+}
+
+// One ungraphed minibatch, before the train graph. Samples DIAG_SAMPLES
+// timesteps from R random rows. Each sample is its own forward and total
+// loss backward into the B=1 gradient buffers. No optimizer step.
+static void diag_grad(PuffeRL* p, RolloutBuf src, int slot,
+        cudaStream_t stream) {
+    Hypers* hypers = &p->hypers;
+    AdvDiag* d = &p->diag;
+    int H = hypers->horizon;
+    int B = hypers->total_agents;
+    int R = hypers->minibatch_size / H;
+    if (H < 2 || R < 1 || R > B) {
+        return;
+    }
+    int valid = R * (H - 1);
+    int n_pick = DIAG_SAMPLES;
+    if (n_pick > valid) {
+        n_pick = valid;
+    }
+    if (n_pick < 2) {
+        return;
+    }
+    int* order = d->order_h;
+    for (int i = 0; i < B; i++) {
+        order[i] = i;
+    }
+    for (int i = 0; i < R; i++) {
+        int span = B - i;
+        int j = i + (int)(diag_rnd(&d->rng) % (unsigned)span);
+        int tmp = order[i];
+        order[i] = order[j];
+        order[j] = tmp;
+        d->rows_h[i] = order[i];
+    }
+    for (int i = 0; i < valid; i++) {
+        d->perm_h[i] = i;
+    }
+    for (int i = 0; i < n_pick; i++) {
+        int span = valid - i;
+        int j = i + (int)(diag_rnd(&d->rng) % (unsigned)span);
+        int tmp = d->perm_h[i];
+        d->perm_h[i] = d->perm_h[j];
+        d->perm_h[j] = tmp;
+        int u = d->perm_h[i];
+        int r = u / (H - 1);
+        int t = u % (H - 1);
+        d->picks_h[i] = r * H + t;
+    }
+    cudaMemcpyAsync(d->rows_d, d->rows_h, R * sizeof(int),
+        cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d->picks_d, d->picks_h, n_pick * sizeof(int),
+        cudaMemcpyHostToDevice, stream);
+
+    int obs_f = (int)src.observations.shape[2];
+    int atn_f = (int)src.actions.shape[2];
+    int mask_f = (int)src.action_mask.shape[2];
+    if (obs_f < 1) {
+        obs_f = 1;
+    }
+    if (atn_f < 1) {
+        atn_f = 1;
+    }
+    if (mask_f < 1) {
+        mask_f = 1;
+    }
+    RolloutBuf* dst = &p->train_rollouts;
+    diag_gather_prec<<<grid_size(R * H * obs_f), BLOCK_SIZE, 0, stream>>>(
+        dst->observations.data, src.observations.data, d->rows_d,
+        R, H, B, obs_f);
+    diag_gather_f32<<<grid_size(R * H * atn_f), BLOCK_SIZE, 0, stream>>>(
+        dst->actions.data, src.actions.data, d->rows_d,
+        R, H, B, atn_f);
+    diag_gather_prec<<<grid_size(R * H), BLOCK_SIZE, 0, stream>>>(
+        dst->logprobs.data, src.logprobs.data, d->rows_d, R, H, B, 1);
+    diag_gather_prec<<<grid_size(R * H), BLOCK_SIZE, 0, stream>>>(
+        dst->rewards.data, src.rewards.data, d->rows_d, R, H, B, 1);
+    diag_gather_prec<<<grid_size(R * H), BLOCK_SIZE, 0, stream>>>(
+        dst->terminals.data, src.terminals.data, d->rows_d, R, H, B, 1);
+    diag_gather_prec<<<grid_size(R * H), BLOCK_SIZE, 0, stream>>>(
+        dst->values.data, src.values.data, d->rows_d, R, H, B, 1);
+    diag_gather_prec<<<grid_size(R * H * mask_f), BLOCK_SIZE, 0, stream>>>(
+        dst->action_mask.data, src.action_mask.data, d->rows_d,
+        R, H, B, mask_f);
+
+    if (hypers->reset_every_horizon || src.initial_states.data == NULL) {
+        cudaMemsetAsync(d->state.data, 0,
+            (size_t)d->state.shape[0] * R * d->state.shape[2]
+                * sizeof(precision_t),
+            stream);
+    } else {
+        Prec slot_st = init_slot(src.initial_states, slot);
+        int L = (int)slot_st.shape[0];
+        int A = (int)slot_st.shape[1];
+        int Hs = (int)slot_st.shape[2];
+        diag_gather_state<<<grid_size(L * R * Hs), BLOCK_SIZE, 0, stream>>>(
+            d->state.data, slot_st.data, d->rows_d, R, A, L, Hs);
+    }
+
+    TrainGraph graph = p->train_buf;
+    graph.mb_obs = slice_rows(dst->observations, 0, R);
+    graph.mb_actions = slice_rows(dst->actions, 0, R);
+    graph.mb_logprobs = slice_rows(dst->logprobs, 0, R);
+    graph.mb_terminals = slice_rows(dst->terminals, 0, R);
+    graph.mb_rewards = slice_rows(dst->rewards, 0, R);
+    graph.mb_values = slice_rows(dst->values, 0, R);
+    graph.mb_action_mask = slice_rows(dst->action_mask, 0, R);
+    graph.mb_state = d->state;
+    Policy* primary = &p->policies[0];
+    DecoderWeights* dw = (DecoderWeights*)primary->weights.decoder;
+    Prec p_logstd = {};
+    if (dw->continuous) {
+        p_logstd = dw->logstd;
+    }
+    Prec dec = arch_forward_train(&primary->arch, primary->weights,
+        p->train_activs, graph.mb_obs, graph.mb_state, graph.mb_terminals,
+        0, graph, p_logstd, p->act_sizes,
+        p->ppo_bufs.grad_logits.data, p->ppo_bufs.grad_values.data,
+        stream, NULL, NULL);
+    constexpr int ADV_THREADS = 64;
+    int adv_grid = (R + ADV_THREADS - 1) / ADV_THREADS;
+    puff_advantage<<<adv_grid, ADV_THREADS, 0, stream>>>(
+        graph.mb_gae_v.data, graph.mb_rewards.data, graph.mb_terminals.data,
+        hypers->vtrace ? graph.mb_imp.data : NULL,
+        graph.mb_advantages.data, graph.mb_gae_v.data,
+        hypers->gamma, hypers->gae_lambda,
+        hypers->vtrace_rho_clip, hypers->vtrace_c_clip, R, H);
+    graph.mb_returns = graph.mb_gae_v;
+    (void)dec;
+
+    int hidden = (int)d->one_state.shape[2];
+    int layers = d->nlayer;
+    cudaMemsetAsync(d->clip_sum, 0, sizeof(float), stream);
+    cudaMemsetAsync(d->trunk_a, 0, d->trunk_n * sizeof(float), stream);
+    cudaMemsetAsync(d->trunk_c, 0, d->trunk_n * sizeof(float), stream);
+    puf_dw_sync = 1;
+    for (int i = 0; i < n_pick; i++) {
+        int nt = d->picks_h[i];
+        diag_load_state<<<grid_size(layers * hidden), BLOCK_SIZE, 0, stream>>>(
+            d->one_state.data, d->scans_d, nt, hidden, layers);
+        TrainGraph one = p->train_buf;
+        one.mb_obs = diag_step(dst->observations, nt, obs_f);
+        one.mb_actions = diag_step_f(dst->actions, nt, atn_f);
+        one.mb_logprobs = diag_step(dst->logprobs, nt, 1);
+        one.mb_terminals = d->one_term;
+        one.mb_rewards = diag_step(dst->rewards, nt, 1);
+        one.mb_values = diag_step(dst->values, nt, 1);
+        one.mb_action_mask = diag_step(dst->action_mask, nt, mask_f);
+        one.mb_advantages = diag_step(p->train_buf.mb_advantages, nt, 1);
+        one.mb_returns = diag_step(p->train_buf.mb_gae_v, nt, 1);
+        one.mb_gae_v = d->one_v;
+        one.mb_imp = d->one_imp;
+        one.mb_state = d->one_state;
+        Prec one_dec = arch_forward_train(&primary->arch, primary->weights,
+            p->diag_acts, one.mb_obs, one.mb_state, one.mb_terminals,
+            0, one, p_logstd, p->act_sizes,
+            p->ppo_bufs.grad_logits.data, p->ppo_bufs.grad_values.data,
+            stream, NULL, NULL);
+        cudaMemsetAsync(d->losses, 0, NUM_LOSSES * sizeof(float), stream);
+        ppo_loss_fwd_bwd(one_dec, p_logstd, one, p->act_sizes, d->losses,
+            hypers->clip_coef, hypers->vf_clip_coef, hypers->vf_coef,
+            p->ppo_bufs.ent_coef, p->ppo_bufs, p->is_continuous, stream);
+        diag_zero_spans<<<d->nspan, BLOCK_SIZE, 0, stream>>>(
+            d->spans_d, d->nspan);
+        cudaMemsetAsync(d->sq_d, 0, 3 * sizeof(float), stream);
+        Float glog = p->ppo_bufs.grad_logits;
+        glog.shape[0] = 1;
+        glog.shape[1] = 1;
+        Float gval = p->ppo_bufs.grad_values;
+        gval.shape[0] = 1;
+        gval.shape[1] = 1;
+        Float gls = {};
+        if (p->is_continuous) {
+            gls = p->ppo_bufs.grad_logstd;
+            gls.shape[0] = 1;
+            gls.shape[1] = 1;
+        }
+        arch_backward(&primary->arch, primary->weights, p->diag_acts,
+            glog, gls, gval, stream);
+        diag_group_sq<<<d->nspan, BLOCK_SIZE, 0, stream>>>(
+            d->spans_d, d->nspan, d->sq_d);
+        diag_store_norms<<<1, 32, 0, stream>>>(d->sq_d, d->shared_d,
+            d->actor_d, d->critic_d, d->abs_d, d->clip_d,
+            one.mb_advantages.data, d->losses, i);
+        diag_add_clip<<<1, 32, 0, stream>>>(d->clip_sum, d->losses);
+        // Split the same output grad. Value grad already includes vf_coef,
+        // so the critic norm is c_v * ||dL_critic||.
+        cudaMemcpyAsync(d->vgrad_saved, gval.data, sizeof(float),
+            cudaMemcpyDeviceToDevice, stream);
+        cudaMemsetAsync(gval.data, 0, sizeof(float), stream);
+        diag_zero_spans<<<d->nspan, BLOCK_SIZE, 0, stream>>>(
+            d->spans_d, d->nspan);
+        arch_backward(&primary->arch, primary->weights, p->diag_acts,
+            glog, gls, gval, stream);
+        diag_accum_shared<<<d->nspan, BLOCK_SIZE, 0, stream>>>(
+            d->spans_d, d->nspan, d->trunk_a, d->trunk_off_d);
+        cudaMemcpyAsync(gval.data, d->vgrad_saved, sizeof(float),
+            cudaMemcpyDeviceToDevice, stream);
+        cudaMemsetAsync(glog.data, 0,
+            (size_t)d->output_dim * sizeof(float), stream);
+        if (p->is_continuous) {
+            cudaMemsetAsync(gls.data, 0,
+                (size_t)d->output_dim * sizeof(float), stream);
+        }
+        diag_zero_spans<<<d->nspan, BLOCK_SIZE, 0, stream>>>(
+            d->spans_d, d->nspan);
+        arch_backward(&primary->arch, primary->weights, p->diag_acts,
+            glog, gls, gval, stream);
+        diag_accum_shared<<<d->nspan, BLOCK_SIZE, 0, stream>>>(
+            d->spans_d, d->nspan, d->trunk_c, d->trunk_off_d);
+    }
+    puf_dw_sync = 0;
+    cudaMemsetAsync(d->trunk_sq, 0, 2 * sizeof(float), stream);
+    diag_flat_sq<<<1, BLOCK_SIZE, 0, stream>>>(
+        d->trunk_a, d->trunk_n, d->trunk_sq);
+    diag_flat_sq<<<1, BLOCK_SIZE, 0, stream>>>(
+        d->trunk_c, d->trunk_n, d->trunk_sq + 1);
+
+    cudaMemcpyAsync(d->abs_h, d->abs_d, n_pick * sizeof(float),
+        cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(d->shared_h, d->shared_d, n_pick * sizeof(float),
+        cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(d->actor_h, d->actor_d, n_pick * sizeof(float),
+        cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(d->critic_h, d->critic_d, n_pick * sizeof(float),
+        cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(d->clip_h, d->clip_d, n_pick * sizeof(int),
+        cudaMemcpyDeviceToHost, stream);
+    float clip_host = 0.0f;
+    float trunk_h[2] = {0, 0};
+    cudaMemcpyAsync(&clip_host, d->clip_sum, sizeof(float),
+        cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(trunk_h, d->trunk_sq, sizeof(trunk_h),
+        cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    double ms = 0;
+    double ma = 0;
+    double mc = 0;
+    for (int i = 0; i < n_pick; i++) {
+        ms += d->shared_h[i];
+        ma += d->actor_h[i];
+        mc += d->critic_h[i];
+    }
+    double inv = 1.0 / (double)n_pick;
+    d->mean_shared = ms * inv;
+    d->mean_actor = ma * inv;
+    d->mean_critic = mc * inv;
+    d->pearson_shared = diag_pearson(d->abs_h, d->shared_h, n_pick);
+    d->spearman_shared = diag_spearman(d, d->abs_h, d->shared_h, n_pick);
+    d->pearson_actor = diag_pearson(d->abs_h, d->actor_h, n_pick);
+    d->spearman_actor = diag_spearman(d, d->abs_h, d->actor_h, n_pick);
+    d->pearson_critic = diag_pearson(d->abs_h, d->critic_h, n_pick);
+    d->spearman_critic = diag_spearman(d, d->abs_h, d->critic_h, n_pick);
+    d->clip_frac = (double)clip_host * inv;
+    {
+        double na = sqrt((double)trunk_h[0]);
+        double nc = sqrt((double)trunk_h[1]);
+        d->ratio_trunk = nc > 1e-8 ? na / nc : 0;
+        d->share_top = diag_share_top(
+            d->abs_h, d->shared_h, d->actor_h, d->critic_h, n_pick);
+    }
+    d->grad_ready = 1;
+    d->pending_grad = 1;
+    {
+        long batch = (long)hypers->total_agents * hypers->horizon;
+        int iteration = (int)(p->global_step * hypers->world_size / batch) - 1;
+        diag_write_raw(d, iteration, n_pick);
+    }
+}
+
+static void diag_json(PuffeRL* p, const DiagSnap* s) {
+    AdvDiag* d = &p->diag;
+    if (!d->path[0]) {
+        return;
+    }
+    if (!d->fp) {
+        d->fp = fopen(d->path, "a");
+        if (!d->fp) {
+            fprintf(stderr, "adv diag log open failed %s\n", d->path);
+            d->path[0] = 0;
+            return;
+        }
+    }
+    fprintf(d->fp,
+        "{\"steps\":%.0f,\"ep_last\":%d,\"ep0_mean\":%.6g,\"ep0_n\":%llu,"
+        "\"ep_last_mean\":%.6g,\"ep_last_n\":%llu,"
+        "\"explained_var\":%.6g,\"bins\":[",
+        s->step, s->ep_last, s->ep0_mean,
+        (unsigned long long)s->ep0_n, s->ep_last_mean,
+        (unsigned long long)s->ep_last_n, s->explained_var);
+    for (int i = 0; i < s->nbins; i++) {
+        fprintf(d->fp,
+            "%s{\"lo\":%d,\"mean_abs\":%.6g,\"signed_mean\":%.6g,"
+            "\"max_abs\":%.6g,\"n\":%u}",
+            i ? "," : "", i * DIAG_EP_BIN, s->mean_abs[i], s->signed_mean[i],
+            s->max_abs[i], s->count[i]);
+    }
+    fprintf(d->fp, "]");
+    if (s->grad_ready) {
+        fprintf(d->fp,
+            ",\"pearson_shared\":%.6g,\"spearman_shared\":%.6g,"
+            "\"pearson_actor\":%.6g,\"spearman_actor\":%.6g,"
+            "\"pearson_critic\":%.6g,\"spearman_critic\":%.6g,"
+            "\"grad_norm_shared\":%.6g,\"grad_norm_actor_head\":%.6g,"
+            "\"grad_norm_critic_head\":%.6g,\"clip_frac\":%.6g,"
+            "\"ratio_trunk\":%.6g,\"share_top\":%.6g",
+            s->pearson_shared, s->spearman_shared,
+            s->pearson_actor, s->spearman_actor,
+            s->pearson_critic, s->spearman_critic,
+            s->mean_shared, s->mean_actor, s->mean_critic,
+            s->clip_frac, s->ratio_trunk, s->share_top);
+    }
+    fprintf(d->fp, "}\n");
+    fflush(d->fp);
+}
+
+// One row per GAE cell. The last horizon index stays out: it is left at 0.
+static void diag_write_samples(AdvDiag* d, int iteration, int n, int horizon) {
+    const char* slash;
+    char raw[1100];
+    int dirlen;
+    int i;
+    if (!d->sample_adv_h || !d->path[0]) {
+        return;
+    }
+    if (!d->sample_fp) {
+        slash = strrchr(d->path, '/');
+        dirlen = slash ? (int)(slash - d->path) : 0;
+        if (dirlen <= 0 || dirlen > 1000) {
+            return;
+        }
+        memcpy(raw, d->path, dirlen);
+        raw[dirlen] = 0;
+        snprintf(raw + dirlen, sizeof(raw) - dirlen, "/adv_samples.csv");
+        d->sample_fp = fopen(raw, "w");
+        if (!d->sample_fp) {
+            return;
+        }
+        setvbuf(d->sample_fp, NULL, _IOFBF, 1 << 20);
+        fprintf(d->sample_fp, "iteration,episode_step,advantage\n");
+    }
+    for (i = 0; i < n; i++) {
+        if (horizon > 1 && (i % horizon) == horizon - 1) {
+            continue;
+        }
+        fprintf(d->sample_fp, "%d,%d,%.8g\n",
+            iteration, d->sample_step_h[i], to_float(d->sample_adv_h[i]));
+    }
+    fflush(d->sample_fp);
+}
+
+// Pair the GAE snapshot with episode_step. Both are (agents, horizon).
+static void diag_bins(PuffeRL* p, RolloutBuf src, cudaStream_t stream) {
+    AdvDiag* d = &p->diag;
+    int H = p->hypers.horizon;
+    int B = p->hypers.total_agents;
+    int n = B * H;
+    transpose_int_102<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        p->train_rollouts.episode_step.data, src.episode_step.data,
+        H, B, 1);
+    cudaMemsetAsync(d->ep_sum_abs, 0, DIAG_EP_BINS * sizeof(double), stream);
+    cudaMemsetAsync(d->ep_sum, 0, DIAG_EP_BINS * sizeof(double), stream);
+    cudaMemsetAsync(d->ep_max_abs, 0, DIAG_EP_BINS * sizeof(float), stream);
+    cudaMemsetAsync(d->ep_count, 0,
+        DIAG_EP_BINS * sizeof(unsigned long long), stream);
+    cudaMemsetAsync(d->ep_edge_sum, 0, 2 * sizeof(double), stream);
+    cudaMemsetAsync(d->ep_edge_n, 0, 2 * sizeof(unsigned long long), stream);
+    diag_ep_bins<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        p->adv_saved.data, p->train_rollouts.episode_step.data,
+        B, H, d->episode_length, DIAG_EP_BIN,
+        d->ep_sum_abs, d->ep_sum, d->ep_max_abs, d->ep_count,
+        d->ep_edge_sum, d->ep_edge_n);
+    // Copies below are on the default stream. Wait for train_stream.
+    assert(cudaStreamSynchronize(stream) == cudaSuccess);
+
+    int nbins = (d->episode_length + DIAG_EP_BIN - 1) / DIAG_EP_BIN;
+    if (nbins < 1) {
+        nbins = 1;
+    }
+    if (nbins > DIAG_EP_BINS) {
+        nbins = DIAG_EP_BINS;
+    }
+    double sum_abs[DIAG_EP_BINS];
+    double sum_signed[DIAG_EP_BINS];
+    float max_abs[DIAG_EP_BINS];
+    unsigned long long count[DIAG_EP_BINS];
+    double edge_sum[2];
+    unsigned long long edge_n[2];
+    cudaMemcpy(sum_abs, d->ep_sum_abs, nbins * sizeof(double),
+        cudaMemcpyDeviceToHost);
+    cudaMemcpy(sum_signed, d->ep_sum, nbins * sizeof(double),
+        cudaMemcpyDeviceToHost);
+    cudaMemcpy(max_abs, d->ep_max_abs, nbins * sizeof(float),
+        cudaMemcpyDeviceToHost);
+    cudaMemcpy(count, d->ep_count, nbins * sizeof(unsigned long long),
+        cudaMemcpyDeviceToHost);
+    cudaMemcpy(edge_sum, d->ep_edge_sum, sizeof(edge_sum),
+        cudaMemcpyDeviceToHost);
+    cudaMemcpy(edge_n, d->ep_edge_n, sizeof(edge_n),
+        cudaMemcpyDeviceToHost);
+
+    d->ep0_mean = edge_n[0] ? edge_sum[0] / (double)edge_n[0] : 0;
+    d->ep_last_mean = edge_n[1] ? edge_sum[1] / (double)edge_n[1] : 0;
+    d->bins_ready = 1;
+
+    DiagSnap local;
+    DiagSnap* s = &local;
+    if (d->snap_n < d->snap_cap) {
+        s = &d->snaps[d->snap_n++];
+    }
+    memset(s, 0, sizeof(*s));
+    s->step = (double)p->global_step * p->hypers.world_size;
+    s->ep_last = d->episode_length - 1;
+    s->ep0_mean = d->ep0_mean;
+    s->ep_last_mean = d->ep_last_mean;
+    s->ep0_n = edge_n[0];
+    s->ep_last_n = edge_n[1];
+    s->explained_var = p->explained_var;
+    s->nbins = nbins;
+    for (int i = 0; i < nbins; i++) {
+        s->count[i] = (unsigned int)count[i];
+        s->max_abs[i] = max_abs[i];
+        s->mean_abs[i] = count[i] ? sum_abs[i] / (double)count[i] : 0;
+        s->signed_mean[i] = count[i] ? sum_signed[i] / (double)count[i] : 0;
+    }
+    if (d->pending_grad) {
+        s->grad_ready = 1;
+        s->pearson_shared = d->pearson_shared;
+        s->spearman_shared = d->spearman_shared;
+        s->pearson_actor = d->pearson_actor;
+        s->spearman_actor = d->spearman_actor;
+        s->pearson_critic = d->pearson_critic;
+        s->spearman_critic = d->spearman_critic;
+        s->mean_shared = d->mean_shared;
+        s->mean_actor = d->mean_actor;
+        s->mean_critic = d->mean_critic;
+        s->clip_frac = d->clip_frac;
+        s->ratio_trunk = d->ratio_trunk;
+        s->share_top = d->share_top;
+    }
+    d->pending_grad = 0;
+    diag_json(p, s);
+    if (d->sample_adv_h && d->sample_step_h && diag_dump_cells(d)) {
+        assert(cudaMemcpy(d->sample_adv_h, p->adv_saved.data,
+            (size_t)n * sizeof(precision_t), cudaMemcpyDeviceToHost)
+            == cudaSuccess);
+        assert(cudaMemcpy(d->sample_step_h,
+            p->train_rollouts.episode_step.data,
+            (size_t)n * sizeof(int), cudaMemcpyDeviceToHost)
+            == cudaSuccess);
+        diag_write_samples(d, (int)(s->step / (double)n) - 1, n, H);
+    }
+}
+
+// Pointers exist only after both diagnostic allocators are created.
+static void diag_bind(PuffeRL* p) {
+    AdvDiag* d = &p->diag;
+    DiagSpan host[DIAG_SPAN_CAP];
+    precision_t* edata[40];
+    int en[40];
+    int n = 0;
+    int ne = drive_enc_grad_spans(p->diag_acts.encoder, edata, en, 40);
+    for (int i = 0; i < ne; i++) {
+        assert(n < DIAG_SPAN_CAP);
+        host[n++] = {edata[i], en[i], 0};
+    }
+    MinGRUWeights* mw = (MinGRUWeights*)p->policies[0].weights.network;
+    MinGRUActivations* mg = (MinGRUActivations*)p->diag_acts.network;
+    for (int i = 0; i < mw->num_layers; i++) {
+        assert(n < DIAG_SPAN_CAP);
+        host[n++] = {
+            mg->wgrad_scratch[i].data,
+            (int)numel(mg->wgrad_scratch[i].shape),
+            0,
+        };
+    }
+    DecoderWeights* dw = (DecoderWeights*)p->policies[0].weights.decoder;
+    DecoderActivations* dec = (DecoderActivations*)p->diag_acts.decoder;
+    int H = (int)dec->wgrad_scratch.shape[1];
+    int od = dw->output_dim;
+    assert(n + 2 < DIAG_SPAN_CAP);
+    host[n++] = {dec->wgrad_scratch.data, od * H, 1};
+    host[n++] = {dec->wgrad_scratch.data + (long)od * H, H, 2};
+    if (dw->continuous) {
+        host[n++] = {
+            dec->logstd_scratch.data,
+            (int)numel(dec->logstd_scratch.shape),
+            1,
+        };
+    }
+    d->nspan = n;
+    d->nlayer = mw->num_layers;
+    assert(cudaMalloc(&d->spans_d, n * sizeof(DiagSpan)) == cudaSuccess);
+    cudaMemcpy(d->spans_d, host, n * sizeof(DiagSpan),
+        cudaMemcpyHostToDevice);
+    assert(mw->num_layers > 0 && mw->num_layers <= 16);
+    precision_t* scans[16];
+    MinGRUActivations* tr = (MinGRUActivations*)p->train_activs.network;
+    for (int i = 0; i < mw->num_layers; i++) {
+        scans[i] = tr->scan_bufs[i].scan_h.data;
+    }
+    assert(cudaMalloc(&d->scans_d,
+        mw->num_layers * sizeof(precision_t*)) == cudaSuccess);
+    cudaMemcpy(d->scans_d, scans, mw->num_layers * sizeof(precision_t*),
+        cudaMemcpyHostToDevice);
+    assert(cudaMalloc(&d->sq_d, 3 * sizeof(float)) == cudaSuccess);
+    assert(cudaMalloc(&d->clip_sum, sizeof(float)) == cudaSuccess);
+    {
+        int off[DIAG_SPAN_CAP];
+        int cursor = 0;
+        for (int i = 0; i < n; i++) {
+            if (host[i].group == 0) {
+                off[i] = cursor;
+                cursor += host[i].n;
+            } else {
+                off[i] = -1;
+            }
+        }
+        d->trunk_n = cursor;
+        d->output_dim = od;
+        assert(cursor > 0);
+        assert(cudaMalloc(&d->trunk_a, cursor * sizeof(float)) == cudaSuccess);
+        assert(cudaMalloc(&d->trunk_c, cursor * sizeof(float)) == cudaSuccess);
+        assert(cudaMalloc(&d->trunk_off_d, n * sizeof(int)) == cudaSuccess);
+        assert(cudaMalloc(&d->trunk_sq, 2 * sizeof(float)) == cudaSuccess);
+        assert(cudaMalloc(&d->vgrad_saved, sizeof(float)) == cudaSuccess);
+        cudaMemcpy(d->trunk_off_d, off, n * sizeof(int),
+            cudaMemcpyHostToDevice);
+    }
 }
 
 static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
@@ -1933,8 +3147,14 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             hypers->gamma, hypers->gae_lambda,
             hypers->vtrace_rho_clip, hypers->vtrace_c_clip, Nmb, Tmb);
         adv_stats<<<grid_size(Nmb * Tmb), BLOCK_SIZE, 0, stream>>>(
-            graph.mb_advantages.data, Nmb * Tmb, Tmb,
-            pufferl->adv_mom, pufferl->adv_count, pufferl->adv_hist);
+            graph.mb_advantages.data, graph.mb_gae_v.data, Nmb * Tmb, Tmb,
+            pufferl->adv_mom, pufferl->adv_count, pufferl->adv_hist,
+            pufferl->ev_mom);
+        cudaMemcpyAsync(
+            pufferl->adv_saved.data + (long)dest_off * Tmb,
+            graph.mb_advantages.data,
+            (size_t)Nmb * (size_t)Tmb * sizeof(precision_t),
+            cudaMemcpyDeviceToDevice, stream);
         graph.mb_returns = graph.mb_gae_v;
 
         ppo_loss_fwd_bwd(dec, p_logstd, graph,
@@ -1980,6 +3200,136 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
     puf_stamp<<<1, 1, 0, stream>>>(st + TE_E);
 }
 
+static float curr_read_adv(const precision_t* p) {
+    if (sizeof(precision_t) == sizeof(float)) {
+        float v;
+        memcpy(&v, p, sizeof(v));
+        return v;
+    }
+    unsigned short bits;
+    memcpy(&bits, p, sizeof(bits));
+    return bf16_to_f32(bits);
+}
+
+// Burn-in keeps every copy on the ini settings. After that, the top
+// hard_frac of copies by RMS advantage become hard. The rest stay
+// standard and are the evaluation envs. hard_frac is clamped to [0, 0.8].
+#define CURR_BURN_IN 50000000L
+#define CURR_HARD_MAX 0.8f
+
+static void curr_update(PuffeRL* p) {
+    VecEnv* vec = p->vec;
+    int nenv;
+    int agents;
+    int horizon;
+    int valid_t;
+    long steps;
+    int n_hard;
+    int n_hard_cap;
+    int burn;
+    float hard_frac;
+    if (!vec || !p->curr_adv_h || !vec->curr_xi || !vec->curr_order) {
+        return;
+    }
+    if (PUF_BACKEND == PUF_GPU) {
+        return;
+    }
+    nenv = vec->size;
+    agents = p->hypers.total_agents;
+    horizon = p->hypers.horizon;
+    if (nenv < 1 || horizon < 2) {
+        return;
+    }
+    cudaMemcpy(p->curr_adv_h, p->adv_saved.data,
+        (size_t)agents * (size_t)horizon * sizeof(precision_t),
+        cudaMemcpyDeviceToHost);
+    valid_t = horizon - 1;
+    for (int e = 0; e < nenv; e++) {
+        Env* env = &vec->envs[e];
+        double ss = 0.0;
+        double ab = 0.0;
+        int n = 0;
+        int na = env->active_agent_count;
+        if (na > DRIVE_AGENT_MAX) {
+            na = DRIVE_AGENT_MAX;
+        }
+        for (int s = 0; s < na; s++) {
+            int slot = env->slot_of[s];
+            const precision_t* row;
+            if (slot < 0 || slot >= agents) {
+                continue;
+            }
+            row = p->curr_adv_h + (size_t)slot * (size_t)horizon;
+            for (int t = 0; t < valid_t; t++) {
+                float a = curr_read_adv(row + t);
+                float m = a < 0.0f ? -a : a;
+                ss += (double)a * (double)a;
+                ab += (double)m;
+                n++;
+            }
+        }
+        vec->curr_xi[e] = n > 0 ? sqrtf((float)(ss / (double)n)) : 0.0f;
+        env->curr_abs = n > 0 ? (float)(ab / (double)n) : 0.0f;
+    }
+    steps = p->global_step * (long)p->hypers.world_size;
+    burn = steps < CURR_BURN_IN;
+    hard_frac = vec->envs[0].hard_frac;
+    if (hard_frac < 0.0f) {
+        hard_frac = 0.0f;
+    }
+    if (hard_frac > CURR_HARD_MAX) {
+        hard_frac = CURR_HARD_MAX;
+    }
+    n_hard = (int)lroundf(hard_frac * (float)nenv);
+    n_hard_cap = (int)(CURR_HARD_MAX * (float)nenv);
+    if (n_hard < 0) {
+        n_hard = 0;
+    }
+    if (n_hard > n_hard_cap) {
+        n_hard = n_hard_cap;
+    }
+    if (n_hard > nenv) {
+        n_hard = nenv;
+    }
+    if (burn || n_hard < 1) {
+        for (int e = 0; e < nenv; e++) {
+            vec->envs[e].curr_standard = 1;
+            drive_curriculum_set(&vec->envs[e], 0.0f, 0);
+        }
+        return;
+    }
+    for (int i = 0; i < nenv; i++) {
+        vec->curr_order[i] = i;
+    }
+    for (int i = 1; i < nenv; i++) {
+        int key = vec->curr_order[i];
+        float kx = vec->curr_xi[key];
+        int j = i - 1;
+        while (j >= 0) {
+            int other = vec->curr_order[j];
+            int before = vec->curr_xi[other] < kx
+                || (vec->curr_xi[other] == kx && other > key);
+            if (!before) {
+                break;
+            }
+            vec->curr_order[j + 1] = other;
+            j--;
+        }
+        vec->curr_order[j + 1] = key;
+    }
+    for (int i = 0; i < nenv; i++) {
+        int e = vec->curr_order[i];
+        if (i < n_hard) {
+            float d = (float)(n_hard - i) / (float)n_hard;
+            vec->envs[e].curr_standard = 0;
+            drive_curriculum_set(&vec->envs[e], d, 1);
+        } else {
+            vec->envs[e].curr_standard = 1;
+            drive_curriculum_set(&vec->envs[e], 0.0f, 0);
+        }
+    }
+}
+
 void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     Hypers* hypers = &pufferl->hypers;
     RolloutBuf src = src_arg ? *src_arg : pufferl->rollouts;
@@ -2017,6 +3367,12 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     int slot = hypers->async ? pufferl->async_ready_slot : 0;
     int total_minibatches = hypers->replay_ratio * batch_size / hypers->minibatch_size;
     bool first = hypers->cudagraphs && pufferl->train_cudagraph[slot] == NULL;
+    // Epoch 0 captures the train graph. The per-sample backward records
+    // the same dW events, so it waits until that graph already exists.
+    if (pufferl->diag_every > 0 && current_epoch % pufferl->diag_every == 0
+            && !first) {
+        diag_grad(pufferl, src, slot, train_stream);
+    }
     profile_begin("train_forward_backward", hypers->profile);
     if (first) {
         double t_cap = wall_clock();
@@ -2037,6 +3393,9 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
         pufferl->start_time += dt;
         pufferl->last_log_time += dt;
     }
+    // Capture executes once, then the graph launches again. Zero here so
+    // the moments match that launch, not the sum of both.
+    cudaMemsetAsync(pufferl->ev_mom, 0, 5 * sizeof(double), train_stream);
     if (hypers->cudagraphs) {
         cudaGraphLaunch(pufferl->train_cudagraph[slot], train_stream);
     } else {
@@ -2045,6 +3404,18 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     profile_end(hypers->profile);
 
     cudaStreamSynchronize(train_stream);
+    {
+        double ev[5];
+        assert(cudaMemcpy(ev, pufferl->ev_mom, sizeof(ev),
+            cudaMemcpyDeviceToHost) == cudaSuccess);
+        pufferl->explained_var = explained_variance(ev);
+    }
+    curr_update(pufferl);
+
+    if (pufferl->diag_every > 0
+            && current_epoch % pufferl->diag_every == 0) {
+        diag_bins(pufferl, src, train_stream);
+    }
 
     if (total_minibatches > 0) {
         unsigned long long h[NUM_TE];
@@ -2841,6 +4212,8 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         mkdir_p(dir);
         snprintf(pufferl->adv_path, sizeof(pufferl->adv_path),
             "%s/%s-advantages.jsonl", dir, run_id);
+        snprintf(pufferl->diag.path, sizeof(pufferl->diag.path),
+            "%s/%s-advdiag.jsonl", dir, run_id);
     }
     snprintf(pufferl->env_name, sizeof(pufferl->env_name), "%s", PUFFER_ENV_NAME);
 
@@ -2907,15 +4280,24 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMalloc((void**)&env->actions.data, total_agents * NUM_ATNS * sizeof(float));
     cudaMalloc((void**)&env->rewards.data, total_agents * sizeof(float));
     cudaMalloc((void**)&env->terminals.data, total_agents * sizeof(float));
+    cudaMalloc((void**)&env->episode_step, total_agents * sizeof(int));
     cudaMalloc((void**)&env->action_mask.data, mask_bytes);
     cudaMemset(env->obs.data, 0, total_agents * OBS_SIZE * sizeof(obs_t));
     cudaMemset(env->actions.data, 0, total_agents * NUM_ATNS * sizeof(float));
     cudaMemset(env->rewards.data, 0, total_agents * sizeof(float));
     cudaMemset(env->terminals.data, 0, total_agents * sizeof(float));
+    cudaMemset(env->episode_step, 0, total_agents * sizeof(int));
     cudaMemset(env->action_mask.data, 1, mask_bytes);
 
     env_setup(pufferl, vec, &vec_kwargs, env_kwargs);
     pufferl->vec = vec;
+    pufferl->diag.episode_length = 1;
+    if (PUF_BACKEND != PUF_GPU && vec->size > 0) {
+        int elen = vec->envs[0].episode_length;
+        if (elen > 0) {
+            pufferl->diag.episode_length = elen;
+        }
+    }
 
     cudaMalloc((void**)&pufferl->profile.stamps,
         2 * NUM_TE * sizeof(unsigned long long));
@@ -2990,6 +4372,23 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     }
     pufferl->train_activs = arch_reg_train(
         &primary->arch, primary->weights, acts, grads, B_TT);
+    {
+        MinGRUWeights* mw = (MinGRUWeights*)primary->weights.network;
+        int saved_horizon = mw->horizon;
+        mw->horizon = 1;
+        pufferl->diag_acts = arch_reg_train(&primary->arch, primary->weights,
+            &pufferl->diag_act_alloc, &pufferl->diag_grad_alloc, 1);
+        mw->horizon = saved_horizon;
+        AdvDiag* d = &pufferl->diag;
+        d->one_state = {.shape = {num_layers, 1, hidden_size}};
+        d->one_term = {.shape = {1, 1}};
+        d->one_v = {.shape = {1, 1}};
+        d->one_imp = {.shape = {1, 1}};
+        alloc_register(&pufferl->diag_act_alloc, &d->one_state);
+        alloc_register(&pufferl->diag_act_alloc, &d->one_term);
+        alloc_register(&pufferl->diag_act_alloc, &d->one_v);
+        alloc_register(&pufferl->diag_act_alloc, &d->one_imp);
+    }
 
     // Async is Cleanba 2-slot only (lag 1). Sync uses a single slot.
     int async_slots = hypers.async ? 2 : 1;
@@ -3006,6 +4405,11 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     register_train_buffers(pufferl->train_buf, acts, minibatch_segments, horizon);
     register_rollout_buffers(&pufferl->train_rollouts,
         acts, total_agents, horizon, input_size, num_action_heads, act_n);
+    pufferl->adv_saved = {.shape = {total_agents, horizon}};
+    alloc_register(acts, &pufferl->adv_saved);
+    pufferl->curr_adv_h = (precision_t*)malloc(
+        (size_t)total_agents * (size_t)horizon * sizeof(precision_t));
+    assert(pufferl->curr_adv_h);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
         hypers.horizon, decoder_output_size, is_continuous);
     pufferl->train_state = {.shape = {num_layers, total_agents, hidden_size}};
@@ -3016,11 +4420,75 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMalloc((void**)&pufferl->act_sizes, num_action_heads * sizeof(int));
     cudaMalloc((void**)&pufferl->losses, NUM_LOSSES * sizeof(float));
     cudaMalloc((void**)&pufferl->adv_mom, 6 * sizeof(double));
+    cudaMalloc((void**)&pufferl->ev_mom, 5 * sizeof(double));
+    cudaMemset(pufferl->ev_mom, 0, 5 * sizeof(double));
     cudaMalloc((void**)&pufferl->adv_count, 2 * sizeof(unsigned long long));
     cudaMalloc((void**)&pufferl->adv_hist, ADV_BINS * sizeof(unsigned int));
     cudaMemset(pufferl->adv_mom, 0, 6 * sizeof(double));
     cudaMemset(pufferl->adv_count, 0, 2 * sizeof(unsigned long long));
     cudaMemset(pufferl->adv_hist, 0, ADV_BINS * sizeof(unsigned int));
+
+    {
+        AdvDiag* d = &pufferl->diag;
+        int R = minibatch_segments;
+        int L = num_layers;
+        int H = hidden_size;
+        int mb = hypers.minibatch_size;
+        d->rng = (unsigned)hypers.seed + 1u;
+        d->state = {.shape = {L, R, H}};
+        assert(cudaMalloc(&d->state.data,
+            (size_t)L * R * H * sizeof(precision_t)) == cudaSuccess);
+        assert(cudaMalloc(&d->losses, NUM_LOSSES * sizeof(float))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->rows_d, R * sizeof(int)) == cudaSuccess);
+        assert(cudaMalloc(&d->picks_d, DIAG_SAMPLES * sizeof(int))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->abs_d, DIAG_SAMPLES * sizeof(float))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->shared_d, DIAG_SAMPLES * sizeof(float))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->actor_d, DIAG_SAMPLES * sizeof(float))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->critic_d, DIAG_SAMPLES * sizeof(float))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->clip_d, DIAG_SAMPLES * sizeof(int))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->ep_sum_abs, DIAG_EP_BINS * sizeof(double))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->ep_sum, DIAG_EP_BINS * sizeof(double))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->ep_max_abs, DIAG_EP_BINS * sizeof(float))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->ep_count,
+            DIAG_EP_BINS * sizeof(unsigned long long)) == cudaSuccess);
+        assert(cudaMalloc(&d->ep_edge_sum, 2 * sizeof(double))
+            == cudaSuccess);
+        assert(cudaMalloc(&d->ep_edge_n, 2 * sizeof(unsigned long long))
+            == cudaSuccess);
+        d->order_h = (int*)malloc((size_t)total_agents * sizeof(int));
+        d->rows_h = (int*)malloc((size_t)R * sizeof(int));
+        d->perm_h = (int*)malloc((size_t)mb * sizeof(int));
+        d->picks_h = (int*)malloc(DIAG_SAMPLES * sizeof(int));
+        d->rank_h = (int*)malloc(DIAG_SAMPLES * sizeof(int));
+        d->abs_h = (float*)malloc(DIAG_SAMPLES * sizeof(float));
+        d->shared_h = (float*)malloc(DIAG_SAMPLES * sizeof(float));
+        d->actor_h = (float*)malloc(DIAG_SAMPLES * sizeof(float));
+        d->critic_h = (float*)malloc(DIAG_SAMPLES * sizeof(float));
+        d->clip_h = (int*)malloc(DIAG_SAMPLES * sizeof(int));
+        d->rank_a = (float*)malloc(DIAG_SAMPLES * sizeof(float));
+        d->rank_b = (float*)malloc(DIAG_SAMPLES * sizeof(float));
+        d->sample_adv_h = (precision_t*)malloc(
+            (size_t)total_agents * horizon * sizeof(precision_t));
+        d->sample_step_h = (int*)malloc(
+            (size_t)total_agents * horizon * sizeof(int));
+        assert(d->order_h && d->rows_h && d->perm_h && d->picks_h
+            && d->rank_h && d->abs_h && d->shared_h && d->actor_h
+            && d->critic_h && d->clip_h && d->rank_a && d->rank_b
+            && d->sample_adv_h && d->sample_step_h);
+        d->snap_cap = DIAG_SNAP_CAP;
+        d->snaps = (DiagSnap*)calloc(DIAG_SNAP_CAP, sizeof(DiagSnap));
+        assert(d->snaps);
+    }
 
     muon_init(&pufferl->muon, &primary->params_alloc, hypers.momentum, acts);
 
@@ -3041,6 +4509,9 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     }
     alloc_create(grads);
     alloc_create(acts);
+    alloc_create(&pufferl->diag_act_alloc);
+    alloc_create(&pufferl->diag_grad_alloc);
+    diag_bind(pufferl);
 
     pufferl->grad = {.data = (precision_t*)grads->mem, .shape = {grads->total_elems}};
     if (hypers.async) {
@@ -3359,7 +4830,7 @@ void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
         {"Epoch", epoch_s, "Train", NULL, train_time, "old_kl", "loss/old_kl"},
         {"Uptime", uptime, "  Model", "perf/train_model", 0, "kl", "loss/kl"},
         {"To go", remaining, "  Misc", "perf/train_misc", 0, "clipfrac", "loss/clipfrac"},
-        {"", "", "", NULL, 0, "anchor", "loss/anchor"},
+        {"", "", "", NULL, 0, "expl_var", "value/explained_var"},
     };
     for (int i = 0; i < (int)(sizeof(rows) / sizeof(rows[0])); i++) {
         char bt[64], bp[16], cv[32];
@@ -3609,7 +5080,7 @@ typedef struct {
 typedef struct {
     long stamp;
     int run;
-    char name[256];
+    char path[1024];
 } SweepHist;
 
 extern char** environ;
@@ -3662,6 +5133,11 @@ static int sweep_task_matches(Ini* cur, Ini* hist,
         for (int i = 0; i < left->size; i++) {
             DictItem* item = &left->items[i];
             if (sweep_param_index(params, n_params, sections[s], item->key) >= 0) {
+                continue;
+            }
+            // The bottleneck town changed the map count. Old trials
+            // still teach the search.
+            if (strcmp(item->key, "num_maps") == 0) {
                 continue;
             }
             DictItem* other = dict_find(right, item->key);
@@ -3733,22 +5209,11 @@ static int metric_last(DictItem* item, double* out) {
     return 0;
 }
 
-// Finished sweep_*.ini logs seed Protein so a restart keeps the search.
-// A log counts when the task matches and every swept value is in range.
-// The next run index is past every sweep log already in the directory.
-static int seed_sweep_history(Ini* ini, ProteinSweep* protein,
-        SweepSpace* space, SweepParam* params, int n_params) {
-    char log_dir[2048];
-    snprintf(log_dir, sizeof(log_dir), "%s/%s",
-        puf_ini_get_str(ini, "base", "log_dir"),
-        puf_ini_get_str(ini, "base", "env_name"));
-    DIR* dp = opendir(log_dir);
+static void sweep_hist_scan(SweepHist** logs, int* n, int* cap, const char* dir) {
+    DIR* dp = opendir(dir);
     if (!dp) {
-        return 0;
+        return;
     }
-    int cap = 0;
-    int n = 0;
-    SweepHist* logs = NULL;
     struct dirent* ent = NULL;
     while ((ent = readdir(dp))) {
         long stamp = 0;
@@ -3756,17 +5221,39 @@ static int seed_sweep_history(Ini* ini, ProteinSweep* protein,
         if (!parse_sweep_log_name(ent->d_name, &stamp, &run)) {
             continue;
         }
-        if (n == cap) {
-            cap = cap ? cap * 2 : 16;
-            logs = (SweepHist*)realloc(logs, cap * sizeof(SweepHist));
-            assert(logs && "sweep history alloc failed");
+        if (*n == *cap) {
+            *cap = *cap ? *cap * 2 : 16;
+            *logs = (SweepHist*)realloc(*logs, (size_t)(*cap) * sizeof(SweepHist));
+            assert(*logs && "sweep history alloc failed");
         }
-        logs[n].stamp = stamp;
-        logs[n].run = run;
-        snprintf(logs[n].name, sizeof(logs[n].name), "%s", ent->d_name);
-        n++;
+        (*logs)[*n].stamp = stamp;
+        (*logs)[*n].run = run;
+        snprintf((*logs)[*n].path, sizeof((*logs)[*n].path), "%s/%s", dir, ent->d_name);
+        (*n)++;
     }
     closedir(dp);
+}
+
+// Finished sweep_*.ini logs seed Protein so a restart keeps the search.
+// sweep.history_dir is an extra folder, so a new log dir can still
+// learn from the previous sweep. A log counts when the task matches
+// and every swept value is in range. The next run index is past every
+// sweep log already found.
+static int seed_sweep_history(Ini* ini, ProteinSweep* protein,
+        SweepSpace* space, SweepParam* params, int n_params) {
+    char log_dir[2048];
+    snprintf(log_dir, sizeof(log_dir), "%s/%s",
+        puf_ini_get_str(ini, "base", "log_dir"),
+        puf_ini_get_str(ini, "base", "env_name"));
+    int cap = 0;
+    int n = 0;
+    SweepHist* logs = NULL;
+    sweep_hist_scan(&logs, &n, &cap, log_dir);
+    Dict* sweep = find_section(ini, "sweep");
+    DictItem* extra = sweep ? dict_find(sweep, "history_dir") : NULL;
+    if (extra && extra->str && extra->str[0]) {
+        sweep_hist_scan(&logs, &n, &cap, extra->str);
+    }
     if (n == 0) {
         free(logs);
         return 0;
@@ -3784,10 +5271,8 @@ static int seed_sweep_history(Ini* ini, ProteinSweep* protein,
         if (logs[i].run + 1 > next_run) {
             next_run = logs[i].run + 1;
         }
-        char path[4096];
-        snprintf(path, sizeof(path), "%s/%s", log_dir, logs[i].name);
         Ini hist = {0};
-        puf_ini_load_file(&hist, path);
+        puf_ini_load_file(&hist, logs[i].path);
         if (!sweep_task_matches(ini, &hist, params, n_params)) {
             puf_ini_free(&hist);
             continue;
@@ -4485,12 +5970,13 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     long local_timesteps = total_timesteps / ctx->world_size;
     long train_epochs = local_timesteps / batch_size;
     long checkpoint_interval = puf_ini_get(ini, "base", "checkpoint_interval");
-    // About 64 advantage histograms across the run, at least one rollout apart.
     pufferl->adv_snap_cap = 65;
-    pufferl->adv_every = (int)((train_epochs + 63) / 64);
-    if (pufferl->adv_every < 1) {
-        pufferl->adv_every = 1;
+    int advantage_every = (int)puf_ini_get(ini, "train", "advantage_every");
+    if (advantage_every < 0) {
+        advantage_every = 0;
     }
+    pufferl->adv_every = advantage_every;
+    pufferl->diag_every = advantage_every;
     pufferl->adv_snaps = (AdvSnap*)calloc(
         pufferl->adv_snap_cap, sizeof(AdvSnap));
     pufferl->adv_snap_n = 0;
@@ -4613,6 +6099,28 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         adv_reduce(mom[0], mom[1], mom[2], adv_n, &adv_abs, &adv_var);
         dict_set(&new_log, "adv/mean_abs", adv_abs);
         dict_set(&new_log, "adv/var", adv_var);
+        dict_set(&new_log, "value/explained_var", pufferl->explained_var);
+        dict_set(&new_log, "adv/ep0_mean", pufferl->diag.ep0_mean);
+        dict_set(&new_log, "adv/ep_last_mean", pufferl->diag.ep_last_mean);
+        dict_set(&new_log, "adv/pearson_shared", pufferl->diag.pearson_shared);
+        dict_set(&new_log, "adv/spearman_shared",
+            pufferl->diag.spearman_shared);
+        dict_set(&new_log, "adv/pearson_actor", pufferl->diag.pearson_actor);
+        dict_set(&new_log, "adv/spearman_actor",
+            pufferl->diag.spearman_actor);
+        dict_set(&new_log, "adv/pearson_critic",
+            pufferl->diag.pearson_critic);
+        dict_set(&new_log, "adv/spearman_critic",
+            pufferl->diag.spearman_critic);
+        dict_set(&new_log, "adv/grad_norm_shared",
+            pufferl->diag.mean_shared);
+        dict_set(&new_log, "adv/grad_norm_actor_head",
+            pufferl->diag.mean_actor);
+        dict_set(&new_log, "adv/grad_norm_critic_head",
+            pufferl->diag.mean_critic);
+        dict_set(&new_log, "adv/clip_frac", pufferl->diag.clip_frac);
+        dict_set(&new_log, "adv/ratio_trunk", pufferl->diag.ratio_trunk);
+        dict_set(&new_log, "adv/share_top", pufferl->diag.share_top);
 
         log_util(pufferl, &new_log);
 
@@ -4696,6 +6204,29 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         && pool_games > 0 && final_checkpoint[0];
     if (final_checkpoint[0]) {
         puf_ini_put(ini, "base.load_model_path", final_checkpoint);
+    }
+    // Last rollout: difficulty d in [0, 1] and mean |A| on that copy.
+    // Captured before close frees the envs. d = 0 is an easy copy.
+    int hard_n = 0;
+    float* hard_d = NULL;
+    float* hard_a = NULL;
+    if (ctx->artifact_owner && pufferl->vec && pufferl->vec->envs
+            && PUF_BACKEND != PUF_GPU) {
+        int nenv = pufferl->vec->size;
+        hard_d = (float*)malloc((size_t)nenv * sizeof(float));
+        hard_a = (float*)malloc((size_t)nenv * sizeof(float));
+        if (hard_d && hard_a) {
+            hard_n = nenv;
+            for (int e = 0; e < nenv; e++) {
+                hard_d[e] = pufferl->vec->envs[e].d_e;
+                hard_a[e] = pufferl->vec->envs[e].curr_abs;
+            }
+        } else {
+            free(hard_d);
+            free(hard_a);
+            hard_d = NULL;
+            hard_a = NULL;
+        }
     }
     // Write the curve before close. A missing map used to abort after the
     // checkpoint was saved and before this log existed.
@@ -4824,6 +6355,22 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             }
             free(out);
         }
+        if (hard_n > 0 && hard_d && hard_a) {
+            fprintf(fp, "\n[hardness]\n");
+            fprintf(fp, "d = ");
+            for (int e = 0; e < hard_n; e++) {
+                fprintf(fp, "%s%.8g", e ? "," : "", hard_d[e]);
+            }
+            fprintf(fp, "\nabs = ");
+            for (int e = 0; e < hard_n; e++) {
+                fprintf(fp, "%s%.8g", e ? "," : "", hard_a[e]);
+            }
+            fputc('\n', fp);
+        }
+        free(hard_d);
+        free(hard_a);
+        hard_d = NULL;
+        hard_a = NULL;
         if (pufferl->adv_snap_n > 0) {
             int nsnap = pufferl->adv_snap_n;
             fprintf(fp, "\n[advantage]\n");
@@ -4848,6 +6395,92 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
                     fprintf(fp, "%s%u", i ? "," : "",
                         pufferl->adv_snaps[i].bin[b]);
                 }
+            }
+            fputc('\n', fp);
+        }
+        if (pufferl->diag.snap_n > 0) {
+            int nsnap = pufferl->diag.snap_n;
+            fprintf(fp, "\n[adv_diag]\n");
+            fprintf(fp, "bin_width = %d\n", DIAG_EP_BIN);
+            fprintf(fp, "step = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].step);
+            }
+            fprintf(fp, "\nep0_mean = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].ep0_mean);
+            }
+            fprintf(fp, "\nep_last_mean = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].ep_last_mean);
+            }
+            fprintf(fp, "\nexplained_var = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].explained_var);
+            }
+            fprintf(fp, "\nratio_trunk = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].ratio_trunk);
+            }
+            fprintf(fp, "\nshare_top = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].share_top);
+            }
+            fprintf(fp, "\npearson_shared = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].pearson_shared);
+            }
+            fprintf(fp, "\nspearman_shared = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].spearman_shared);
+            }
+            fprintf(fp, "\npearson_actor = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].pearson_actor);
+            }
+            fprintf(fp, "\nspearman_actor = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].spearman_actor);
+            }
+            fprintf(fp, "\npearson_critic = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].pearson_critic);
+            }
+            fprintf(fp, "\nspearman_critic = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].spearman_critic);
+            }
+            fprintf(fp, "\ngrad_norm_shared = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].mean_shared);
+            }
+            fprintf(fp, "\ngrad_norm_actor_head = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].mean_actor);
+            }
+            fprintf(fp, "\ngrad_norm_critic_head = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].mean_critic);
+            }
+            fprintf(fp, "\nclip_frac = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->diag.snaps[i].clip_frac);
             }
             fputc('\n', fp);
         }

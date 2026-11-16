@@ -3,21 +3,22 @@
 // Drive entity encoder. Included by src/ocean.cu.
 //
 // Each ego, partner, and road token goes through its own
-// Linear -> LayerNorm -> Linear. There is no activation between the
-// two linears. The last road feature is a class in 0..6 and becomes a
-// 7-way one-hot; the first 6 features stay continuous.
+// Linear -> LayerNorm -> SiLU -> Linear. SiLU is the pointwise
+// nonlinearity; without it the tower is two affine maps around a norm.
+// The last road feature is a class in 0..6 and becomes a 7-way one-hot;
+// the first 6 features stay continuous.
 //
-// Those tokens are not pooled. Four learned queries cross-attend to the
-// full sequence ego | road | partner, including zero padding, with no
-// mask. That is the PyTorch module with this env's real lengths:
-// 1 ego, MAX_ROAD_SEGMENT_OBSERVATIONS roads, MAX_AGENTS partners.
-// Multi-head attention matches nn.MultiheadAttention (batch_first,
-// bias, dropout 0): separate Q, K, V linears, scale 1/sqrt(head_dim),
-// softmax over keys, output linear. Residual adds the unprojected
-// queries, then LayerNorm over the embed dim, a linear back to hidden,
-// and tanh.
+// Those tokens are not pooled. Four learned queries cross-attend
+// ego | road | partner. The MLP output is both the key and the value,
+// so there is no second projection per token. An all-zero partner or
+// road slot is padding and is masked out of the softmax. A zero road
+// would otherwise look like a lane at the origin, because class 0 is
+// ROAD_LANE. Width 64 uses 2 heads (dim 32). Width 128 and up keeps
+// 4 heads, each at least 32 wide. Scale is 1/sqrt(head_dim).
+// Residual adds the unprojected queries, then LayerNorm over the embed
+// dim, a linear back to hidden, and tanh.
 //
-// A batch that fits in one chunk leaves qproj, token embeddings, K, V,
+// A batch that fits in one chunk leaves qproj, the token embeddings,
 // context, and the pre-norm residual in scratch. Backward reuses them.
 // A larger batch recomputes each chunk from the saved observation.
 
@@ -29,15 +30,21 @@
 #define DRIVE_ROAD_IN (DRIVE_ROAD_CONT + DRIVE_ROAD_CLASSES)
 #define DRIVE_LN_ROWS 8
 #define DRIVE_ATTN_Q 4
-#define DRIVE_ATTN_HEADS 4
+#define DRIVE_ATTN_HEADS_MAX 4
 #define DRIVE_ATTN_S (1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS)
-#define DRIVE_ATTN_UNROLL 4
+#define DRIVE_MASK_LOGIT (-1.0e30f)
+
+// 16-wide heads leave half of each warp idle. Hidden 64 uses 2 heads.
+static int drive_attn_heads(int H) {
+    return H >= 128 ? DRIVE_ATTN_HEADS_MAX : 2;
+}
 
 struct DriveEncWeights {
     Prec ego_w1, ego_b1, ego_lng, ego_lnb, ego_w2, ego_b2;
     Prec part_w1, part_b1, part_lng, part_lnb, part_w2, part_b2;
     Prec road_w1, road_b1, road_lng, road_lnb, road_w2, road_b2;
-    Prec q_lat, wq, bq, wk, bk, wv, bv, wo, bo;
+    Prec q_lat, wq, bq;
+    Prec wo, bo;
     Prec attn_lng, attn_lnb, fc_w, fc_b;
     int hidden;
 };
@@ -58,8 +65,6 @@ enum {
     DRIVE_ACC_ROAD_G,
     DRIVE_ACC_ROAD_B2,
     DRIVE_ACC_BQ,
-    DRIVE_ACC_BK,
-    DRIVE_ACC_BV,
     DRIVE_ACC_BO,
     DRIVE_ACC_ATTN_BE,
     DRIVE_ACC_ATTN_G,
@@ -72,12 +77,13 @@ struct DriveEncActs {
     Prec ego_w1_g, ego_b1_g, ego_lng_g, ego_lnb_g, ego_w2_g, ego_b2_g;
     Prec part_w1_g, part_b1_g, part_lng_g, part_lnb_g, part_w2_g, part_b2_g;
     Prec road_w1_g, road_b1_g, road_lng_g, road_lnb_g, road_w2_g, road_b2_g;
-    Prec q_lat_g, wq_g, bq_g, wk_g, bk_g, wv_g, bv_g, wo_g, bo_g;
+    Prec q_lat_g, wq_g, bq_g;
+    Prec wo_g, bo_g;
     Prec attn_lng_g, attn_lnb_g, fc_w_g, fc_b_g;
     Prec pack, buf0, buf1, buf2, buf3;
-    Prec tok, ktok, vtok;
+    Prec tok;
     Prec qproj, ctx, proj, pre, hid, dq;
-    Float dqsum, acc_lat;
+    Float mask, dqsum, acc_lat;
     Float acc[DRIVE_ACC_N];
 };
 
@@ -244,288 +250,282 @@ __global__ void drive_ln_bwd_kernel(precision_t* dx, precision_t* dgamma,
     }
 }
 
-// Sequence layout in tok/ktok/vtok, row-major with a CHUNK stride so a
-// shorter chunk is still a contiguous prefix: ego, then every road, then
-// every partner. s == 0 is ego.
-__device__ precision_t* drive_grouped_ptr(precision_t* ego,
-        precision_t* road, precision_t* part, int r, int s, int H) {
+// One row's tokens are staged into shared memory as a contiguous
+// [S, H] slab. Ego, then roads, then partners. The MLP output is both
+// the key and the value, so the slab is loaded once per use.
+#define DRIVE_ATTN_THREADS 256
+
+// Token stride is H+2 bf16. H is a multiple of 8, so the step in
+// 4-byte banks is odd and a warp of consecutive keys does not collide.
+__device__ int drive_slab_stride(int H) {
+    return H + 2;
+}
+
+__device__ void drive_stage_row(precision_t* slab, const precision_t* ego,
+        const precision_t* road, const precision_t* part,
+        int r, int H, int tid, int nt) {
+    int stride = drive_slab_stride(H);
+    const precision_t* e = ego + (long)r * H;
+    for (int h = tid; h < H; h += nt) {
+        slab[h] = e[h];
+    }
+    int road_n = MAX_ROAD_SEGMENT_OBSERVATIONS * H;
+    const precision_t* rd = road + (long)r * road_n;
+    for (int i = tid; i < road_n; i += nt) {
+        int n = i / H;
+        int h = i - n * H;
+        slab[(1 + n) * stride + h] = rd[i];
+    }
+    int part_n = MAX_AGENTS * H;
+    const precision_t* pt = part + (long)r * part_n;
+    int base = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS;
+    for (int i = tid; i < part_n; i += nt) {
+        int n = i / H;
+        int h = i - n * H;
+        slab[(base + n) * stride + h] = pt[i];
+    }
+}
+
+__device__ void drive_scatter_row(precision_t* ego, precision_t* road,
+        precision_t* part, int r, int s, int h, int H, float v) {
+    precision_t bits = from_float(v);
     if (s == 0) {
-        return ego + (long)r * H;
+        ego[(long)r * H + h] = bits;
+        return;
     }
     if (s <= MAX_ROAD_SEGMENT_OBSERVATIONS) {
         int n = s - 1;
-        return road + ((long)r * MAX_ROAD_SEGMENT_OBSERVATIONS + n) * H;
+        road[((long)r * MAX_ROAD_SEGMENT_OBSERVATIONS + n) * H + h] = bits;
+        return;
     }
     int n = s - 1 - MAX_ROAD_SEGMENT_OBSERVATIONS;
-    return part + ((long)r * MAX_AGENTS + n) * H;
+    part[((long)r * MAX_AGENTS + n) * H + h] = bits;
 }
 
-__device__ float drive_grouped_at(const precision_t* ego,
-        const precision_t* road, const precision_t* part,
-        int r, int s, int h, int H) {
-    const precision_t* p = drive_grouped_ptr(
-        (precision_t*)ego, (precision_t*)road, (precision_t*)part,
-        r, s, H);
-    return to_float(p[h]);
+__device__ int drive_score_at(int head, int q, int s) {
+    return (head * DRIVE_ATTN_Q + q) * DRIVE_ATTN_S + s;
 }
 
-__device__ void drive_grouped_store(precision_t* ego, precision_t* road,
-        precision_t* part, int r, int s, int h, int H, float v) {
-    drive_grouped_ptr(ego, road, part, r, s, H)[h] = from_float(v);
-}
-
-// Pointer to token s of this row. ego / road / partner stay separate
-// allocations; the head slice is contiguous inside the token.
-__device__ const precision_t* drive_tok_ptr(const precision_t* ego,
-        const precision_t* road, const precision_t* part,
-        int r, int s, int H) {
-    return drive_grouped_ptr((precision_t*)ego, (precision_t*)road,
-        (precision_t*)part, r, s, H);
-}
-
-// Dots of every latent query with a run of keys. One K load feeds all
-// queries, and DRIVE_ATTN_UNROLL keys are fetched before the reductions.
-__device__ void drive_head_dots(float out[DRIVE_ATTN_Q][DRIVE_ATTN_S],
-        const precision_t* query, const precision_t* k_ego,
-        const precision_t* k_road, const precision_t* k_part,
-        int r, int head, int lane, int H, int apply_scale) {
-    int d = H / DRIVE_ATTN_HEADS;
-    int h0 = head * d;
-    float scale = apply_scale ? rsqrtf((float)d) : 1.0f;
-    for (int s0 = 0; s0 < DRIVE_ATTN_S; s0 += DRIVE_ATTN_UNROLL) {
-        int n = DRIVE_ATTN_S - s0;
-        if (n > DRIVE_ATTN_UNROLL) {
-            n = DRIVE_ATTN_UNROLL;
-        }
-        const precision_t* kp[DRIVE_ATTN_UNROLL];
-        #pragma unroll
-        for (int t = 0; t < DRIVE_ATTN_UNROLL; t++) {
-            kp[t] = 0;
-            if (t < n) {
-                kp[t] = drive_tok_ptr(
-                    k_ego, k_road, k_part, r, s0 + t, H);
-            }
-        }
-        float partial[DRIVE_ATTN_UNROLL][DRIVE_ATTN_Q];
-        #pragma unroll
-        for (int t = 0; t < DRIVE_ATTN_UNROLL; t++) {
-            #pragma unroll
-            for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-                partial[t][q] = 0.0f;
-            }
-        }
-        for (int i = lane; i < d; i += 32) {
-            float kv[DRIVE_ATTN_UNROLL];
-            #pragma unroll
-            for (int t = 0; t < DRIVE_ATTN_UNROLL; t++) {
-                kv[t] = 0.0f;
-                if (t < n) {
-                    kv[t] = to_float(kp[t][h0 + i]);
-                }
-            }
-            #pragma unroll
-            for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-                float qv = to_float(query[q * H + h0 + i]);
-                #pragma unroll
-                for (int t = 0; t < DRIVE_ATTN_UNROLL; t++) {
-                    partial[t][q] += qv * kv[t];
-                }
-            }
-        }
-        #pragma unroll
-        for (int t = 0; t < DRIVE_ATTN_UNROLL; t++) {
-            #pragma unroll
-            for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-                float dot = drive_warp_sum(partial[t][q]) * scale;
-                if (lane == 0 && t < n) {
-                    out[q][s0 + t] = dot;
-                }
-            }
-        }
+__device__ float drive_dot_d(const precision_t* qv, const precision_t* kv,
+        int d) {
+    float dot = 0.0f;
+    int i = 0;
+    for (; i + 3 < d; i += 4) {
+        dot += to_float(qv[i]) * to_float(kv[i]);
+        dot += to_float(qv[i + 1]) * to_float(kv[i + 1]);
+        dot += to_float(qv[i + 2]) * to_float(kv[i + 2]);
+        dot += to_float(qv[i + 3]) * to_float(kv[i + 3]);
     }
-    __syncwarp();
-}
-
-__device__ void drive_attn_softmax(float P[DRIVE_ATTN_Q][DRIVE_ATTN_S],
-        int lane) {
-    if (lane == 0) {
-        for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-            float m = P[q][0];
-            for (int s = 1; s < DRIVE_ATTN_S; s++) {
-                if (P[q][s] > m) {
-                    m = P[q][s];
-                }
-            }
-            float sum = 0.0f;
-            for (int s = 0; s < DRIVE_ATTN_S; s++) {
-                float e = expf(P[q][s] - m);
-                P[q][s] = e;
-                sum += e;
-            }
-            float inv = 1.0f / sum;
-            for (int s = 0; s < DRIVE_ATTN_S; s++) {
-                P[q][s] *= inv;
-            }
-        }
+    for (; i < d; i++) {
+        dot += to_float(qv[i]) * to_float(kv[i]);
     }
-    __syncwarp();
+    return dot;
 }
 
-// One warp per head, one block per row. Q is shared by every row.
+// 256 threads, one block per row. Scores sit after the padded slab.
+// Masked keys are a large negative logit before the softmax.
 __global__ void drive_xattn_fwd_kernel(precision_t* ctx,
-        const precision_t* Q, const precision_t* k_ego,
-        const precision_t* k_road, const precision_t* k_part,
-        const precision_t* v_ego, const precision_t* v_road,
-        const precision_t* v_part, int H) {
+        const precision_t* Q, const precision_t* ego,
+        const precision_t* road, const precision_t* part,
+        const float* mask, int H, int heads) {
+    extern __shared__ __align__(16) char drive_attn_smem[];
     int r = blockIdx.x;
-    int head = threadIdx.y;
-    int lane = threadIdx.x;
-    int d = H / DRIVE_ATTN_HEADS;
-    int h0 = head * d;
-    __shared__ float P[DRIVE_ATTN_HEADS][DRIVE_ATTN_Q][DRIVE_ATTN_S];
-    drive_head_dots(P[head], Q, k_ego, k_road, k_part,
-        r, head, lane, H, 1);
-    drive_attn_softmax(P[head], lane);
-    for (int i = lane; i < d; i += 32) {
-        float acc[DRIVE_ATTN_Q];
-        #pragma unroll
-        for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-            acc[q] = 0.0f;
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
+    int d = H / heads;
+    int stride = drive_slab_stride(H);
+    float scale = rsqrtf((float)d);
+    int slab_n = DRIVE_ATTN_S * stride;
+    precision_t* slab = (precision_t*)drive_attn_smem;
+    float* scores = (float*)(slab + slab_n);
+    const float* row_mask = mask + (long)r * DRIVE_ATTN_S;
+    drive_stage_row(slab, ego, road, part, r, H, tid, nt);
+    __syncthreads();
+    int ndot = heads * DRIVE_ATTN_Q * DRIVE_ATTN_S;
+    for (int job = tid; job < ndot; job += nt) {
+        int s = job % DRIVE_ATTN_S;
+        int t = job / DRIVE_ATTN_S;
+        int q = t % DRIVE_ATTN_Q;
+        int head = t / DRIVE_ATTN_Q;
+        int h0 = head * d;
+        float dot = DRIVE_MASK_LOGIT;
+        if (row_mask[s] != 0.0f) {
+            const precision_t* kv = slab + s * stride + h0;
+            const precision_t* qv = Q + (long)q * H + h0;
+            dot = drive_dot_d(qv, kv, d) * scale;
         }
-        int h = h0 + i;
-        for (int s0 = 0; s0 < DRIVE_ATTN_S; s0 += DRIVE_ATTN_UNROLL) {
-            int n = DRIVE_ATTN_S - s0;
-            if (n > DRIVE_ATTN_UNROLL) {
-                n = DRIVE_ATTN_UNROLL;
-            }
-            float vv[DRIVE_ATTN_UNROLL];
-            #pragma unroll
-            for (int t = 0; t < DRIVE_ATTN_UNROLL; t++) {
-                vv[t] = 0.0f;
-                if (t < n) {
-                    vv[t] = drive_grouped_at(
-                        v_ego, v_road, v_part, r, s0 + t, h, H);
-                }
-            }
-            #pragma unroll
-            for (int t = 0; t < DRIVE_ATTN_UNROLL; t++) {
-                #pragma unroll
-                for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-                    acc[q] += P[head][q][s0 + t] * vv[t];
-                }
+        scores[drive_score_at(head, q, s)] = dot;
+    }
+    __syncthreads();
+    int nsoft = heads * DRIVE_ATTN_Q;
+    if (tid < nsoft) {
+        int head = tid / DRIVE_ATTN_Q;
+        int q = tid - head * DRIVE_ATTN_Q;
+        float* row = scores + (head * DRIVE_ATTN_Q + q) * DRIVE_ATTN_S;
+        float m = row[0];
+        for (int s = 1; s < DRIVE_ATTN_S; s++) {
+            if (row[s] > m) {
+                m = row[s];
             }
         }
-        #pragma unroll
-        for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-            long o = (((long)r * DRIVE_ATTN_Q) + q) * H + h;
-            ctx[o] = from_float(acc[q]);
+        float sum = 0.0f;
+        for (int s = 0; s < DRIVE_ATTN_S; s++) {
+            float e = expf(row[s] - m);
+            row[s] = e;
+            sum += e;
         }
+        float inv = 1.0f / sum;
+        for (int s = 0; s < DRIVE_ATTN_S; s++) {
+            row[s] *= inv;
+        }
+    }
+    __syncthreads();
+    int nout = DRIVE_ATTN_Q * H;
+    for (int job = tid; job < nout; job += nt) {
+        int h = job % H;
+        int q = job / H;
+        int head = h / d;
+        const float* p = scores + (head * DRIVE_ATTN_Q + q) * DRIVE_ATTN_S;
+        float acc = 0.0f;
+        for (int s = 0; s < DRIVE_ATTN_S; s++) {
+            acc += p[s] * to_float(slab[s * stride + h]);
+        }
+        long o = (((long)r * DRIVE_ATTN_Q) + q) * H + h;
+        ctx[o] = from_float(acc);
     }
 }
 
-// dK and dV overwrite K and V. Each head owns a disjoint H slice, so a
-// warp only has to finish its own reads before it writes that slice.
+// Writes dK+dV over the token embeddings. dQ is one row of the batch.
+// P and dS sit after the slab.
 __global__ void drive_xattn_bwd_kernel(precision_t* dQ,
         const precision_t* dctx, const precision_t* Q,
-        precision_t* k_ego, precision_t* k_road, precision_t* k_part,
-        precision_t* v_ego, precision_t* v_road, precision_t* v_part,
-        int H) {
+        precision_t* ego, precision_t* road, precision_t* part,
+        const float* mask, int H, int heads) {
+    extern __shared__ __align__(16) char drive_attn_smem[];
     int r = blockIdx.x;
-    int head = threadIdx.y;
-    int lane = threadIdx.x;
-    int d = H / DRIVE_ATTN_HEADS;
-    int h0 = head * d;
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
+    int d = H / heads;
+    int stride = drive_slab_stride(H);
     float scale = rsqrtf((float)d);
-    __shared__ float P[DRIVE_ATTN_HEADS][DRIVE_ATTN_Q][DRIVE_ATTN_S];
-    __shared__ float dS[DRIVE_ATTN_HEADS][DRIVE_ATTN_Q][DRIVE_ATTN_S];
-    drive_head_dots(P[head], Q, k_ego, k_road, k_part,
-        r, head, lane, H, 1);
-    drive_attn_softmax(P[head], lane);
+    int slab_n = DRIVE_ATTN_S * stride;
+    int score_n = DRIVE_ATTN_HEADS_MAX * DRIVE_ATTN_Q * DRIVE_ATTN_S;
+    precision_t* slab = (precision_t*)drive_attn_smem;
+    float* scores = (float*)(slab + slab_n);
+    float* dSrow = scores + score_n;
+    const float* row_mask = mask + (long)r * DRIVE_ATTN_S;
     const precision_t* row_dy = dctx + ((long)r * DRIVE_ATTN_Q) * H;
-    drive_head_dots(dS[head], row_dy, v_ego, v_road, v_part,
-        r, head, lane, H, 0);
-    if (lane == 0) {
-        for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-            float sum = 0.0f;
-            for (int s = 0; s < DRIVE_ATTN_S; s++) {
-                sum += dS[head][q][s] * P[head][q][s];
-            }
-            for (int s = 0; s < DRIVE_ATTN_S; s++) {
-                float p = P[head][q][s];
-                dS[head][q][s] = p * (dS[head][q][s] - sum);
+    drive_stage_row(slab, ego, road, part, r, H, tid, nt);
+    __syncthreads();
+    int ndot = heads * DRIVE_ATTN_Q * DRIVE_ATTN_S;
+    for (int job = tid; job < ndot; job += nt) {
+        int s = job % DRIVE_ATTN_S;
+        int t = job / DRIVE_ATTN_S;
+        int q = t % DRIVE_ATTN_Q;
+        int head = t / DRIVE_ATTN_Q;
+        int h0 = head * d;
+        float dot = DRIVE_MASK_LOGIT;
+        if (row_mask[s] != 0.0f) {
+            const precision_t* kv = slab + s * stride + h0;
+            const precision_t* qv = Q + (long)q * H + h0;
+            dot = drive_dot_d(qv, kv, d) * scale;
+        }
+        scores[drive_score_at(head, q, s)] = dot;
+    }
+    __syncthreads();
+    int nsoft = heads * DRIVE_ATTN_Q;
+    if (tid < nsoft) {
+        int head = tid / DRIVE_ATTN_Q;
+        int q = tid - head * DRIVE_ATTN_Q;
+        float* row = scores + (head * DRIVE_ATTN_Q + q) * DRIVE_ATTN_S;
+        float m = row[0];
+        for (int s = 1; s < DRIVE_ATTN_S; s++) {
+            if (row[s] > m) {
+                m = row[s];
             }
         }
+        float sum = 0.0f;
+        for (int s = 0; s < DRIVE_ATTN_S; s++) {
+            float e = expf(row[s] - m);
+            row[s] = e;
+            sum += e;
+        }
+        float inv = 1.0f / sum;
+        for (int s = 0; s < DRIVE_ATTN_S; s++) {
+            row[s] *= inv;
+        }
     }
-    __syncwarp();
-    for (int i = lane; i < d; i += 32) {
-        int h = h0 + i;
-        float dy[DRIVE_ATTN_Q];
-        #pragma unroll
-        for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-            dy[q] = to_float(row_dy[q * H + h]);
+    __syncthreads();
+    for (int job = tid; job < ndot; job += nt) {
+        int s = job % DRIVE_ATTN_S;
+        int t = job / DRIVE_ATTN_S;
+        int q = t % DRIVE_ATTN_Q;
+        int head = t / DRIVE_ATTN_Q;
+        int h0 = head * d;
+        const precision_t* vv = slab + s * stride + h0;
+        const precision_t* dy = row_dy + (long)q * H + h0;
+        dSrow[drive_score_at(head, q, s)] = drive_dot_d(dy, vv, d);
+    }
+    __syncthreads();
+    if (tid < nsoft) {
+        int head = tid / DRIVE_ATTN_Q;
+        int q = tid - head * DRIVE_ATTN_Q;
+        float* prow = scores + (head * DRIVE_ATTN_Q + q) * DRIVE_ATTN_S;
+        float* drow = dSrow + (head * DRIVE_ATTN_Q + q) * DRIVE_ATTN_S;
+        float sum = 0.0f;
+        for (int s = 0; s < DRIVE_ATTN_S; s++) {
+            sum += drow[s] * prow[s];
         }
         for (int s = 0; s < DRIVE_ATTN_S; s++) {
-            float g = 0.0f;
-            #pragma unroll
-            for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-                g += P[head][q][s] * dy[q];
-            }
-            drive_grouped_store(v_ego, v_road, v_part, r, s, h, H, g);
+            float p = prow[s];
+            drow[s] = p * (drow[s] - sum);
         }
     }
-    for (int i = lane; i < d; i += 32) {
-        int h = h0 + i;
-        float acc[DRIVE_ATTN_Q];
-        #pragma unroll
-        for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-            acc[q] = 0.0f;
-        }
-        for (int s0 = 0; s0 < DRIVE_ATTN_S; s0 += DRIVE_ATTN_UNROLL) {
-            int n = DRIVE_ATTN_S - s0;
-            if (n > DRIVE_ATTN_UNROLL) {
-                n = DRIVE_ATTN_UNROLL;
-            }
-            float kv[DRIVE_ATTN_UNROLL];
-            #pragma unroll
-            for (int t = 0; t < DRIVE_ATTN_UNROLL; t++) {
-                kv[t] = 0.0f;
-                if (t < n) {
-                    kv[t] = drive_grouped_at(
-                        k_ego, k_road, k_part, r, s0 + t, h, H);
-                }
-            }
-            #pragma unroll
-            for (int t = 0; t < DRIVE_ATTN_UNROLL; t++) {
-                #pragma unroll
-                for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-                    acc[q] += dS[head][q][s0 + t] * scale * kv[t];
-                }
-            }
-        }
-        #pragma unroll
-        for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-            long o = (((long)r * DRIVE_ATTN_Q) + q) * H + h;
-            dQ[o] = from_float(acc[q]);
-        }
-    }
-    __syncwarp();
-    for (int i = lane; i < d; i += 32) {
-        int h = h0 + i;
-        float qv[DRIVE_ATTN_Q];
-        #pragma unroll
-        for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-            qv[q] = to_float(Q[q * H + h]);
-        }
+    __syncthreads();
+    int nout = DRIVE_ATTN_Q * H;
+    for (int job = tid; job < nout; job += nt) {
+        int h = job % H;
+        int q = job / H;
+        int head = h / d;
+        const float* ds = dSrow + (head * DRIVE_ATTN_Q + q) * DRIVE_ATTN_S;
+        float acc = 0.0f;
         for (int s = 0; s < DRIVE_ATTN_S; s++) {
-            float gk = 0.0f;
-            #pragma unroll
-            for (int q = 0; q < DRIVE_ATTN_Q; q++) {
-                gk += dS[head][q][s] * scale * qv[q];
-            }
-            drive_grouped_store(k_ego, k_road, k_part, r, s, h, H, gk);
+            acc += ds[s] * scale * to_float(slab[s * stride + h]);
         }
+        long o = (((long)r * DRIVE_ATTN_Q) + q) * H + h;
+        dQ[o] = from_float(acc);
+    }
+    int ntok = DRIVE_ATTN_S * H;
+    for (int job = tid; job < ntok; job += nt) {
+        int s = job / H;
+        int h = job - s * H;
+        int head = h / d;
+        float dv = 0.0f;
+        float dk = 0.0f;
+        for (int q = 0; q < DRIVE_ATTN_Q; q++) {
+            int at = drive_score_at(head, q, s);
+            float dy = to_float(row_dy[(long)q * H + h]);
+            dv += scores[at] * dy;
+            dk += dSrow[at] * scale * to_float(Q[(long)q * H + h]);
+        }
+        drive_scatter_row(ego, road, part, r, s, h, H, dv + dk);
     }
 }
+
+static int drive_attn_bytes(int H, int score_sets) {
+    int stride = H + 2;
+    int slab = DRIVE_ATTN_S * stride * (int)sizeof(precision_t);
+    int scores = DRIVE_ATTN_HEADS_MAX * DRIVE_ATTN_Q * DRIVE_ATTN_S
+        * (int)sizeof(float);
+    return slab + score_sets * scores;
+}
+
+static void drive_attn_allow_smem(const void* fn) {
+    cudaError_t st = cudaFuncSetAttribute(fn,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+    assert(st == cudaSuccess);
+}
+
 
 __global__ void drive_residual_kernel(precision_t* pre,
         const precision_t* proj, const precision_t* lat,
@@ -538,6 +538,63 @@ __global__ void drive_residual_kernel(precision_t* pre,
     int q = (i / H) % DRIVE_ATTN_Q;
     float s = to_float(proj[i]) + to_float(lat[q * H + h]);
     pre[i] = from_float(s);
+}
+
+__global__ void drive_silu_kernel(precision_t* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = to_float(y[i]);
+        float sig = 1.0f / (1.0f + expf(-v));
+        y[i] = from_float(v * sig);
+    }
+}
+
+// dy is the grad of silu(x). x is the pre-activation.
+__global__ void drive_silu_bwd_kernel(precision_t* dy, const precision_t* x,
+        int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = to_float(x[i]);
+        float sig = 1.0f / (1.0f + expf(-v));
+        float ds = sig * (1.0f + v * (1.0f - sig));
+        dy[i] = from_float(to_float(dy[i]) * ds);
+    }
+}
+
+// Sequence order is ego, roads, partners. A slot whose raw features are
+// all zero is padding. Ego is always a real token.
+__global__ void drive_mask_kernel(float* mask, const precision_t* obs,
+        int rows, int obs_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * DRIVE_ATTN_S;
+    if (idx >= total) {
+        return;
+    }
+    int s = idx % DRIVE_ATTN_S;
+    int r = idx / DRIVE_ATTN_S;
+    const precision_t* row = obs + (long)r * obs_size;
+    int valid = 1;
+    if (s > 0 && s <= MAX_ROAD_SEGMENT_OBSERVATIONS) {
+        int n = s - 1;
+        int off = EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS
+            + n * ROAD_FEATURES;
+        valid = 0;
+        for (int k = 0; k < ROAD_FEATURES; k++) {
+            if (to_float(row[off + k]) != 0.0f) {
+                valid = 1;
+            }
+        }
+    } else if (s > MAX_ROAD_SEGMENT_OBSERVATIONS) {
+        int n = s - 1 - MAX_ROAD_SEGMENT_OBSERVATIONS;
+        int off = EGO_FEATURES + n * PARTNER_FEATURES;
+        valid = 0;
+        for (int k = 0; k < PARTNER_FEATURES; k++) {
+            if (to_float(row[off + k]) != 0.0f) {
+                valid = 1;
+            }
+        }
+    }
+    mask[idx] = valid ? 1.0f : 0.0f;
 }
 
 __global__ void drive_tanh_kernel(precision_t* y, int n) {
@@ -751,6 +808,22 @@ static void drive_ln_fwd(precision_t* y, precision_t* x,
     dim3 grid((rows + DRIVE_LN_ROWS - 1) / DRIVE_LN_ROWS);
     drive_ln_fwd_kernel<<<grid, block, 0, stream>>>(
         y, x, gamma, beta, H, rows);
+}
+
+static void drive_silu(precision_t* y, int n, cudaStream_t stream) {
+    drive_silu_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(y, n);
+}
+
+static void drive_silu_bwd(precision_t* dy, const precision_t* x, int n,
+        cudaStream_t stream) {
+    drive_silu_bwd_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dy, x, n);
+}
+
+static void drive_mask(float* mask, const precision_t* obs, int rows,
+        cudaStream_t stream) {
+    int n = rows * DRIVE_ATTN_S;
+    drive_mask_kernel<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        mask, obs, rows, OBS_SIZE);
 }
 
 // partial is a float view of a scratch buffer. It must not alias A, B, or C.
@@ -1061,6 +1134,7 @@ static void drive_mlp_fwd(Prec w1, Prec b1, Prec gamma, Prec beta,
         cudaStream_t stream) {
     drive_project(w1, b1, x, h1, tokens, feat, H, stream);
     drive_ln_fwd(ln, h1, gamma.data, beta.data, tokens, H, stream);
+    drive_silu(ln, tokens * H, stream);
     drive_project(w2, b2, ln, dest, tokens, H, H, stream);
 }
 
@@ -1078,20 +1152,17 @@ static precision_t* drive_part_ptr(precision_t* base, int H) {
         * (1 + MAX_ROAD_SEGMENT_OBSERVATIONS) * H;
 }
 
+// dest is the token embedding. Attention reads it as both key and value.
 static void drive_embed_group(Prec w1, Prec b1, Prec gamma, Prec beta,
-        Prec w2, Prec b2, Prec wk, Prec bk, Prec wv, Prec bv,
-        const precision_t* obs, int rows, int obs_size, int off,
-        int slots, int raw, int one_hot, int H,
+        Prec w2, Prec b2, const precision_t* obs, int rows, int obs_size,
+        int off, int slots, int raw, int one_hot, int H,
         precision_t* pack, precision_t* h1, precision_t* ln,
-        precision_t* h2, precision_t* K, precision_t* V,
-        cudaStream_t stream) {
+        precision_t* dest, cudaStream_t stream) {
     int feat = one_hot ? DRIVE_ROAD_IN : raw;
     int tokens = rows * slots;
     drive_pack(pack, obs, rows, obs_size, off, slots, raw, one_hot, stream);
-    drive_mlp_fwd(w1, b1, gamma, beta, w2, b2, pack, h1, ln, h2,
+    drive_mlp_fwd(w1, b1, gamma, beta, w2, b2, pack, h1, ln, dest,
         tokens, feat, H, stream);
-    drive_project(wk, bk, h2, K, tokens, H, H, stream);
-    drive_project(wv, bv, h2, V, tokens, H, H, stream);
 }
 
 static void drive_fill_kv(DriveEncWeights* ew, DriveEncActs* a,
@@ -1100,41 +1171,33 @@ static void drive_fill_kv(DriveEncWeights* ew, DriveEncActs* a,
     int obs_size = OBS_SIZE;
     drive_project(ew->wq, ew->bq, ew->q_lat.data, a->qproj.data,
         DRIVE_ATTN_Q, H, H, stream);
+    drive_mask(a->mask.data, row, rows, stream);
     drive_embed_group(ew->ego_w1, ew->ego_b1, ew->ego_lng, ew->ego_lnb,
-        ew->ego_w2, ew->ego_b2, ew->wk, ew->bk, ew->wv, ew->bv,
-        row, rows, obs_size, 0, 1, EGO_FEATURES, 0, H,
-        a->pack.data, a->buf0.data, a->buf1.data,
-        drive_ego_ptr(a->tok.data, H),
-        drive_ego_ptr(a->ktok.data, H),
-        drive_ego_ptr(a->vtok.data, H), stream);
+        ew->ego_w2, ew->ego_b2, row, rows, obs_size, 0, 1, EGO_FEATURES, 0,
+        H, a->pack.data, a->buf0.data, a->buf1.data,
+        drive_ego_ptr(a->tok.data, H), stream);
     drive_embed_group(ew->road_w1, ew->road_b1, ew->road_lng, ew->road_lnb,
-        ew->road_w2, ew->road_b2, ew->wk, ew->bk, ew->wv, ew->bv,
-        row, rows, obs_size, EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS,
+        ew->road_w2, ew->road_b2, row, rows, obs_size,
+        EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS,
         MAX_ROAD_SEGMENT_OBSERVATIONS, ROAD_FEATURES, 1, H,
         a->pack.data, a->buf0.data, a->buf1.data,
-        drive_road_ptr(a->tok.data, H),
-        drive_road_ptr(a->ktok.data, H),
-        drive_road_ptr(a->vtok.data, H), stream);
+        drive_road_ptr(a->tok.data, H), stream);
     drive_embed_group(ew->part_w1, ew->part_b1, ew->part_lng, ew->part_lnb,
-        ew->part_w2, ew->part_b2, ew->wk, ew->bk, ew->wv, ew->bv,
-        row, rows, obs_size, EGO_FEATURES, MAX_AGENTS, PARTNER_FEATURES, 0,
-        H, a->pack.data, a->buf0.data, a->buf1.data,
-        drive_part_ptr(a->tok.data, H),
-        drive_part_ptr(a->ktok.data, H),
-        drive_part_ptr(a->vtok.data, H), stream);
+        ew->part_w2, ew->part_b2, row, rows, obs_size, EGO_FEATURES,
+        MAX_AGENTS, PARTNER_FEATURES, 0, H,
+        a->pack.data, a->buf0.data, a->buf1.data,
+        drive_part_ptr(a->tok.data, H), stream);
 }
 
 static void drive_xattn_launch(precision_t* ctx, DriveEncActs* a, int rows,
         int H, cudaStream_t stream) {
-    dim3 block(32, DRIVE_ATTN_HEADS);
-    drive_xattn_fwd_kernel<<<rows, block, 0, stream>>>(ctx,
-        a->qproj.data,
-        drive_ego_ptr(a->ktok.data, H),
-        drive_road_ptr(a->ktok.data, H),
-        drive_part_ptr(a->ktok.data, H),
-        drive_ego_ptr(a->vtok.data, H),
-        drive_road_ptr(a->vtok.data, H),
-        drive_part_ptr(a->vtok.data, H), H);
+    int heads = drive_attn_heads(H);
+    drive_xattn_fwd_kernel<<<rows, DRIVE_ATTN_THREADS,
+        drive_attn_bytes(H, 1), stream>>>(ctx, a->qproj.data,
+        drive_ego_ptr(a->tok.data, H),
+        drive_road_ptr(a->tok.data, H),
+        drive_part_ptr(a->tok.data, H),
+        a->mask.data, H, heads);
 }
 
 // ctx -> out-proj -> residual with the raw queries -> LayerNorm.
@@ -1177,15 +1240,20 @@ static void drive_tower_bwd(Prec w1, Prec b1, Prec gamma, Prec beta,
     int feat = one_hot ? DRIVE_ROAD_IN : raw;
     int tokens = rows * slots;
     drive_pack(pack, obs, rows, obs_size, off, slots, raw, one_hot, stream);
-    Prec ln = drive_view(buf1, tokens, H);
     drive_project(w1, b1, pack, buf0, tokens, feat, H, stream);
     drive_ln_fwd(buf1, buf0, gamma.data, beta.data, tokens, H, stream);
+    // buf2 keeps the pre-activation. w2's input is silu(buf1).
+    cudaMemcpyAsync(buf2, buf1, (size_t)tokens * H * sizeof(precision_t),
+        cudaMemcpyDeviceToDevice, stream);
+    drive_silu(buf1, tokens * H, stream);
     int partial_n = drive_partial_cap(H);
     drive_dw(w2g.data, dh, buf1, (float*)buf3, tokens, H, H,
         partial_n, stream);
     drive_colsum(acc_b2.data, dh, tokens, H, stream);
     Prec dhv = drive_view(dh, tokens, H);
-    puf_mm_nn(&dhv, &w2, &ln, stream);
+    Prec dact = drive_view(buf1, tokens, H);
+    puf_mm_nn(&dhv, &w2, &dact, stream);
+    drive_silu_bwd(buf1, buf2, tokens * H, stream);
     drive_colsum(acc_be.data, buf1, tokens, H, stream);
     dim3 ln_block(32, DRIVE_LN_ROWS);
     dim3 ln_grid((tokens + DRIVE_LN_ROWS - 1) / DRIVE_LN_ROWS);
@@ -1195,21 +1263,6 @@ static void drive_tower_bwd(Prec w1, Prec b1, Prec gamma, Prec beta,
     drive_dw(w1g.data, buf2, pack, (float*)buf3, tokens, H, feat,
         partial_n, stream);
     drive_colsum(acc_b1.data, buf2, tokens, H, stream);
-}
-
-static void drive_group_bwd(Prec wk, Prec wv, Prec wkg, Prec wvg,
-        Float acc_bk, Float acc_bv, precision_t* h2, precision_t* dK,
-        precision_t* dV, float* partial, int tokens, int H,
-        int partial_n, cudaStream_t stream) {
-    drive_dw(wkg.data, dK, h2, partial, tokens, H, H, partial_n, stream);
-    drive_dw(wvg.data, dV, h2, partial, tokens, H, H, partial_n, stream);
-    drive_colsum(acc_bk.data, dK, tokens, H, stream);
-    drive_colsum(acc_bv.data, dV, tokens, H, stream);
-    Prec dk = drive_view(dK, tokens, H);
-    Prec dv = drive_view(dV, tokens, H);
-    Prec dh = drive_view(h2, tokens, H);
-    puf_mm_nn(&dk, &wk, &dh, stream, 1.0f, 0.0f);
-    puf_mm_nn(&dv, &wv, &dh, stream, 1.0f, 1.0f);
 }
 
 static void drive_chunk_bwd(DriveEncWeights* ew, DriveEncActs* a,
@@ -1253,40 +1306,22 @@ static void drive_chunk_bwd(DriveEncWeights* ew, DriveEncActs* a,
     Prec dpre = drive_view(a->proj.data, nq, H);
     Prec dctx = drive_view(a->ctx.data, nq, H);
     puf_mm_nn(&dpre, &ew->wo, &dctx, stream);
-    dim3 block(32, DRIVE_ATTN_HEADS);
-    drive_xattn_bwd_kernel<<<rows, block, 0, stream>>>(a->dq.data,
+    int heads = drive_attn_heads(H);
+    // Writes dK+dV over the token embeddings. Tower backward reads that
+    // as the gradient of the MLP output.
+    drive_xattn_bwd_kernel<<<rows, DRIVE_ATTN_THREADS,
+        drive_attn_bytes(H, 2), stream>>>(a->dq.data,
         a->ctx.data, a->qproj.data,
-        drive_ego_ptr(a->ktok.data, H),
-        drive_road_ptr(a->ktok.data, H),
-        drive_part_ptr(a->ktok.data, H),
-        drive_ego_ptr(a->vtok.data, H),
-        drive_road_ptr(a->vtok.data, H),
-        drive_part_ptr(a->vtok.data, H), H);
+        drive_ego_ptr(a->tok.data, H),
+        drive_road_ptr(a->tok.data, H),
+        drive_part_ptr(a->tok.data, H),
+        a->mask.data, H, heads);
     int nsum = DRIVE_ATTN_Q * H;
     drive_dq_sum_kernel<<<grid_size(nsum), BLOCK_SIZE, 0, stream>>>(
         a->dqsum.data, a->dq.data, rows, nsum);
     drive_dq_apply_kernel<<<grid_size(H * H), BLOCK_SIZE, 0, stream>>>(
         a->wq_g.data, a->acc[DRIVE_ACC_BQ].data, a->acc_lat.data,
         a->dqsum.data, ew->q_lat.data, ew->wq.data, H);
-    drive_group_bwd(ew->wk, ew->wv, a->wk_g, a->wv_g,
-        a->acc[DRIVE_ACC_BK], a->acc[DRIVE_ACC_BV],
-        drive_ego_ptr(a->tok.data, H),
-        drive_ego_ptr(a->ktok.data, H),
-        drive_ego_ptr(a->vtok.data, H),
-        (float*)a->buf3.data, rows, H, partial_n, stream);
-    drive_group_bwd(ew->wk, ew->wv, a->wk_g, a->wv_g,
-        a->acc[DRIVE_ACC_BK], a->acc[DRIVE_ACC_BV],
-        drive_road_ptr(a->tok.data, H),
-        drive_road_ptr(a->ktok.data, H),
-        drive_road_ptr(a->vtok.data, H),
-        (float*)a->buf3.data, rows * MAX_ROAD_SEGMENT_OBSERVATIONS,
-        H, partial_n, stream);
-    drive_group_bwd(ew->wk, ew->wv, a->wk_g, a->wv_g,
-        a->acc[DRIVE_ACC_BK], a->acc[DRIVE_ACC_BV],
-        drive_part_ptr(a->tok.data, H),
-        drive_part_ptr(a->ktok.data, H),
-        drive_part_ptr(a->vtok.data, H),
-        (float*)a->buf3.data, rows * MAX_AGENTS, H, partial_n, stream);
     drive_tower_bwd(ew->ego_w1, ew->ego_b1, ew->ego_lng, ew->ego_lnb,
         ew->ego_w2, ew->ego_b2, a->ego_w1_g, a->ego_w2_g,
         a->acc[DRIVE_ACC_EGO_B1], a->acc[DRIVE_ACC_EGO_BE],
@@ -1368,11 +1403,12 @@ static void drive_enc_backward(void* w, void* activations, Prec grad,
         &a->part_w2_g, &a->part_b2_g,
         &a->road_w1_g, &a->road_b1_g, &a->road_lng_g, &a->road_lnb_g,
         &a->road_w2_g, &a->road_b2_g,
-        &a->q_lat_g, &a->wq_g, &a->bq_g, &a->wk_g, &a->bk_g,
-        &a->wv_g, &a->bv_g, &a->wo_g, &a->bo_g,
+        &a->q_lat_g, &a->wq_g, &a->bq_g,
+        &a->wo_g, &a->bo_g,
         &a->attn_lng_g, &a->attn_lnb_g, &a->fc_w_g, &a->fc_b_g,
     };
-    for (int i = 0; i < 31; i++) {
+    int ngrad = (int)(sizeof(grads) / sizeof(grads[0]));
+    for (int i = 0; i < ngrad; i++) {
         drive_zero_prec(grads[i], stream);
     }
     for (int i = 0; i < DRIVE_ACC_N; i++) {
@@ -1403,13 +1439,36 @@ static void drive_enc_backward(void* w, void* activations, Prec grad,
     drive_store_acc(&a->road_lng_g, &a->acc[DRIVE_ACC_ROAD_G], stream);
     drive_store_acc(&a->road_b2_g, &a->acc[DRIVE_ACC_ROAD_B2], stream);
     drive_store_acc(&a->bq_g, &a->acc[DRIVE_ACC_BQ], stream);
-    drive_store_acc(&a->bk_g, &a->acc[DRIVE_ACC_BK], stream);
-    drive_store_acc(&a->bv_g, &a->acc[DRIVE_ACC_BV], stream);
     drive_store_acc(&a->bo_g, &a->acc[DRIVE_ACC_BO], stream);
     drive_store_acc(&a->attn_lnb_g, &a->acc[DRIVE_ACC_ATTN_BE], stream);
     drive_store_acc(&a->attn_lng_g, &a->acc[DRIVE_ACC_ATTN_G], stream);
     drive_store_acc(&a->fc_b_g, &a->acc[DRIVE_ACC_FC_B], stream);
     drive_store_acc(&a->q_lat_g, &a->acc_lat, stream);
+}
+
+// Parameter grads this backward just wrote. Same tensors it zeros.
+static int drive_enc_grad_spans(void* activations,
+        precision_t** data, int* n, int cap) {
+    DriveEncActs* a = (DriveEncActs*)activations;
+    Prec* grads[] = {
+        &a->ego_w1_g, &a->ego_b1_g, &a->ego_lng_g, &a->ego_lnb_g,
+        &a->ego_w2_g, &a->ego_b2_g,
+        &a->part_w1_g, &a->part_b1_g, &a->part_lng_g, &a->part_lnb_g,
+        &a->part_w2_g, &a->part_b2_g,
+        &a->road_w1_g, &a->road_b1_g, &a->road_lng_g, &a->road_lnb_g,
+        &a->road_w2_g, &a->road_b2_g,
+        &a->q_lat_g, &a->wq_g, &a->bq_g,
+        &a->wo_g, &a->bo_g,
+        &a->attn_lng_g, &a->attn_lnb_g, &a->fc_w_g, &a->fc_b_g,
+    };
+    int ngrad = (int)(sizeof(grads) / sizeof(grads[0]));
+    int c = 0;
+    for (int i = 0; i < ngrad && c < cap; i++) {
+        data[c] = grads[i]->data;
+        n[c] = (int)numel(grads[i]->shape);
+        c++;
+    }
+    return c;
 }
 
 static void drive_init_tower(Prec w1, Prec b1, Prec gamma, Prec beta,
@@ -1440,8 +1499,6 @@ static void drive_enc_init(void* w, ulong* seed, cudaStream_t stream) {
         ew->road_w2, ew->road_b2, seed, stream);
     puf_kaiming_init(&ew->q_lat, 1.0f, (*seed)++, stream);
     drive_init_square(ew->wq, ew->bq, seed, stream);
-    drive_init_square(ew->wk, ew->bk, seed, stream);
-    drive_init_square(ew->wv, ew->bv, seed, stream);
     drive_init_square(ew->wo, ew->bo, seed, stream);
     drive_fill(ew->attn_lnb.data, 0.0f, H, stream);
     drive_fill(ew->attn_lng.data, 1.0f, H, stream);
@@ -1476,7 +1533,8 @@ static void drive_reg_params(void* w, Allocator* alloc) {
     DriveEncWeights* ew = (DriveEncWeights*)w;
     int H = ew->hidden;
     assert(H > 0 && H % 8 == 0);
-    assert(H % DRIVE_ATTN_HEADS == 0);
+    assert(drive_attn_heads(H) <= DRIVE_ATTN_HEADS_MAX);
+    assert(H % drive_attn_heads(H) == 0);
     assert(H <= 4096);
     assert(DRIVE_ROAD_CLASSES == 7);
     assert(DRIVE_ATTN_S == 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS);
@@ -1494,10 +1552,6 @@ static void drive_reg_params(void* w, Allocator* alloc) {
     drive_reg_mat(alloc, &ew->q_lat, DRIVE_ATTN_Q, H);
     drive_reg_mat(alloc, &ew->wq, H, H);
     drive_reg_vec(alloc, &ew->bq, H);
-    drive_reg_mat(alloc, &ew->wk, H, H);
-    drive_reg_vec(alloc, &ew->bk, H);
-    drive_reg_mat(alloc, &ew->wv, H, H);
-    drive_reg_vec(alloc, &ew->bv, H);
     drive_reg_mat(alloc, &ew->wo, H, H);
     drive_reg_vec(alloc, &ew->bo, H);
     drive_reg_vec(alloc, &ew->attn_lng, H);
@@ -1515,14 +1569,14 @@ static void drive_reg_scratch(DriveEncActs* a, Allocator* alloc, int H) {
     drive_reg_mat(alloc, &a->buf2, road_tok, H);
     drive_reg_mat(alloc, &a->buf3, road_tok, H);
     drive_reg_mat(alloc, &a->tok, seq_tok, H);
-    drive_reg_mat(alloc, &a->ktok, seq_tok, H);
-    drive_reg_mat(alloc, &a->vtok, seq_tok, H);
     drive_reg_mat(alloc, &a->qproj, DRIVE_ATTN_Q, H);
     drive_reg_mat(alloc, &a->ctx, DRIVE_ENC_CHUNK * DRIVE_ATTN_Q, H);
     drive_reg_mat(alloc, &a->proj, DRIVE_ENC_CHUNK * DRIVE_ATTN_Q, H);
     drive_reg_mat(alloc, &a->pre, DRIVE_ENC_CHUNK * DRIVE_ATTN_Q, H);
     drive_reg_mat(alloc, &a->hid, DRIVE_ENC_CHUNK * DRIVE_ATTN_Q, H);
     drive_reg_mat(alloc, &a->dq, DRIVE_ENC_CHUNK * DRIVE_ATTN_Q, H);
+    a->mask = (Float){.shape = {DRIVE_ENC_CHUNK * DRIVE_ATTN_S}};
+    alloc_register(alloc, &a->mask);
 }
 
 static void drive_enc_reg_train(void* w, void* activations,
@@ -1553,10 +1607,6 @@ static void drive_enc_reg_train(void* w, void* activations,
     drive_reg_mat(grads, &a->q_lat_g, DRIVE_ATTN_Q, H);
     drive_reg_mat(grads, &a->wq_g, H, H);
     drive_reg_vec(grads, &a->bq_g, H);
-    drive_reg_mat(grads, &a->wk_g, H, H);
-    drive_reg_vec(grads, &a->bk_g, H);
-    drive_reg_mat(grads, &a->wv_g, H, H);
-    drive_reg_vec(grads, &a->bv_g, H);
     drive_reg_mat(grads, &a->wo_g, H, H);
     drive_reg_vec(grads, &a->bo_g, H);
     drive_reg_vec(grads, &a->attn_lng_g, H);
@@ -1586,7 +1636,10 @@ static void create_drive_encoder(Encoder* enc) {
     int out_dim = enc->out_dim;
     assert(in_dim == OBS_SIZE);
     assert(out_dim > 0 && out_dim % 8 == 0);
-    assert(out_dim % DRIVE_ATTN_HEADS == 0);
+    assert(out_dim % drive_attn_heads(out_dim) == 0);
+    // H=128 backward needs about 54 KB. The default dynamic cap is 48 KB.
+    drive_attn_allow_smem((const void*)drive_xattn_fwd_kernel);
+    drive_attn_allow_smem((const void*)drive_xattn_bwd_kernel);
     *enc = (Encoder){
         .forward = drive_enc_forward,
         .backward = drive_enc_backward,

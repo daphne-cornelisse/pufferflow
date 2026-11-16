@@ -60,7 +60,10 @@
 // ±OBS_YAW_ABS. Both are 0 on the first step of a life.
 // EGO_TARGET_SPEED is the target in m/s times OBS_SPEED_SCALE, the
 // same scale as index 2.
-#define EGO_FEATURES 9
+#define EGO_FEATURES 10
+// Sampled time headway in seconds, divided by 2.5. 0 when the
+// curriculum is off. The target speed stays in the last slot.
+#define EGO_HEADWAY (EGO_FEATURES - 2)
 #define EGO_TARGET_SPEED (EGO_FEATURES - 1)
 // km/h. Training reads target_speed and speed_band from the ini.
 // A target of 0 pays nothing. Offline uses this band.

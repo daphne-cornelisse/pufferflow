@@ -28,6 +28,9 @@ typedef struct Agent {
     float* terminals;
     unsigned char* action_mask;
     int policy;
+    // Flat trainer slot. Null on the CPU player. Holds the episode clock
+    // of the observation currently in the env buffer.
+    int* episode_step;
 } Agent;
 
 // Env backend identity. Trainer: if (PUF_BACKEND == PUF_GPU) — not #if.

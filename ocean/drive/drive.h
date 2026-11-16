@@ -174,6 +174,34 @@ struct Env {
     int num_roads;
     int timestep;
     int episode_length;
+    // Advantage curriculum. Standard copies and the burn-in leave
+    // curr_on at 0 and keep episode_length. Hard copies latch
+    // episode_limit on the next reset. hard_frac is the share of copies
+    // the trainer may mark hard, in [0, 0.8].
+    float d_e;
+    float hard_frac;
+    int max_episode_steps;
+    int episode_limit;
+    int curr_on;
+    int curr_standard;
+    float headway_mean;
+    float headway_std;
+    float headway_lo;
+    float headway_hi;
+    float tau_headway[DRIVE_AGENT_MAX];
+    // Rollout slot of each agent. Filled by the trainer after init.
+    int slot_of[DRIVE_AGENT_MAX];
+    // Mean |advantage| of the last scored rollout.
+    float curr_abs;
+    // Finished-episode sums since the last cleared log.
+    float grp_return;
+    float grp_coll;
+    float grp_len;
+    float grp_score;
+    float grp_n;
+    // Steps since this car's episode started. Goal respawn does not
+    // clear it. Truncation and a terminal do. Index is the agent slot.
+    int episode_step[DRIVE_AGENT_MAX];
     float* map_corners;
     int* grid_cells;
     int grid_cols;
@@ -185,7 +213,8 @@ struct Env {
     float reward_vehicle_collision;
     float reward_offroad_collision;
     char* map_name;
-    // Index of map_%03d.bin. 0 Town01, 1 Town02, 2 Town06, 3 Town10HD.
+    // Index of map_%03d.bin. 0 Town01, 1 Town02, 2 Town06,
+    // 3 Town10HD, 4 bottleneck.
     int map_id;
     float world_mean_x;
     float world_mean_y;
@@ -1264,6 +1293,7 @@ void compute_observations(Drive* env) {
         }
         obs[6] = accel_lag * OBS_ACCEL_SCALE;
         obs[7] = yaw_lag * OBS_YAW_SCALE;
+        obs[EGO_HEADWAY] = env->tau_headway[i] * (1.0f / 2.5f);
         obs[EGO_TARGET_SPEED] = env->target_speed * OBS_SPEED_SCALE;
         ego->dyn_speed = signed_speed;
         ego->dyn_heading = ego->heading;
@@ -1698,14 +1728,87 @@ void initialize_env(Drive* env) {
     }
 }
 
+static void publish_episode_step(Drive* env) {
+    int n = env->active_agent_count;
+    for (int i = 0; i < n; i++) {
+        int* dst = env->agents[i].episode_step;
+        if (dst) {
+            *dst = env->episode_step[i];
+        }
+    }
+}
+
+// d = 0 is the long highway headway. d = 1 is the short urban one.
+// on = 0 keeps the ini episode length and pays no headway penalty.
+static void drive_curriculum_set(Drive* env, float d, int on) {
+    if (d < 0.0f) {
+        d = 0.0f;
+    }
+    if (d > 1.0f) {
+        d = 1.0f;
+    }
+    env->d_e = d;
+    env->curr_on = on;
+    if (!on) {
+        env->max_episode_steps = env->episode_length;
+        env->headway_mean = 1.5f;
+        env->headway_std = 0.4f;
+        env->headway_lo = 0.8f;
+        env->headway_hi = 2.5f;
+        return;
+    }
+    float steps = 128.0f - d * (128.0f - 10.0f);
+    int rounded = (int)lroundf(steps);
+    if (rounded < 10) {
+        rounded = 10;
+    }
+    if (rounded > 128) {
+        rounded = 128;
+    }
+    env->max_episode_steps = rounded;
+    env->headway_mean = 1.5f + d * (0.35f - 1.5f);
+    env->headway_std = 0.4f + d * (0.10f - 0.4f);
+    env->headway_lo = 0.8f + d * (0.2f - 0.8f);
+    env->headway_hi = 2.5f + d * (0.6f - 2.5f);
+}
+
+static float curr_unit_normal(unsigned int* rng) {
+    float u1 = ((float)rand_r(rng) + 1.0f) / ((float)RAND_MAX + 2.0f);
+    float u2 = ((float)rand_r(rng) + 1.0f) / ((float)RAND_MAX + 2.0f);
+    return sqrtf(-2.0f * logf(u1)) * cosf(6.2831853f * u2);
+}
+
+static void sample_headway(Drive* env) {
+    int n = env->active_agent_count;
+    for (int i = 0; i < n; i++) {
+        float tau = 0.0f;
+        if (env->curr_on) {
+            tau = env->headway_mean
+                + env->headway_std * curr_unit_normal(&env->rng);
+            if (tau < env->headway_lo) {
+                tau = env->headway_lo;
+            }
+            if (tau > env->headway_hi) {
+                tau = env->headway_hi;
+            }
+        }
+        env->tau_headway[i] = tau;
+    }
+}
+
 void puf_reset(Drive* env) {
     env->timestep = 0;
+    env->episode_limit = env->curr_on
+        ? env->max_episode_steps : env->episode_length;
     set_start_position(env);
     initialize_env(env);
+    sample_headway(env);
     for (int i = 0; i < env->active_agent_count; i++) {
         env->logs[i] = (Log){0};
         env->entities[i].dyn_ready = 0;
+        env->episode_step[i] = 0;
     }
+    publish_episode_step(env);
     compute_observations(env);
 }
 
@@ -1918,6 +2021,78 @@ float speed_bonus(Drive* env, Entity* agent) {
     return SPEED_ALPHA * SIM_DT * align;
 }
 
+// Longitudinal gap to the nearest car ahead in the same corridor.
+// Negative when nobody is there. Meters.
+static float lead_gap(Drive* env, int agent_idx) {
+    Entity* ego = &env->entities[agent_idx];
+    float best = -1.0f;
+    float cos_h = ego->heading_x;
+    float sin_h = ego->heading_y;
+    int n = env->active_agent_count;
+    for (int j = 0; j < n; j++) {
+        Entity* other;
+        float dx;
+        float dy;
+        float lon;
+        float lat;
+        float dot;
+        if (j == agent_idx) {
+            continue;
+        }
+        other = &env->entities[j];
+        if (other->x == INVALID_POSITION || other->y == INVALID_POSITION) {
+            continue;
+        }
+        dx = other->x - ego->x;
+        dy = other->y - ego->y;
+        lon = dx * cos_h + dy * sin_h;
+        lat = -dx * sin_h + dy * cos_h;
+        if (lat < 0.0f) {
+            lat = -lat;
+        }
+        if (lon <= 0.5f || lat > 2.5f) {
+            continue;
+        }
+        dot = cos_h * other->heading_x + sin_h * other->heading_y;
+        if (dot < 0.5f) {
+            continue;
+        }
+        if (best < 0.0f || lon < best) {
+            best = lon;
+        }
+    }
+    return best;
+}
+
+// Per second of time-headway short of the sampled target, times dt.
+#define CURR_HEADWAY_PER_S 0.1f
+
+static float headway_penalty(Drive* env, int agent_idx) {
+    Entity* agent;
+    float gap;
+    float speed;
+    float tau;
+    float shortfall;
+    if (!env->curr_on) {
+        return 0.0f;
+    }
+    gap = lead_gap(env, agent_idx);
+    if (gap < 0.0f) {
+        return 0.0f;
+    }
+    agent = &env->entities[agent_idx];
+    speed = agent->vx * agent->heading_x + agent->vy * agent->heading_y;
+    if (speed < 0.5f) {
+        speed = 0.5f;
+    }
+    tau = gap / speed;
+    shortfall = env->tau_headway[agent_idx] - tau;
+    if (shortfall <= 0.0f) {
+        return 0.0f;
+    }
+    return -CURR_HEADWAY_PER_S * SIM_DT * shortfall;
+}
+
 void puf_step(Drive* env) {
     human_controls(env);
     if (!env->entities || env->active_agent_count <= 0) {
@@ -1932,7 +2107,21 @@ void puf_step(Drive* env) {
     }
     env->timestep++;
 
-    if (env->timestep == env->episode_length) {
+    int limit = env->episode_limit;
+    if (limit < 1) {
+        limit = env->episode_length;
+    }
+    if (env->timestep == limit) {
+        // Time limit. terminals = 1 so GAE stops at this boundary
+        // instead of bootstrapping the reset state. Anchors stay at 0,
+        // which is the historical drive.h behavior.
+        if (env->curr_on) {
+            for (int i = 0; i < env->active_agent_count; i++) {
+                if (env->agents[i].terminals) {
+                    env->agents[i].terminals[0] = 1.0f;
+                }
+            }
+        }
         for (int i = 0; i < env->active_agent_count; i++) {
             float completion = 0.0f;
             if (env->entities[i].goals_sampled > 0) {
@@ -1963,9 +2152,18 @@ void puf_step(Drive* env) {
             env->log.speed_sum += env->logs[i].speed_sum;
             env->log.speed_steps += env->logs[i].speed_steps;
             env->log.n += 1;
+            env->grp_return += env->logs[i].episode_return;
+            env->grp_coll += env->logs[i].collision_rate;
+            env->grp_len += env->logs[i].episode_length;
+            env->grp_score += env->logs[i].score;
+            env->grp_n += 1.0f;
         }
         puf_reset(env);
         return;
+    }
+
+    for (int i = 0; i < env->active_agent_count; i++) {
+        env->episode_step[i] += 1;
     }
 
     float step_jerk[DRIVE_AGENT_MAX] = {0};
@@ -2053,14 +2251,22 @@ void puf_step(Drive* env) {
         float bonus = speed_bonus(env, agent);
         env->agents[i].rewards[0] += bonus;
         env->logs[i].episode_return += bonus;
+        float headway = headway_penalty(env, i);
+        env->agents[i].rewards[0] += headway;
+        env->logs[i].episode_return += headway;
         if (arrived) {
             respawn_agent(env, i);
+        }
+        if (env->agents[i].terminals
+                && env->agents[i].terminals[0] != 0.0f) {
+            env->episode_step[i] = 0;
         }
     }
 
     bump_agents(env);
 
     compute_observations(env);
+    publish_episode_step(env);
 }
 
 static int collision_physics_mode(const char* name) {
@@ -2100,6 +2306,16 @@ void puf_init(Env* env, Dict* kwargs) {
     env->goal_distance_max = (float)dict_get(kwargs, "goal_distance_max");
     env->timestep = 0;
     env->episode_length = (int)dict_get(kwargs, "episode_length");
+    env->max_episode_steps = env->episode_length;
+    env->episode_limit = env->episode_length;
+    env->d_e = 0.0f;
+    env->hard_frac = (float)dict_get(kwargs, "hard_frac");
+    env->curr_on = 0;
+    env->curr_standard = 1;
+    env->headway_mean = 1.5f;
+    env->headway_std = 0.4f;
+    env->headway_lo = 0.8f;
+    env->headway_hi = 2.5f;
     load_world(env);
     for (int i = 0; i < env->num_agents; i++) {
         env->agents[i].policy = 0;
@@ -2108,12 +2324,15 @@ void puf_init(Env* env, Dict* kwargs) {
 }
 
 // Logged as env/score_town_01 and so on. Town10HD is score_town_10.
+// Bottleneck is score_bottleneck. DRIVE_SCORE_MAPS is one past the last id.
+#define DRIVE_SCORE_MAPS 5
 static const char* drive_score_town_key(int map_id) {
     switch (map_id) {
     case 0: return "score_town_01";
     case 1: return "score_town_02";
     case 2: return "score_town_06";
     case 3: return "score_town_10";
+    case 4: return "score_bottleneck";
     default: return NULL;
     }
 }

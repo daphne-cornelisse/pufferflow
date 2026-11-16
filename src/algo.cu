@@ -155,15 +155,26 @@ void puf_mm_nn(Prec* a, Prec* b, Prec* out, cudaStream_t stream,
         a->data, b->data, out->data, stream, alpha, beta);
 }
 
+// Set only outside a captured train graph. Those graphs already record
+// g_main_ready and g_dw_done, and CUDA rejects a later record on them.
+int puf_dw_sync = 0;
+
 // Queue dW (mm_tn) on side stream once inputs are ready on main. Per-layer
 // wgrad buffers are disjoint so multiple dWs can queue; puf_dw_join before muon.
 void puf_mm_tn_async_after(Prec* a, Prec* b, Prec* out, cudaStream_t main_stream) {
+    if (puf_dw_sync) {
+        puf_mm_tn(a, b, out, main_stream);
+        return;
+    }
     cudaEventRecord(g_main_ready, main_stream);
     cudaStreamWaitEvent(g_dw_stream, g_main_ready, 0);
     puf_mm_tn(a, b, out, g_dw_stream, 1.0f, 0.0f, g_cublas_dw_handle);
 }
 
 void puf_dw_join(cudaStream_t consumer) {
+    if (puf_dw_sync) {
+        return;
+    }
     cudaEventRecord(g_dw_done, g_dw_stream);
     cudaStreamWaitEvent(consumer, g_dw_done, 0);
 }

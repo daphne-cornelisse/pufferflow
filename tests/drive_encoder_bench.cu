@@ -171,6 +171,11 @@ static void token_mlp(const float* w1, const float* b1, const float* gamma,
     linear_bt(x, w1, h1, feat, H);
     add_bias(h1, b1, H);
     layernorm(ln, h1, gamma, beta, H);
+    for (int i = 0; i < H; i++) {
+        float v = ln[i];
+        float sig = 1.0f / (1.0f + expf(-v));
+        ln[i] = rndf(v * sig);
+    }
     linear_bt(ln, w2, h2, H, H);
     add_bias(h2, b2, H);
     free(h1);
@@ -184,11 +189,11 @@ static void project_token(const float* x, const float* w, const float* b,
 }
 
 // Every slot, including padding. Order is ego, then roads, then partners.
+// The MLP output is both the key and the value.
 static void embed_group(const float* w1, const float* b1, const float* gamma,
         const float* beta, const float* w2, const float* b2,
-        const float* wk, const float* bk, const float* wv, const float* bv,
         const float* obs, int off, int slots, int raw, int one_hot,
-        int H, int* s, float* K, float* V) {
+        int H, int* s, float* tok) {
     float* x = (float*)calloc((size_t)DRIVE_ROAD_IN, sizeof(float));
     float* h2 = (float*)malloc((size_t)H * sizeof(float));
     int feat = one_hot ? DRIVE_ROAD_IN : raw;
@@ -214,12 +219,33 @@ static void embed_group(const float* w1, const float* b1, const float* gamma,
             }
         }
         token_mlp(w1, b1, gamma, beta, w2, b2, x, feat, H, h2);
-        project_token(h2, wk, bk, H, H, K + (size_t)(*s) * H);
-        project_token(h2, wv, bv, H, H, V + (size_t)(*s) * H);
+        memcpy(tok + (size_t)(*s) * H, h2, (size_t)H * sizeof(float));
         *s += 1;
     }
     free(x);
     free(h2);
+}
+
+static int ref_token_live(const float* row, int s) {
+    const float* f;
+    int n;
+    if (s == 0) {
+        return 1;
+    }
+    if (s <= MAX_ROAD_SEGMENT_OBSERVATIONS) {
+        f = row + road_base() + (s - 1) * ROAD_FEATURES;
+        n = ROAD_FEATURES;
+    } else {
+        int slot = s - 1 - MAX_ROAD_SEGMENT_OBSERVATIONS;
+        f = row + EGO_FEATURES + slot * PARTNER_FEATURES;
+        n = PARTNER_FEATURES;
+    }
+    for (int i = 0; i < n; i++) {
+        if (f[i] != 0.0f) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void ref_forward(DriveEncWeights* ew, const float* obs, int rows,
@@ -246,10 +272,6 @@ static void ref_forward(DriveEncWeights* ew, const float* obs, int rows,
     float* q_lat = pull_prec(&ew->q_lat);
     float* wq = pull_prec(&ew->wq);
     float* bq = pull_prec(&ew->bq);
-    float* wk = pull_prec(&ew->wk);
-    float* bk = pull_prec(&ew->bk);
-    float* wv = pull_prec(&ew->wv);
-    float* bv = pull_prec(&ew->bv);
     float* wo = pull_prec(&ew->wo);
     float* bo = pull_prec(&ew->bo);
     float* attn_g = pull_prec(&ew->attn_lng);
@@ -258,12 +280,11 @@ static void ref_forward(DriveEncWeights* ew, const float* obs, int rows,
     float* fc_b = pull_prec(&ew->fc_b);
     int Q = DRIVE_ATTN_Q;
     int S = DRIVE_ATTN_S;
-    int heads = DRIVE_ATTN_HEADS;
+    int heads = drive_attn_heads(H);
     int d = H / heads;
     float scale = rsqrtf((float)d);
     float* Qp = (float*)malloc((size_t)Q * H * sizeof(float));
-    float* K = (float*)malloc((size_t)S * H * sizeof(float));
-    float* V = (float*)malloc((size_t)S * H * sizeof(float));
+    float* tok = (float*)malloc((size_t)S * H * sizeof(float));
     float* ctx = (float*)malloc((size_t)Q * H * sizeof(float));
     float* proj = (float*)malloc((size_t)Q * H * sizeof(float));
     float* pre = (float*)malloc((size_t)Q * H * sizeof(float));
@@ -277,22 +298,24 @@ static void ref_forward(DriveEncWeights* ew, const float* obs, int rows,
         const float* row = obs + (size_t)r * OBS_SIZE;
         int s = 0;
         embed_group(ego_w1, ego_b1, ego_g, ego_be, ego_w2, ego_b2,
-            wk, bk, wv, bv, row, 0, 1, EGO_FEATURES, 0, H, &s, K, V);
+            row, 0, 1, EGO_FEATURES, 0, H, &s, tok);
         embed_group(road_w1, road_b1, road_g, road_be, road_w2, road_b2,
-            wk, bk, wv, bv, row, road_base(),
-            MAX_ROAD_SEGMENT_OBSERVATIONS, ROAD_FEATURES, 1, H, &s, K, V);
+            row, road_base(), MAX_ROAD_SEGMENT_OBSERVATIONS, ROAD_FEATURES,
+            1, H, &s, tok);
         embed_group(part_w1, part_b1, part_g, part_be, part_w2, part_b2,
-            wk, bk, wv, bv, row, EGO_FEATURES, MAX_AGENTS, PARTNER_FEATURES,
-            0, H, &s, K, V);
+            row, EGO_FEATURES, MAX_AGENTS, PARTNER_FEATURES, 0, H, &s, tok);
         for (int head = 0; head < heads; head++) {
             int h0 = head * d;
             for (int q = 0; q < Q; q++) {
                 for (int t = 0; t < S; t++) {
                     float dot = 0.0f;
                     for (int i = 0; i < d; i++) {
-                        dot += Qp[q * H + h0 + i] * K[t * H + h0 + i];
+                        dot += Qp[q * H + h0 + i] * tok[t * H + h0 + i];
                     }
                     scores[t] = dot * scale;
+                    if (!ref_token_live(row, t)) {
+                        scores[t] = DRIVE_MASK_LOGIT;
+                    }
                 }
                 float m = scores[0];
                 for (int t = 1; t < S; t++) {
@@ -311,7 +334,7 @@ static void ref_forward(DriveEncWeights* ew, const float* obs, int rows,
                 for (int i = 0; i < d; i++) {
                     float acc = 0.0f;
                     for (int t = 0; t < S; t++) {
-                        acc += scores[t] * V[t * H + h0 + i];
+                        acc += scores[t] * tok[t * H + h0 + i];
                     }
                     ctx[q * H + h0 + i] = rndf(acc);
                 }
@@ -338,10 +361,10 @@ static void ref_forward(DriveEncWeights* ew, const float* obs, int rows,
     free(part_w2); free(part_b2);
     free(road_w1); free(road_b1); free(road_g); free(road_be);
     free(road_w2); free(road_b2);
-    free(q_lat); free(wq); free(bq); free(wk); free(bk);
-    free(wv); free(bv); free(wo); free(bo);
+    free(q_lat); free(wq); free(bq);
+    free(wo); free(bo);
     free(attn_g); free(attn_be); free(fc_w); free(fc_b);
-    free(Qp); free(K); free(V); free(ctx); free(proj); free(pre);
+    free(Qp); free(tok); free(ctx); free(proj); free(pre);
     free(hid); free(y); free(scores);
 }
 
