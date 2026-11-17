@@ -28,13 +28,18 @@ Road `type` is one of `lane`, `road_line`, `road_edge`, `stop_sign`, `crosswalk`
 
 ### I24-3D
 
-`python utils/i24.py` reads `data/spl_obj/scene{1,2,3}_splobj.json` and `data/hg/scene{n}_hg.json`. Source positions and sizes are feet.
+`python utils/i24.py` reads `data/spl_obj/scene{1,2,3}_splobj.json` and `data/hg/scene{n}_hg.json`.
 
-Body styles `sedan`, `midsize`, `pickup`, `van`, `semi`, `truck`, and `cs` are vehicles. `cs` is the one car-sized track in scene 3. Unknown labels are an error.
+Processing assumptions:
 
-Roads come from the 12-foot calibration grid: freeway centerlines, broken single white dividers, a median between the carriageways, and boundary edges. Eastbound runs toward +x. The grid is shifted so the focal car starts at the origin and extended along the roadway. Each of those lines is then sampled every 5 m. The simulator keeps one observation per segment midpoint in a 5 m grid, and only cells within about 50 m of the agent, so one chord across the whole highway leaves the view empty.
-
-A scenario is one focal track plus nearby traffic, up to 128 objects (hard cap 256). The default focal track is the longest clean one. `--all-scenes` exports scenes 1, 2, and 3 and requires `--all-sdcs`.
+- Positions and sizes in the splines are feet. Logs are meters.
+- Time is 10 Hz with both endpoints. A track keeps its own length, capped at 90 s.
+- Body styles `sedan`, `midsize`, `pickup`, `van`, `semi`, `truck`, and `cs` are vehicles. `cs` is the one car-sized track in scene 3. Any other label is an error.
+- Exported length, width, and height are 0.90 of the annotated size, after the small-size defaults (4.5 m, 1.8 m, 1.5 m).
+- Heading is the direction of travel. Stabilization is off unless requested.
+- One scenario is one focal track plus nearby traffic, at most 128 objects. The default focal track is the longest clean one. Object 0 is that vehicle and is valid on every state. `mark_as_expert` is 0.
+- Lanes, broken white lines, and edges come from the 12-foot calibration grid. Eastbound runs toward +x. The lower carriageway is eastbound. The grid is shifted so the focal car starts at the origin, extended along the roadway, and sampled every 5 m. The simulator stores one observation per segment midpoint, so an unsampled chord leaves the view empty.
+- No vehicle in the source data is treated as overlapping a real road edge. The calibration edge is the outer lane line, so each edge, including the median, is moved 1.5 ft away from the lanes.
 
 ### WOMD
 

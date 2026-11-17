@@ -55,6 +55,13 @@ from utils.common import (  # noqa: E402
 
 
 FEET_TO_METERS = 0.3048
+# Annotated boxes are treated as slightly larger than the body that
+# drove the lane. Exported length, width, and height use this factor.
+BOX_SCALE = 0.90
+# The calibration edge is the outer lane line. No I24 vehicle is
+# treated as truly overlapping that line, so each edge is moved 1.5 ft
+# away from the lanes.
+ROAD_EDGE_OUTWARD_M = 1.5 * FEET_TO_METERS
 # The simulator stores one observation per segment midpoint, in 5 m
 # grid cells, and only cells within about 50 m of the agent. A single
 # chord across the whole highway has one midpoint, often far from the
@@ -108,6 +115,12 @@ def _cluster(values: list[float], tolerance: float = 0.1) -> list[float]:
         else:
             groups[-1].append(value)
     return [sum(group) / len(group) for group in groups]
+
+
+def _edge_y_m(boundary_y_ft: float, lane_mid_ft: float) -> float:
+    """Lane-line y, shifted 1.5 ft away from the carriageway center."""
+    outward = -1.0 if boundary_y_ft < lane_mid_ft else 1.0
+    return boundary_y_ft * FEET_TO_METERS + outward * ROAD_EDGE_OUTWARD_M
 
 
 def load_road_grid(homography_path: Path) -> dict[str, Any]:
@@ -169,6 +182,7 @@ def load_road_grid(homography_path: Path) -> dict[str, Any]:
             )
             road_id += 1
 
+        lane_mid_ft = 0.5 * (boundaries_ft[0] + boundaries_ft[-1])
         for boundary_index in (0, len(boundaries_ft) - 1):
             boundary_y = boundaries_ft[boundary_index]
             is_median = (
@@ -180,8 +194,8 @@ def load_road_grid(homography_path: Path) -> dict[str, Any]:
                     "type": "road_edge",
                     "map_element_id": ROAD_EDGE_MEDIAN if is_median else ROAD_EDGE_BOUNDARY,
                     "geometry": [
-                        _point(x_min_ft * FEET_TO_METERS, boundary_y * FEET_TO_METERS),
-                        _point(x_max_ft * FEET_TO_METERS, boundary_y * FEET_TO_METERS),
+                        _point(x_min_ft * FEET_TO_METERS, _edge_y_m(boundary_y, lane_mid_ft)),
+                        _point(x_max_ft * FEET_TO_METERS, _edge_y_m(boundary_y, lane_mid_ft)),
                     ],
                 }
             )
@@ -359,6 +373,9 @@ def normalize_object(
         width_m = 1.8
     if height_m <= 0.0:
         height_m = 1.5
+    length_m *= BOX_SCALE
+    width_m *= BOX_SCALE
+    height_m *= BOX_SCALE
 
     source_class = str(raw.get("class", "vehicle"))
     normalized = {
@@ -776,7 +793,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
             "sdc.bin holds that map's self-driving-car object index.",
             "Each track keeps its own length, capped at 90 s (901 states).",
             "Goals are each track's last valid logged position.",
-            "The road model is the scene's 12-foot calibration grid, extended along the roadway and sampled every 5 m.",
+            "The road model is the scene's 12-foot calibration grid, extended along the roadway and sampled every 5 m. Road edges are 1.5 ft outward from the lane lines. Boxes are 0.90 of the annotated size.",
             "Action labels are the simulator inverse on these logs, as in arXiv 2606.19370 A.4.",
             "Heading stabilization never modifies exported positions or velocities.",
         ],

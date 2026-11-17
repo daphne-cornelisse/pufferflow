@@ -144,6 +144,15 @@ class I24ConversionTest(unittest.TestCase):
             "y_position": ys,
         }
 
+    def test_road_edge_moves_away_from_the_lanes(self):
+        # A lower edge moves down. An upper edge moves up. The shift is 1.5 ft.
+        shift = CONVERTER.ROAD_EDGE_OUTWARD_M
+        self.assertAlmostEqual(CONVERTER._edge_y_m(0.0, 10.0), -shift)
+        self.assertAlmostEqual(
+            CONVERTER._edge_y_m(20.0, 10.0),
+            20.0 * CONVERTER.FEET_TO_METERS + shift,
+        )
+
     def test_long_roads_are_sampled_every_five_meters(self):
         line = [
             CONVERTER._point(0.0, 0.0),
@@ -178,7 +187,12 @@ class I24ConversionTest(unittest.TestCase):
         self.assertAlmostEqual(obj["position_m"][-1][0], 300 * CONVERTER.FEET_TO_METERS)
         self.assertAlmostEqual(obj["velocity_mps"][50][0], 30 * CONVERTER.FEET_TO_METERS)
         self.assertAlmostEqual(obj["heading_rad"][50], 0.0)
-        self.assertAlmostEqual(obj["length_m"], 15.0 * CONVERTER.FEET_TO_METERS)
+        self.assertAlmostEqual(
+            obj["length_m"], 15.0 * CONVERTER.FEET_TO_METERS * CONVERTER.BOX_SCALE
+        )
+        self.assertAlmostEqual(
+            obj["width_m"], 6.0 * CONVERTER.FEET_TO_METERS * CONVERTER.BOX_SCALE
+        )
 
     def test_heading_stabilization_is_opt_in_and_only_changes_headings(self):
         raw = self.raw_object_with_noisy_stop()
