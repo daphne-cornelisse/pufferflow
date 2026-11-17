@@ -233,7 +233,7 @@ def test_copied_pose(lib):
 
 
 def consecutive_labels(lib, h, i):
-    traj = lib.pf_traj()
+    traj = lib.pf_log_traj(h)
     count = 0
     for t in range(traj - 1):
         if lib.pf_log_valid(h, i, t) and lib.pf_log_valid(h, i, t + 1):
@@ -278,7 +278,7 @@ def test_collect_and_inverse(lib):
         for i in range(n):
             if lib.pf_base_unfit(scenario, i):
                 continue
-            for t in range(lib.pf_traj() - 1):
+            for t in range(lib.pf_log_traj(scenario) - 1):
                 if not lib.pf_log_valid(scenario, i, t):
                     continue
                 if not lib.pf_log_valid(scenario, i, t + 1):

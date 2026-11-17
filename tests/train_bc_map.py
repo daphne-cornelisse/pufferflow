@@ -546,7 +546,7 @@ def save_policy(pol, acc, n_accel, n_steer, path=None):
 
 def rollout(lib, h, pol, controlled, steps=None):
     if steps is None:
-        steps = drv.TRAJ - 1
+        steps = lib.pf_log_traj(h) - 1
     _require_policy_bins(lib, pol)
     lib.pf_reset(h, 0)
     xs = []
@@ -618,7 +618,7 @@ def controllable_agents(lib, h):
 def log_track(lib, h, agent):
     xs = []
     ys = []
-    for t in range(drv.TRAJ):
+    for t in range(lib.pf_log_traj(h)):
         if not lib.pf_log_valid(h, agent, t):
             continue
         x, y = drv.log_xy(lib, h, agent, t)
@@ -627,7 +627,7 @@ def log_track(lib, h, agent):
     return xs, ys
 
 def squared_displacement(human, rollout):
-    n = min(len(human[0]), len(rollout["x"]), drv.TRAJ)
+    n = min(len(human[0]), len(rollout["x"]))
     dx = np.asarray(rollout["x"][:n], dtype=np.float64) - np.asarray(human[0][:n], dtype=np.float64)
     dy = np.asarray(rollout["y"][:n], dtype=np.float64) - np.asarray(human[1][:n], dtype=np.float64)
     return dx * dx + dy * dy
@@ -803,7 +803,7 @@ def closed_loop_rollout(lib, h, pol, agents, ends, steps=None):
                 tracks[agent]["ent_t"].append(t)
                 tracks[agent]["ent"].append(float(entropy))
         for agent in live:
-            if t < drv.TRAJ and lib.pf_log_valid(h, agent, t):
+            if t < lib.pf_log_traj(h) and lib.pf_log_valid(h, agent, t):
                 lx, ly = drv.log_xy(lib, h, agent, t)
                 state = states[agent]
                 dist = float(np.hypot(float(state[0]) - lx, float(state[1]) - ly))

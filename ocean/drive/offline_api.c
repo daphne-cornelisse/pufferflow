@@ -179,6 +179,10 @@ int pf_traj(void) {
     return OFFLINE_TRAJ;
 }
 
+int pf_log_traj(PfHandle* h) {
+    return h->off.traj;
+}
+
 float* pf_obs(PfHandle* h) {
     return h->obs;
 }
@@ -393,13 +397,13 @@ void pf_roads(PfHandle* h, int* offsets, int* types, float* xs, float* ys) {
     }
 }
 
-// Agent-major, OFFLINE_TRAJ frames. A null xs skips the store.
+// Agent-major, span frames. A null xs skips the store.
 static void trace_store(float* xs, float* ys, unsigned char* on,
-        int i, int t, const Entity* e) {
+        int i, int t, int span, const Entity* e) {
     if (!xs) {
         return;
     }
-    int k = i * OFFLINE_TRAJ + t;
+    int k = i * span + t;
     if (e->x == INVALID_POSITION) {
         xs[k] = 0.0f;
         ys[k] = 0.0f;
@@ -412,12 +416,12 @@ static void trace_store(float* xs, float* ys, unsigned char* on,
 }
 
 static void trace_frame(float* xs, float* ys, unsigned char* on,
-        int n, int t, const Drive* drive) {
+        int n, int t, int span, const Drive* drive) {
     if (!xs) {
         return;
     }
     for (int i = 0; i < n; i++) {
-        trace_store(xs, ys, on, i, t, &drive->entities[i]);
+        trace_store(xs, ys, on, i, t, span, &drive->entities[i]);
     }
 }
 
@@ -441,11 +445,12 @@ static void quantized_replay(PfHandle* h, float amin, float amax, int na,
     int commands = 0;
     int clipped_a = 0;
     int clipped_s = 0;
+    int span = env->traj;
     drive->use_action_values = 1;
-    for (int t = 0; t < OFFLINE_TRAJ - 1; t++) {
+    for (int t = 0; t < span - 1; t++) {
         drive->timestep = t;
         offline_spawn_due(env);
-        trace_frame(trace_x, trace_y, trace_on, n, t, drive);
+        trace_frame(trace_x, trace_y, trace_on, n, t, span, drive);
         for (int i = 0; i < n; i++) {
             Entity* e = &drive->entities[i];
             OfflineAgent* a = &env->logs[i];
@@ -507,7 +512,7 @@ static void quantized_replay(PfHandle* h, float amin, float amax, int na,
             agent_n[i] += 1;
         }
     }
-    trace_frame(trace_x, trace_y, trace_on, n, OFFLINE_TRAJ - 1, drive);
+    trace_frame(trace_x, trace_y, trace_on, n, span - 1, span, drive);
     drive->use_action_values = 0;
     int used = 0;
     double mean = 0.0;
@@ -567,10 +572,11 @@ static void delta_replay(PfHandle* h, int n_dx, int n_dy, int n_yaw,
     int clipped_x = 0;
     int clipped_y = 0;
     int clipped_yaw = 0;
-    for (int t = 0; t < OFFLINE_TRAJ - 1; t++) {
+    int span = env->traj;
+    for (int t = 0; t < span - 1; t++) {
         drive->timestep = t;
         offline_spawn_due(env);
-        trace_frame(trace_x, trace_y, trace_on, n, t, drive);
+        trace_frame(trace_x, trace_y, trace_on, n, t, span, drive);
         for (int i = 0; i < n; i++) {
             Entity* e = &drive->entities[i];
             OfflineAgent* a = &env->logs[i];
@@ -621,7 +627,7 @@ static void delta_replay(PfHandle* h, int n_dx, int n_dy, int n_yaw,
             agent_n[i] += 1;
         }
     }
-    trace_frame(trace_x, trace_y, trace_on, n, OFFLINE_TRAJ - 1, drive);
+    trace_frame(trace_x, trace_y, trace_on, n, span - 1, span, drive);
     int used = 0;
     double mean = 0.0;
     for (int i = 0; i < n; i++) {

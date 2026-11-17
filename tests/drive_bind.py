@@ -43,6 +43,7 @@ def load():
     fn("pf_n", ctypes.c_int, [handle])
     fn("pf_obs_size", ctypes.c_int, [handle])
     fn("pf_traj", ctypes.c_int, [])
+    fn("pf_log_traj", ctypes.c_int, [handle])
     fn("pf_obs", c_float_p, [handle])
     fn("pf_set_action", None, [handle, ctypes.c_int, ctypes.c_float, ctypes.c_float])
     fn("pf_relabel_grid", None, [
@@ -191,7 +192,7 @@ def outcome(lib, h, i):
 def collect(lib, h, teleport):
     n = lib.pf_log_n(h)
     obs_n = lib.pf_obs_size(h)
-    traj = lib.pf_traj()
+    traj = lib.pf_log_traj(h)
     obs = np.zeros((traj, n, obs_n), dtype=np.float32)
     acts = np.zeros((traj, n, 2), dtype=np.int32)
     valid = np.zeros((traj, n), dtype=np.uint8)

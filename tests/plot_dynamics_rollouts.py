@@ -43,39 +43,42 @@ def _specs():
 
 def _trace_bike(lib, h, grid):
     n = lib.pf_log_n(h)
-    xs = np.zeros(n * drv.TRAJ, dtype=np.float32)
-    ys = np.zeros(n * drv.TRAJ, dtype=np.float32)
-    on = np.zeros(n * drv.TRAJ, dtype=np.uint8)
+    traj = lib.pf_log_traj(h)
+    xs = np.zeros(n * traj, dtype=np.float32)
+    ys = np.zeros(n * traj, dtype=np.float32)
+    on = np.zeros(n * traj, dtype=np.uint8)
     lib.pf_quantized_trace(
         h, grid[0], grid[1], grid[2], grid[3], grid[4], grid[5],
         xs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         ys.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         on.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
     )
-    shape = (n, drv.TRAJ)
+    shape = (n, traj)
     return xs.reshape(shape), ys.reshape(shape), on.reshape(shape)
 
 
 def _trace_delta(lib, h, counts):
     n = lib.pf_log_n(h)
-    xs = np.zeros(n * drv.TRAJ, dtype=np.float32)
-    ys = np.zeros(n * drv.TRAJ, dtype=np.float32)
-    on = np.zeros(n * drv.TRAJ, dtype=np.uint8)
+    traj = lib.pf_log_traj(h)
+    xs = np.zeros(n * traj, dtype=np.float32)
+    ys = np.zeros(n * traj, dtype=np.float32)
+    on = np.zeros(n * traj, dtype=np.uint8)
     lib.pf_delta_trace(
         h, counts[0], counts[1], counts[2],
         xs.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         ys.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         on.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
     )
-    shape = (n, drv.TRAJ)
+    shape = (n, traj)
     return xs.reshape(shape), ys.reshape(shape), on.reshape(shape)
 
 
 def _log(lib, h, agent):
-    xs = np.zeros(drv.TRAJ, dtype=np.float64)
-    ys = np.zeros(drv.TRAJ, dtype=np.float64)
-    valid = np.zeros(drv.TRAJ, dtype=bool)
-    for frame in range(drv.TRAJ):
+    traj = lib.pf_log_traj(h)
+    xs = np.zeros(traj, dtype=np.float64)
+    ys = np.zeros(traj, dtype=np.float64)
+    valid = np.zeros(traj, dtype=bool)
+    for frame in range(traj):
         if not lib.pf_log_valid(h, agent, frame):
             continue
         x, y = drv.log_xy(lib, h, agent, frame)
@@ -87,7 +90,7 @@ def _log(lib, h, agent):
 
 def _ade(sim_x, sim_y, sim_on, log_x, log_y, log_on):
     err = []
-    for frame in range(1, drv.TRAJ):
+    for frame in range(1, len(log_on)):
         if not (sim_on[frame] and log_on[frame]):
             continue
         dx = float(sim_x[frame] - log_x[frame])

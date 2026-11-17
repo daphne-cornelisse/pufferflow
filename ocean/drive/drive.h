@@ -419,10 +419,11 @@ static int read_map_sdc(const char* map_file, int map_id) {
 }
 
 // CARLA files are roads only: int count, then road records.
-// Waymo files are int objects, roads, first agent type, trajectory
-// length 91, then each object (series, size, goal, mark, next type,
-// next length). The last object's next type and length are the first
-// road header. Roads then use the CARLA record.
+// Log files are int objects, roads, first agent type, trajectory
+// length, then each object (series, size, goal, mark, next type,
+// next length). The length is that scenario's state count, from 2
+// through DRIVE_LOG_MAX. The last object's next type and length are
+// the first road header. Roads then use the CARLA record.
 Entity* load_map_binary(const char* filename, Drive* env) {
     FILE* file = fopen(filename, "rb");
     if (!file) {
@@ -449,7 +450,8 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     env->replay_len = 0;
     int head[4];
     assert(fread(head, sizeof(int), 4, file) == 4);
-    int log_map = head[3] == 91 && head[0] >= 0 && head[0] <= 512
+    int log_map = head[3] >= 2 && head[3] <= DRIVE_LOG_MAX
+        && head[0] >= 0 && head[0] <= 512
         && head[1] > 0 && head[2] >= VEHICLE && head[2] <= 3;
     if (!log_map) {
         assert(fseek(file, 0, SEEK_SET) == 0);
@@ -477,6 +479,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     int nroads = head[1];
     int type = head[2];
     int traj = head[3];
+    assert(traj >= 2 && traj <= DRIVE_LOG_MAX);
     int replay = env->control_mode == CONTROL_SDC_ONLY;
     // Five pose series per object, kept only for human-replay.
     float* series = NULL;

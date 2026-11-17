@@ -124,7 +124,6 @@ static int ademo_policy_on(void) {
 // The SDC starts outside the 5 m goal disk, on a busy junction.
 // A NULL name is CARLA Town01 (data/mixed/binaries/map_000.bin). That
 // map has no trajectory, so its goals come from pick_forward_goal.
-#define ADEMO_LOOP 90
 
 typedef struct {
     int map_id;
@@ -149,6 +148,7 @@ static const AdemoScene g_scenes[] = {
 
 static OfflineAgent* g_logs;
 static int g_log_n;
+static int g_traj;
 static int g_sdc;
 static int g_scene_i;
 // Waymo logs stay on this directory. Town01 always loads data/mixed.
@@ -1669,6 +1669,7 @@ static void ademo_release(Drive* env) {
     free(g_logs);
     g_logs = NULL;
     g_log_n = 0;
+    g_traj = 0;
     if (!env->map_name) {
         return;
     }
@@ -1726,8 +1727,8 @@ static void ademo_place(Drive* env, int frame) {
     if (frame < 0) {
         frame = 0;
     }
-    if (frame >= OFFLINE_TRAJ) {
-        frame = OFFLINE_TRAJ - 1;
+    if (frame >= g_traj) {
+        frame = g_traj - 1;
     }
     for (int i = 0; i < g_log_n; i++) {
         offline_write_agent(&env->entities[i], &g_logs[i], frame);
@@ -1742,8 +1743,8 @@ static void ademo_place(Drive* env, int frame) {
 static void ademo_replay_step(Drive* env) {
     int frame = env->timestep;
     int next = frame + 1;
-    if (next >= OFFLINE_TRAJ) {
-        next = OFFLINE_TRAJ - 1;
+    if (next >= g_traj) {
+        next = g_traj - 1;
     }
     Entity* ego = &env->entities[g_sdc];
     if (ego->x != INVALID_POSITION && ego->y != INVALID_POSITION) {
@@ -1770,6 +1771,7 @@ static void ademo_load_town(Drive* env, Dict* cfg, int which) {
     dict_set(cfg, "num_agents", n);
     g_logs = NULL;
     g_log_n = 0;
+    g_traj = 0;
     g_sdc = 0;
     puf_init(env, cfg);
     ademo_bind(env);
@@ -1800,8 +1802,10 @@ static void ademo_load(Drive* env, Dict* cfg, int which) {
     offline_parse(&parsed, path);
     g_logs = parsed.logs;
     g_log_n = parsed.log_n;
+    g_traj = parsed.traj;
     g_sdc = parsed.sdc;
     assert(g_log_n > 0);
+    assert(g_traj >= 2 && g_traj <= OFFLINE_TRAJ);
     assert(g_sdc >= 0 && g_sdc < g_log_n);
     dict_set(cfg, "map_id", g_scenes[which].map_id);
     dict_set(cfg, "num_agents", g_log_n);
@@ -1815,9 +1819,9 @@ static void ademo_load(Drive* env, Dict* cfg, int which) {
     offline_shift_logs(&shift);
     ademo_place(env, 0);
     g_scene_i = which;
-    printf("scenario map %d  %s  vehicles %d  sdc %d\n",
+    printf("scenario map %d  %s  vehicles %d  sdc %d  states %d\n",
         g_scenes[which].map_id, g_scenes[which].name,
-        g_log_n, g_sdc);
+        g_log_n, g_sdc, g_traj);
     fflush(stdout);
     ademo_title();
 }
@@ -1879,6 +1883,7 @@ static void ademo_shutdown(void) {
     free(g_logs);
     g_logs = NULL;
     g_log_n = 0;
+    g_traj = 0;
     free(g_obs);
     g_obs = NULL;
     free(g_act);
@@ -1910,7 +1915,7 @@ static void ademo_frame(Drive* env, int step) {
     ademo_note_value(env);
     puf_render(env);
     if (step && !puf_sim_paused(env)) {
-        if (g_logs && env->timestep >= ADEMO_LOOP) {
+        if (g_logs && env->timestep >= g_traj - 1) {
             ademo_place(env, 0);
             ademo_hist_clear();
             ademo_policy_zero();

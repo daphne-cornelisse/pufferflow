@@ -22,6 +22,9 @@
 
 // One step is 0.1 s. 500 steps is the ini default.
 #define SIM_DT 0.1f
+// Inclusive log states at 10 Hz. Waymo segments are 91. I24 scenes
+// run up to 90 s, so a log is 2..DRIVE_LOG_MAX states.
+#define DRIVE_LOG_MAX 901
 // Interactive playback only. 20 steps/s is 2x real time so the window is
 // easier to follow. Headless eval still runs as fast as it can.
 #define PUF_STEPS_PER_SEC 20

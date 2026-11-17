@@ -5,7 +5,8 @@
 #include <math.h>
 #include "cJSON.h"
 
-#define OFFLINE_TRAJ 91
+// Array capacity. Offline.traj is the states in this log.
+#define OFFLINE_TRAJ DRIVE_LOG_MAX
 #define OFFLINE_ADE_MAX 2.0f
 #define OFFLINE_MIN_VALID 10
 // Parked logs jitter by centimeters. A track inside this radius never moved.
@@ -42,6 +43,7 @@ typedef struct Offline {
     Drive drive;
     OfflineAgent* logs;
     int log_n;
+    int traj;
     int sdc;
     float mean_x;
     float mean_y;
@@ -351,11 +353,16 @@ static void offline_parse(Offline* env, const char* json_path) {
     assert(root);
 
     int sdc_track = 0;
+    int stated = 0;
     cJSON* meta = cJSON_GetObjectItemCaseSensitive(root, "metadata");
     if (meta) {
         cJSON* sdc = cJSON_GetObjectItemCaseSensitive(meta, "sdc_track_index");
         if (sdc && cJSON_IsNumber(sdc)) {
             sdc_track = sdc->valueint;
+        }
+        cJSON* frames = cJSON_GetObjectItemCaseSensitive(meta, "frame_count");
+        if (frames && cJSON_IsNumber(frames)) {
+            stated = frames->valueint;
         }
     }
 
@@ -377,6 +384,7 @@ static void offline_parse(Offline* env, const char* json_path) {
     }
     env->logs = (OfflineAgent*)calloc((size_t)keep, sizeof(OfflineAgent));
     assert(env->logs);
+    int seen_len = 0;
     env->log_n = 0;
     env->sdc = 0;
     int seen = 0;
@@ -425,7 +433,11 @@ static void offline_parse(Offline* env, const char* json_path) {
         assert(goal);
         a->goal_x = (float)offline_jnum(goal, "x");
         a->goal_y = (float)offline_jnum(goal, "y");
-        offline_read_series(cJSON_GetObjectItemCaseSensitive(obj, "position"),
+        cJSON* pos = cJSON_GetObjectItemCaseSensitive(obj, "position");
+        if (cJSON_IsArray(pos) && cJSON_GetArraySize(pos) > seen_len) {
+            seen_len = cJSON_GetArraySize(pos);
+        }
+        offline_read_series(pos,
             a->x, OFFLINE_TRAJ, "x");
         float* ys = (float*)malloc(OFFLINE_TRAJ * sizeof(float));
         assert(ys);
@@ -455,6 +467,12 @@ static void offline_parse(Offline* env, const char* json_path) {
             t++;
         }
     }
+    int traj = stated > 0 ? stated : seen_len;
+    if (traj > OFFLINE_TRAJ) {
+        traj = OFFLINE_TRAJ;
+    }
+    assert(traj >= 2);
+    env->traj = traj;
     cJSON_Delete(root);
     assert(env->log_n > 0);
 }
@@ -529,7 +547,7 @@ static void offline_mark_offroad(Offline* env) {
 
 static void offline_place(Offline* env, int frame) {
     Drive* drive = &env->drive;
-    assert(frame >= 0 && frame < OFFLINE_TRAJ);
+    assert(frame >= 0 && frame < env->traj);
     for (int i = 0; i < env->log_n; i++) {
         offline_write_agent(&drive->entities[i], &env->logs[i], frame);
     }
@@ -539,7 +557,7 @@ static void offline_place(Offline* env, int frame) {
 // A parked car whose log is valid enters on that pose. Moving cars stay put.
 static void offline_spawn_due(Offline* env) {
     int frame = env->drive.timestep;
-    if (frame < 0 || frame >= OFFLINE_TRAJ) {
+    if (frame < 0 || frame >= env->traj) {
         return;
     }
     for (int i = 0; i < env->log_n; i++) {
@@ -713,8 +731,8 @@ static void offline_replay_step(Offline* env, int controlled) {
     offline_integrate(drive, 1);
     drive->timestep = frame + 1;
     int next = frame + 1;
-    if (next >= OFFLINE_TRAJ) {
-        next = OFFLINE_TRAJ - 1;
+    if (next >= env->traj) {
+        next = env->traj - 1;
     }
     for (int i = 0; i < n; i++) {
         if (i == controlled) {
@@ -775,7 +793,7 @@ static void offline_replay_step(Offline* env, int controlled) {
         if (log->goal_dist < MIN_DISTANCE_TO_GOAL) {
             log->reached = 1;
         }
-        if (drive->timestep < OFFLINE_TRAJ
+        if (drive->timestep < env->traj
                 && env->logs[controlled].valid[drive->timestep]) {
             float dx = ego->x - log->x[drive->timestep];
             float dy = ego->y - log->y[drive->timestep];
@@ -794,11 +812,12 @@ static void offline_collect(Offline* env, int teleport, float* obs_out,
     Drive* drive = &env->drive;
     int n = env->log_n;
     int obs_n = OBS_SIZE;
-    float* sim_x = (float*)malloc((size_t)n * OFFLINE_TRAJ * sizeof(float));
-    float* sim_y = (float*)malloc((size_t)n * OFFLINE_TRAJ * sizeof(float));
+    int steps = env->traj;
+    float* sim_x = (float*)malloc((size_t)n * (size_t)steps * sizeof(float));
+    float* sim_y = (float*)malloc((size_t)n * (size_t)steps * sizeof(float));
     assert(sim_x && sim_y);
     offline_reset_scenario(env);
-    for (int t = 0; t < OFFLINE_TRAJ; t++) {
+    for (int t = 0; t < steps; t++) {
         if (teleport || t == 0) {
             offline_place(env, t);
             drive->timestep = t;
@@ -811,8 +830,8 @@ static void offline_collect(Offline* env, int teleport, float* obs_out,
                 (size_t)obs_n * sizeof(float));
         }
         for (int i = 0; i < n; i++) {
-            sim_x[(size_t)i * OFFLINE_TRAJ + t] = drive->entities[i].x;
-            sim_y[(size_t)i * OFFLINE_TRAJ + t] = drive->entities[i].y;
+            sim_x[(size_t)i * (size_t)steps + t] = drive->entities[i].x;
+            sim_y[(size_t)i * (size_t)steps + t] = drive->entities[i].y;
             int label_ok = env->logs[i].accel_bin[t] >= 0;
             int off = (t * n + i) * 2;
             if (label_ok) {
@@ -825,7 +844,7 @@ static void offline_collect(Offline* env, int teleport, float* obs_out,
                 valid_out[t * n + i] = 0;
             }
         }
-        if (t + 1 >= OFFLINE_TRAJ || teleport) {
+        if (t + 1 >= steps || teleport) {
             continue;
         }
         for (int i = 0; i < n; i++) {
@@ -846,15 +865,15 @@ static void offline_collect(Offline* env, int teleport, float* obs_out,
         float err = 0.0f;
         int count = 0;
         if (!teleport) {
-            for (int t = 0; t < OFFLINE_TRAJ; t++) {
+            for (int t = 0; t < steps; t++) {
                 if (!a->valid[t]) {
                     continue;
                 }
-                if (sim_x[(size_t)i * OFFLINE_TRAJ + t] == INVALID_POSITION) {
+                if (sim_x[(size_t)i * (size_t)steps + t] == INVALID_POSITION) {
                     continue;
                 }
-                float dx = sim_x[(size_t)i * OFFLINE_TRAJ + t] - a->x[t];
-                float dy = sim_y[(size_t)i * OFFLINE_TRAJ + t] - a->y[t];
+                float dx = sim_x[(size_t)i * (size_t)steps + t] - a->x[t];
+                float dy = sim_y[(size_t)i * (size_t)steps + t] - a->y[t];
                 err += sqrtf(dx * dx + dy * dy);
                 count++;
             }
@@ -866,7 +885,7 @@ static void offline_collect(Offline* env, int teleport, float* obs_out,
             unfit = 1;
         }
         if (unfit) {
-            for (int t = 0; t < OFFLINE_TRAJ; t++) {
+            for (int t = 0; t < steps; t++) {
                 valid_out[t * n + i] = 0;
                 int off = (t * n + i) * 2;
                 act_out[off] = -1;
