@@ -1570,7 +1570,6 @@ int main(int argc, char** argv) {
         if (!saw_episode) {
             dict_set(env_sec, "episode_length", 100000);
         }
-        dict_set_str(env_sec, "collision_physics", "bump");
         if (headless || record) {
             fprintf(stderr, "--anchor opens a window\n");
             return 1;

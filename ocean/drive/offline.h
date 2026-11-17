@@ -464,7 +464,6 @@ static void offline_write_agent(Entity* e, OfflineAgent* a, int frame) {
     e->width = a->width;
     e->length = a->length;
     e->height = CAR_HEIGHT;
-    e->active_agent = 1;
     e->goal_position_x = a->goal_x;
     e->goal_position_y = a->goal_y;
     e->goal_position_z = 0.0f;
@@ -623,7 +622,6 @@ static void offline_integrate(Drive* env, int stop_at_goal) {
             agent->vy = 0.0f;
         }
     }
-    bump_agents(env);
     compute_observations(env);
 }
 
@@ -703,15 +701,13 @@ static void offline_replay_step(Offline* env, int controlled) {
         drive->agents[i].actions[1] = STEER_COAST_BIN;
     }
     // Partners are parked so move_dynamics steps only the controlled car.
-    int active[DRIVE_AGENT_MAX];
     int n = drive->active_agent_count;
     for (int i = 0; i < n; i++) {
-        active[i] = drive->entities[i].active_agent;
-        if (i != controlled) {
-            drive->entities[i].active_agent = 0;
-            drive->entities[i].x = INVALID_POSITION;
-            drive->entities[i].y = INVALID_POSITION;
+        if (i == controlled) {
+            continue;
         }
+        drive->entities[i].x = INVALID_POSITION;
+        drive->entities[i].y = INVALID_POSITION;
     }
     drive->bins_ready = 0;
     offline_integrate(drive, 1);
@@ -721,7 +717,6 @@ static void offline_replay_step(Offline* env, int controlled) {
         next = OFFLINE_TRAJ - 1;
     }
     for (int i = 0; i < n; i++) {
-        drive->entities[i].active_agent = active[i];
         if (i == controlled) {
             continue;
         }

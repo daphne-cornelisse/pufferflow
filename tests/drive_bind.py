@@ -25,10 +25,10 @@ def load():
 
     fn("pf_create_sim", handle, [
         ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ctypes.c_float, ctypes.c_float, ctypes.c_char_p,
+        ctypes.c_float, ctypes.c_float,
     ])
     fn("pf_create_scenario", handle, [
-        ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
     ])
     fn("pf_close", None, [handle])
     fn("pf_reset", None, [handle, ctypes.c_uint])
@@ -101,19 +101,19 @@ def load():
 
 
 def create_sim(lib, data_dir, map_id, num_agents, episode_length=500,
-        goal_min=5.0, goal_max=30.0, physics="through"):
+        goal_min=5.0, goal_max=30.0):
     h = lib.pf_create_sim(
         str(data_dir).encode(), int(map_id), int(num_agents), int(episode_length),
-        float(goal_min), float(goal_max), physics.encode(),
+        float(goal_min), float(goal_max),
     )
     if not h:
         raise RuntimeError("pf_create_sim failed")
     return h
 
 
-def create_scenario(lib, data_dir, map_id, json_path, physics="through"):
+def create_scenario(lib, data_dir, map_id, json_path):
     h = lib.pf_create_scenario(
-        str(data_dir).encode(), int(map_id), str(json_path).encode(), physics.encode(),
+        str(data_dir).encode(), int(map_id), str(json_path).encode(),
     )
     if not h:
         raise RuntimeError("pf_create_scenario failed")

@@ -18,7 +18,6 @@ typedef struct PfHandle {
     Offline off;
     Dict cfg;
     char data_dir[1024];
-    char physics[32];
     float* obs;
     float* act;
     float* rew;
@@ -26,13 +25,11 @@ typedef struct PfHandle {
 } PfHandle;
 
 static void pf_fill(PfHandle* h, const char* data_dir, int map_id, int num_agents,
-        int episode_length, float goal_min, float goal_max, const char* physics) {
+        int episode_length, float goal_min, float goal_max) {
     memset(&h->cfg, 0, sizeof(h->cfg));
     h->cfg.name = "drive";
     snprintf(h->data_dir, sizeof(h->data_dir), "%s", data_dir);
-    snprintf(h->physics, sizeof(h->physics), "%s", physics);
     dict_set(&h->cfg, "selected_agent_idx", 0);
-    dict_set_str(&h->cfg, "collision_physics", h->physics);
     dict_set(&h->cfg, "reward_vehicle_collision", -1.0);
     dict_set(&h->cfg, "reward_offroad_collision", -1.0);
     dict_set(&h->cfg, "reward_goal", 1.0);
@@ -65,23 +62,23 @@ static void pf_bind(PfHandle* h) {
 }
 
 PfHandle* pf_create_sim(const char* data_dir, int map_id, int num_agents,
-        int episode_length, float goal_min, float goal_max, const char* physics) {
+        int episode_length, float goal_min, float goal_max) {
     PfHandle* h = (PfHandle*)calloc(1, sizeof(PfHandle));
     assert(h);
     h->kind = PF_SIM;
-    pf_fill(h, data_dir, map_id, num_agents, episode_length, goal_min, goal_max, physics);
+    pf_fill(h, data_dir, map_id, num_agents, episode_length, goal_min, goal_max);
     puf_init(&h->off.drive, &h->cfg);
     pf_bind(h);
     return h;
 }
 
 PfHandle* pf_create_scenario(const char* data_dir, int map_id,
-        const char* json_path, const char* physics) {
+        const char* json_path) {
     PfHandle* h = (PfHandle*)calloc(1, sizeof(PfHandle));
     assert(h);
     h->kind = PF_SCENARIO;
     offline_parse(&h->off, json_path);
-    pf_fill(h, data_dir, map_id, h->off.log_n, 100000, 5.0f, 30.0f, physics);
+    pf_fill(h, data_dir, map_id, h->off.log_n, 100000, 5.0f, 30.0f);
     puf_init(&h->off.drive, &h->cfg);
     pf_bind(h);
     h->off.mean_x = h->off.drive.world_mean_x;
@@ -234,7 +231,6 @@ void pf_set_agent(PfHandle* h, int i, float x, float y, float heading,
         float vx, float vy, float width, float length, float gx, float gy) {
     Entity* e = &h->off.drive.entities[i];
     e->type = VEHICLE;
-    e->active_agent = 1;
     e->height = CAR_HEIGHT;
     e->lane_node = -1;
     e->width = width;

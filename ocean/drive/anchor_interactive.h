@@ -1709,15 +1709,13 @@ static void ademo_bind(Drive* env) {
     }
 }
 
-// Partners stay on the logged pose. active_agent stays 0 so a bump
-// pushes only the SDC, then the log pose is written again.
+// Partners stay on the logged pose.
 static void ademo_pin(Drive* env, int frame) {
     for (int i = 0; i < g_log_n; i++) {
         if (i == g_sdc) {
             continue;
         }
         offline_write_agent(&env->entities[i], &g_logs[i], frame);
-        env->entities[i].active_agent = 0;
         env->entities[i].goal_position_x = INVALID_POSITION;
         env->entities[i].goal_position_y = INVALID_POSITION;
     }
@@ -1735,7 +1733,6 @@ static void ademo_place(Drive* env, int frame) {
         offline_write_agent(&env->entities[i], &g_logs[i], frame);
     }
     ademo_pin(env, frame);
-    env->entities[g_sdc].active_agent = 1;
     env->selected_agent_idx = g_sdc;
     env->timestep = frame;
     env->bins_ready = 0;
@@ -1753,19 +1750,15 @@ static void ademo_replay_step(Drive* env) {
         move_dynamics(env, g_sdc);
     }
     ademo_pin(env, next);
-    env->entities[g_sdc].active_agent = 1;
-    bump_agents(env);
-    ademo_pin(env, next);
     collision_check(env, g_sdc);
     env->timestep = next;
     compute_observations(env);
 }
 
-// Town01 uses the trainer fleet and the trainer collision mode. Goals
-// are the forward-lane sample from initialize_env, then again on arrival.
+// Town01 uses the trainer fleet. Goals are the forward-lane sample
+// from initialize_env, then again on arrival.
 static void ademo_load_town(Drive* env, Dict* cfg, int which) {
     dict_set_str(cfg, "data_dir", "data/mixed");
-    dict_set_str(cfg, "collision_physics", "through");
     dict_set(cfg, "map_id", g_scenes[which].map_id);
     int n = g_fleet;
     if (n < 1) {
@@ -1799,7 +1792,6 @@ static void ademo_load(Drive* env, Dict* cfg, int which) {
         return;
     }
     dict_set_str(cfg, "data_dir", g_log_dir[0] ? g_log_dir : "data/womd");
-    dict_set_str(cfg, "collision_physics", "bump");
     const char* dir = dict_get_str(cfg, "data_dir");
     char path[1200];
     snprintf(path, sizeof(path), "%s/json/%s",

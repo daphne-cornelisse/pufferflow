@@ -75,7 +75,7 @@ def load_lib():
     lib.pf_create_sim.restype = handle
     lib.pf_create_sim.argtypes = [
         ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ctypes.c_float, ctypes.c_float, ctypes.c_char_p,
+        ctypes.c_float, ctypes.c_float,
     ]
     lib.pf_close.restype = None
     lib.pf_close.argtypes = [handle]
@@ -95,7 +95,7 @@ def load_lib():
 def create_sim(lib, num_agents, map_id=MAP_ID):
     sim = lib.pf_create_sim(
         str(DATA_DIR).encode(), int(map_id), int(num_agents), EPISODE_LENGTH,
-        GOAL_MIN, GOAL_MAX, b"through",
+        GOAL_MIN, GOAL_MAX,
     )
     if not sim:
         raise RuntimeError(f"pf_create_sim failed for map {map_id}, {num_agents} agents")

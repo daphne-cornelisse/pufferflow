@@ -90,7 +90,6 @@ typedef struct Entity {
     int goals_clean;
     int collided_this_goal;
     int failed;
-    int active_agent;
     int lane_node;
     // Signed speed and heading at the previous observation. dyn_ready
     // is 0 until that pair exists, so a fresh spawn reports no lag.
@@ -220,7 +219,6 @@ struct Env {
     // Target and the band around it, in m/s.
     float target_speed;
     float speed_band;
-    int collision_physics;
     unsigned int rng;
     int checkpoint_ok;
     char checkpoint_error[256];
@@ -1063,199 +1061,6 @@ int check_aabb_collision(Entity* car1, Entity* car2) {
     return 1;
 }
 
-static float box_radius(const Entity* e, float nx, float ny) {
-    float hl = e->length * 0.5f;
-    float hw = e->width * 0.5f;
-    float along = fabsf(hl * e->heading_x * nx + hl * e->heading_y * ny);
-    float side = fabsf(hw * (-e->heading_y) * nx + hw * e->heading_x * ny);
-    return along + side;
-}
-
-static void box_span(const Entity* e, float ax, float ay, float* lo, float* hi) {
-    float c = e->x * ax + e->y * ay;
-    float r = box_radius(e, ax, ay);
-    *lo = c - r;
-    *hi = c + r;
-}
-
-// Smallest translation that pulls a out of b. Normal points from b toward a.
-static int box_mtv(const Entity* a, const Entity* b,
-        float* nx, float* ny, float* depth) {
-    float axes[4][2] = {
-        {a->heading_x, a->heading_y},
-        {-a->heading_y, a->heading_x},
-        {b->heading_x, b->heading_y},
-        {-b->heading_y, b->heading_x}
-    };
-    float best = 1.0e9f;
-    float bx = 1.0f;
-    float by = 0.0f;
-    for (int i = 0; i < 4; i++) {
-        float ax = axes[i][0];
-        float ay = axes[i][1];
-        float a0, a1, b0, b1;
-        box_span(a, ax, ay, &a0, &a1);
-        box_span(b, ax, ay, &b0, &b1);
-        float overlap = fminf(a1, b1) - fmaxf(a0, b0);
-        if (overlap <= 0.0f) {
-            return 0;
-        }
-        if (overlap < best) {
-            best = overlap;
-            bx = ax;
-            by = ay;
-        }
-    }
-    if ((a->x - b->x) * bx + (a->y - b->y) * by < 0.0f) {
-        bx = -bx;
-        by = -by;
-    }
-    *nx = bx;
-    *ny = by;
-    *depth = best;
-    return 1;
-}
-
-// Centers came within both boxes during the step and finished past each
-// other. The sample at the end of the step would miss that pass-through.
-static int swept_bump(const Entity* a, const Entity* b,
-        float pax, float pay, float pbx, float pby,
-        float* nx, float* ny, float* depth) {
-    float rx = pax - pbx;
-    float ry = pay - pby;
-    float dx = (a->x - b->x) - rx;
-    float dy = (a->y - b->y) - ry;
-    float dd = dx * dx + dy * dy;
-    float t = 0.0f;
-    if (dd > 1.0e-8f) {
-        t = -(rx * dx + ry * dy) / dd;
-        if (t < 0.0f) {
-            t = 0.0f;
-        }
-        if (t > 1.0f) {
-            t = 1.0f;
-        }
-    }
-    float cx = rx + t * dx;
-    float cy = ry + t * dy;
-    float dist = sqrtf(cx * cx + cy * cy);
-    float nxx;
-    float nyy;
-    if (dist > 1.0e-3f) {
-        nxx = cx / dist;
-        nyy = cy / dist;
-    } else {
-        float rvx = a->vx - b->vx;
-        float rvy = a->vy - b->vy;
-        float rl = sqrtf(rvx * rvx + rvy * rvy);
-        if (rl < 1.0e-3f) {
-            return 0;
-        }
-        nxx = -rvx / rl;
-        nyy = -rvy / rl;
-    }
-    float sep = box_radius(a, nxx, nyy) + box_radius(b, nxx, nyy);
-    if (dist > sep) {
-        return 0;
-    }
-    float cur = (a->x - b->x) * nxx + (a->y - b->y) * nyy;
-    float dep = sep - cur;
-    if (dep <= 0.0f) {
-        return 0;
-    }
-    *nx = nxx;
-    *ny = nyy;
-    *depth = dep;
-    return 1;
-}
-
-static void bump_pair(Drive* env, Entity* a, Entity* b,
-        float pax, float pay, float pbx, float pby, int sweep) {
-    if (a->x == INVALID_POSITION || b->x == INVALID_POSITION) {
-        return;
-    }
-    int a_moves = a->active_agent == 1;
-    int b_moves = b->active_agent == 1;
-    if (!a_moves && !b_moves) {
-        return;
-    }
-    float dx = a->x - b->x;
-    float dy = a->y - b->y;
-    if (dx * dx + dy * dy > 40.0f * 40.0f) {
-        return;
-    }
-    float nx, ny, depth;
-    if (!box_mtv(a, b, &nx, &ny, &depth)) {
-        if (!sweep || !a_moves || !b_moves
-                || !swept_bump(a, b, pax, pay, pbx, pby, &nx, &ny, &depth)) {
-            return;
-        }
-    }
-    float share_a = a_moves ? (b_moves ? 0.5f : 1.0f) : 0.0f;
-    float share_b = b_moves ? (a_moves ? 0.5f : 1.0f) : 0.0f;
-    float push = depth + BUMP_SLOP;
-    float ma = push * share_a;
-    float mb = push * share_b;
-    if (ma > BUMP_MAX) {
-        ma = BUMP_MAX;
-    }
-    if (mb > BUMP_MAX) {
-        mb = BUMP_MAX;
-    }
-    a->x += nx * ma;
-    a->y += ny * ma;
-    b->x -= nx * mb;
-    b->y -= ny * mb;
-
-    float inv = (a_moves ? 1.0f : 0.0f) + (b_moves ? 1.0f : 0.0f);
-    float rv = (a->vx - b->vx) * nx + (a->vy - b->vy) * ny;
-    if (inv <= 0.0f || rv >= 0.0f) {
-        return;
-    }
-    float j = -(1.0f + BUMP_BOUNCE) * rv / inv;
-    if (a_moves) {
-        a->vx += j * nx;
-        a->vy += j * ny;
-    }
-    if (b_moves) {
-        b->vx -= j * nx;
-        b->vy -= j * ny;
-    }
-}
-
-// through leaves overlapping cars where they are. Road edges never push.
-static void bump_agents(Drive* env) {
-    if (env->collision_physics == COLLISION_THROUGH) {
-        return;
-    }
-    int n = env->active_agent_count;
-    if (n > DRIVE_AGENT_MAX) {
-        n = DRIVE_AGENT_MAX;
-    }
-    float prev_x[DRIVE_AGENT_MAX];
-    float prev_y[DRIVE_AGENT_MAX];
-    for (int i = 0; i < n; i++) {
-        Entity* e = &env->entities[i];
-        prev_x[i] = e->x - e->vx * SIM_DT;
-        prev_y[i] = e->y - e->vy * SIM_DT;
-    }
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < n; i++) {
-            for (int j = i + 1; j < n; j++) {
-                float dx = env->entities[i].x - env->entities[j].x;
-                float dy = env->entities[i].y - env->entities[j].y;
-                if (dx * dx + dy * dy > COLLISION_NEAR_SQ) {
-                    continue;
-                }
-                bump_pair(env,
-                    &env->entities[i], &env->entities[j],
-                    prev_x[i], prev_y[i], prev_x[j], prev_y[j],
-                    pass == 0);
-            }
-        }
-    }
-}
-
 static int agent_cell(Drive* env, float x, float y) {
     int cx = (int)((x - env->map_corners[0]) / COLLISION_NEAR);
     int cy = (int)((y - env->map_corners[1]) / COLLISION_NEAR);
@@ -1559,7 +1364,6 @@ static void load_world(Drive* env) {
         e->width = CAR_WIDTH * COLLISION_BOX_SCALE;
         e->length = CAR_LENGTH * COLLISION_BOX_SCALE;
         e->height = CAR_HEIGHT;
-        e->active_agent = i < n;
         e->valid = 1;
         e->collision_state = NO_COLLISION;
         e->x = INVALID_POSITION;
@@ -2165,7 +1969,6 @@ static void seat_logged(Entity* e, LogSpawn* s, int scored) {
     e->path_lon = 0.0f;
     e->path_n = 0;
     e->valid = 0;
-    e->active_agent = 0;
     e->vx = 0.0f;
     e->vy = 0.0f;
     e->vz = 0.0f;
@@ -2194,7 +1997,6 @@ static void seat_logged(Entity* e, LogSpawn* s, int scored) {
     e->length = length;
     e->width = width;
     e->valid = 1;
-    e->active_agent = scored;
     write_goal(e, s->gx, s->gy);
     e->goals_sampled = scored;
 }
@@ -2893,7 +2695,6 @@ void puf_step(Drive* env) {
         }
     }
 
-    bump_agents(env);
     // Human-replay runs to episode_length. Stopping at the goal would
     // reset inside a trainer horizon and count another episode.
     if (env->log_spawn && !env->goal_stop && !env->replay_x
@@ -2905,22 +2706,9 @@ void puf_step(Drive* env) {
     compute_observations(env);
 }
 
-static int collision_physics_mode(const char* name) {
-    if (strcmp(name, "bump") == 0) {
-        return COLLISION_BUMP;
-    }
-    if (strcmp(name, "through") == 0) {
-        return COLLISION_THROUGH;
-    }
-    fprintf(stderr, "collision_physics must be bump or through, got %s\n", name);
-    exit(1);
-}
-
 void puf_init(Env* env, Dict* kwargs) {
     init_action_space();
     env->selected_agent_idx = dict_get(kwargs, "selected_agent_idx");
-    env->collision_physics = collision_physics_mode(
-        dict_get_str(kwargs, "collision_physics"));
     env->reward_vehicle_collision = dict_get(kwargs, "reward_vehicle_collision");
     env->reward_offroad_collision = dict_get(kwargs, "reward_offroad_collision");
     env->reward_goal = dict_get(kwargs, "reward_goal");

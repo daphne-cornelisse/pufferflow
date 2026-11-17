@@ -37,14 +37,10 @@
 #define DRIVE_AGENT_MAX 256
 #endif
 
-// Collision state
+// Collision state. Overlap is reported and left in place.
 #define NO_COLLISION 0
 #define AGENT_COLLISION 1
 #define OFFROAD 2
-
-// Agent-agent response. bump separates the cars. through leaves the overlap.
-#define COLLISION_BUMP 0
-#define COLLISION_THROUGH 1
 
 // Grid map. 5 m cells: the vision spiral is about 50 m and collision
 // looks ±2 cells, which covers one bottleneck segment.
@@ -98,12 +94,6 @@
 // Distance thresholds
 // Arrival radius. A 5 m disk covers a 5 m centerline segment.
 #define MIN_DISTANCE_TO_GOAL 5.0f
-// Closing-speed bounce. 0 stops at the contact, 1 sends it back at full speed.
-#define BUMP_BOUNCE 0.4f
-// Extra gap so the next step does not start already overlapping.
-#define BUMP_SLOP 0.05f
-// Cap on one shove, in meters. A bad normal cannot throw a car across the map.
-#define BUMP_MAX 4.0f
 #define OBS_DIST_SQ 2500.0f
 // Center distance in meters. Farther pairs skip the box test.
 #define COLLISION_NEAR 20.0f

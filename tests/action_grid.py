@@ -92,7 +92,7 @@ def main():
     cont_clips = []
     agent_counts = []
     for map_id in range(N_MAPS):
-        h = drv.create_scenario(lib, t.DATA, map_id, t.JSONS[map_id], physics="through")
+        h = drv.create_scenario(lib, t.DATA, map_id, t.JSONS[map_id])
         try:
             for g in grids:
                 amin, amax, na, smin, smax, ns = g

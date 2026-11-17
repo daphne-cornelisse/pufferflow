@@ -121,7 +121,7 @@ def _roads_in(roads, x0, x1, y0, y1):
 def main():
     best, bike_grid, delta_grid = _specs()
     lib = drv.load()
-    h = drv.create_scenario(lib, t.DATA, MAP_ID, t.JSONS[MAP_ID], physics="through")
+    h = drv.create_scenario(lib, t.DATA, MAP_ID, t.JSONS[MAP_ID])
     try:
         fit = [i for i in range(lib.pf_log_n(h)) if not lib.pf_base_unfit(h, i)]
         sdc = int(lib.pf_sdc(h))

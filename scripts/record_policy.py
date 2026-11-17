@@ -37,7 +37,6 @@ ENV_KEYS = (
     "speed_band",
     "goal_distance_min",
     "goal_distance_max",
-    "collision_physics",
 )
 POLICY_KEYS = ("hidden_size", "num_layers")
 
