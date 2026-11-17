@@ -1079,6 +1079,11 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     if (num_maps < 1) {
         num_maps = 1;
     }
+    int map_offset = 0;
+    DictItem* off = dict_find(ek, "map_offset");
+    if (off) {
+        map_offset = (int)off->value;
+    }
     if (num_maps > 1) {
         saved_map_id = dict_get(ek, "map_id");
         restore_map_id = 1;
@@ -1086,7 +1091,7 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     while (agents_created < total_agents) {
         envs[num_envs].rng = num_envs;
         if (num_maps > 1) {
-            int map_id = num_envs % num_maps;
+            int map_id = map_offset + (num_envs % num_maps);
             dict_set(ek, "map_id", (double)map_id);
             if (map_id < 8) {
                 map_counts[map_id]++;
@@ -2567,6 +2572,7 @@ static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
     a->dist = anchor_dist_id(dist_s);
     a->coef = (float)puf_ini_get(ini, "train", "anchor_coef");
     a->on = 0;
+    // A set path is scored even when anchor_coef is 0.
     if (path[0] == 0) {
         return;
     }
@@ -3852,9 +3858,19 @@ typedef struct {
     pid_t pid;
     float* sample;
     TrainResult result;
+    char run_id[128];
 } SweepJob;
 
-void run_sweep(Ini* ini, const char* exe_path) {
+void run_sweep(Ini* ini, const char* exe_path, int argc, char** argv) {
+    // The child loads this file before the flattened overrides. Without it,
+    // drive falls back to carla_long.ini and puf_ini_put exits on WOMD keys.
+    const char* config_arg = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strncmp(argv[i], "--config=", 9) == 0) {
+            config_arg = argv[i];
+            break;
+        }
+    }
     // Build SweepSpace + param map from [sweep.<section>.<key>] sections.
     const char* goal = puf_ini_get_str(ini, "sweep", "goal");
     assert((strcmp(goal, "maximize") == 0 || strcmp(goal, "minimize") == 0)
@@ -4033,6 +4049,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
             char run_id[128];
             snprintf(run_id, sizeof(run_id), "sweep_%ld_%04d",
                 (long)(1000.0 * wall_clock()), job.run);
+            snprintf(job.run_id, sizeof(job.run_id), "%s", run_id);
             puf_ini_put(ini, "base.run_id", run_id);
 
             // Spawn train: result pipe + full ini as section.key=value argv.
@@ -4049,10 +4066,13 @@ void run_sweep(Ini* ini, const char* exe_path) {
             for (int s = 0; s < ini->num_sections; s++) {
                 nkeys += ini->sections[s].size;
             }
-            char** argv = (char**)calloc(nkeys + 3, sizeof(char*));
+            char** argv = (char**)calloc(nkeys + 4, sizeof(char*));
             argv[0] = (char*)exe_path;
             argv[1] = (char*)"train";
             int argc = 2;
+            if (config_arg) {
+                argv[argc++] = (char*)config_arg;
+            }
             char full_key[PUF_DICT_MAX_KEY * 2];
             char val[128];
             for (int s = 0; s < ini->num_sections; s++) {
@@ -4082,7 +4102,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
             assert(posix_spawnp(&job.pid, exe_path, &actions, NULL, argv, environ) == 0
                 && "posix_spawn train failed");
             posix_spawn_file_actions_destroy(&actions);
-            for (int a = 2; a < argc; a++) {
+            for (int a = config_arg ? 3 : 2; a < argc; a++) {
                 free(argv[a]);
             }
             free(argv);
@@ -4128,6 +4148,20 @@ void run_sweep(Ini* ini, const char* exe_path) {
         printf("sweep run=%d score=%.4f cost=%.2f steps=%.0f random=%d gp_obs=%d pareto=%d\n",
             job->run, job->result.score, job->result.cost, job->result.steps,
             job->random, job->gp_obs, job->pareto);
+        fflush(stdout);
+        Dict* sweep_dict = find_section(ini, "sweep");
+        DictItem* post = sweep_dict ? dict_find(sweep_dict, "post") : NULL;
+        if (post && post->str && post->str[0]) {
+            char cmd[4096];
+            snprintf(cmd, sizeof(cmd), "%s %s/%s/%s.ini", post->str,
+                puf_ini_get_str(ini, "base", "log_dir"),
+                puf_ini_get_str(ini, "base", "env_name"), job->run_id);
+            int post_rc = system(cmd);
+            if (post_rc != 0) {
+                fprintf(stderr, "sweep post run=%d status=%d\n",
+                    job->run, post_rc);
+            }
+        }
         completed++;
     }
 }
@@ -4451,6 +4485,12 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    char warm_buf[4096];
+    const char* warm = puf_checkpoint_path_key(ini, "load_model_path",
+        warm_buf, sizeof(warm_buf));
+    if (warm) {
+        pufferl_load_policy(pufferl, 0, warm);
+    }
     int record_every = (int)puf_ini_get(ini, "base", "record_rollout_every");
     int checkpoints_saved = 0;
     Selfplay selfplay = {0};
@@ -4709,14 +4749,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     // waitpid()s (and previously poisoned rank-0 CUDA graphs if children
     // exited early).
     close_pufferl(pufferl);
-
-    if (ctx->artifact_owner) {
-        FILE* fp = fopen(log_path, "w");
-        assert(fp && "failed to open log for writing");
-        fprintf(fp, "# PufferLib log v1\n");
-        puf_ini_write(fp, ini);
-        fclose(fp);
-    }
 
     // Final Protein point (points=1): bot ladder > pool match > train curve.
     if (bot_ladder && ctx->artifact_owner) {
@@ -5009,7 +5041,7 @@ int main(int argc, char** argv) {
     if (strcmp(mode, "train") == 0) {
         launch_train(&ini);
     } else if (strcmp(mode, "sweep") == 0) {
-        run_sweep(&ini, argv[0]);
+        run_sweep(&ini, argv[0], ini_argc, ini_argv);
     } else if (strcmp(mode, "eval") == 0) {
         run_eval(&ini, &ctx, EVAL_SCORE, 1, render);
     } else if (strcmp(mode, "match") == 0) {

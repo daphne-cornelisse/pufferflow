@@ -1694,7 +1694,7 @@ void ppo_loss_fwd_bwd(
 }
 
 // One sample, one thread. Adds coef/NT * d(distance)/d(policy logits).
-// partials[block] is the unweighted mean distance.
+// partials[block] is the unweighted mean distance, logged even at coef 0.
 // partials[gridDim + block] is coef times that mean. LOSS_TOTAL adds it,
 // so the logged total matches the gradient.
 __global__ void anchor_distance_kernel(

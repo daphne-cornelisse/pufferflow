@@ -55,6 +55,24 @@ import seaborn as sns
 # Seaborn's deep green. Other runs skip this color so only the best is green.
 BEST_COLOR = "#55A868"
 BEST_STAR_SIZE = 220
+# Best-run mark. The WOMD figure sets this to its own accent.
+PLOT_ACCENT = BEST_COLOR
+# Muted blues, sage, and sand, in the manner of the HALO figures.
+HALO_COLORS = (
+    "#3E6F8C",
+    "#7FA6B8",
+    "#8EAE9B",
+    "#C4A36A",
+    "#C4785A",
+    "#6E8494",
+    "#4E7A6E",
+    "#B7C3C6",
+    "#A67C62",
+    "#5C7394",
+    "#D2C2A4",
+    "#3F5E66",
+)
+HALO_ACCENT = "#C45C38"
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_LINE = re.compile(
@@ -413,10 +431,10 @@ def assign_palette(ordered, best):
     others = [key for key in ordered if key not in best]
     colors = distinct_colors(len(others))
     palette = {key: colors[i] for i, key in enumerate(others)}
-    green = mcolors.to_rgb(BEST_COLOR)
+    mark = mcolors.to_rgb(PLOT_ACCENT)
     for key in ordered:
         if key in best:
-            palette[key] = green
+            palette[key] = mark
     return palette
 
 
@@ -463,22 +481,22 @@ def scatter_stars(frame, x, y, ax):
         return
     ax.scatter(
         plotted[x], plotted[y],
-        marker="*", s=BEST_STAR_SIZE, c=[mcolors.to_rgb(BEST_COLOR)],
-        edgecolors="0.1", linewidths=0.45, zorder=6,
+        marker="*", s=BEST_STAR_SIZE, c=[mcolors.to_rgb(PLOT_ACCENT)],
+        edgecolors="#1C2830", linewidths=0.45, zorder=6,
     )
 
 
 def lift_best(ax):
     """Keep the green series above the other runs, and heavier so it stays visible."""
     for line in ax.lines:
-        if same_color(line.get_color(), BEST_COLOR):
+        if same_color(line.get_color(), PLOT_ACCENT):
             line.set_zorder(5)
             line.set_linewidth(2.4)
     for coll in ax.collections:
         facecolors = coll.get_facecolors()
         if len(facecolors) == 0:
             continue
-        if all(same_color(color, BEST_COLOR) for color in facecolors):
+        if all(same_color(color, PLOT_ACCENT) for color in facecolors):
             coll.set_zorder(6)
 
 
@@ -505,6 +523,19 @@ def fit_score_axis(ax, values):
     hi = float(finite.max())
     pad = max(hi * 0.08, 0.5)
     ax.set_ylim(-0.03, hi + pad)
+
+
+def fit_data_axis(ax, values):
+    """Zero stays visible. A rate uses a small pad; meters and steps use 1."""
+    finite = values.dropna()
+    if len(finite) == 0:
+        return
+    hi = float(finite.max())
+    if hi <= 1.0:
+        pad = max(hi * 0.18, 0.008)
+    else:
+        pad = max(hi * 0.08, 1.0)
+    ax.set_ylim(-0.04 * pad, hi + pad)
 
 
 def fit_failure_axis(ax, values):
@@ -1015,14 +1046,15 @@ def draw_distance_per_infraction(ax, counts, palette, markers=None):
     fit_failure_axis(ax, plotted[column])
 
 
-def scatter_wallclock(summary, x, y, ax, norm, markers=None, best=()):
+def scatter_wallclock(summary, x, y, ax, norm, markers=None, best=(),
+        cmap="viridis"):
     """Episode return colored by wall clock. The best run is still a green star."""
     stars, rest = split_best(summary, best)
     if len(rest):
         if markers is None:
             sns.scatterplot(
                 data=rest, x=x, y=y, hue="wall_min",
-                hue_norm=norm, palette="viridis", s=58, ax=ax,
+                hue_norm=norm, palette=cmap, s=58, ax=ax,
                 legend=False, edgecolor="white", linewidth=0.6,
             )
         else:
@@ -1032,7 +1064,7 @@ def scatter_wallclock(summary, x, y, ax, norm, markers=None, best=()):
                     continue
                 sns.scatterplot(
                     data=part, x=x, y=y, hue="wall_min",
-                    hue_norm=norm, palette="viridis", marker=marker, s=58, ax=ax,
+                    hue_norm=norm, palette=cmap, marker=marker, s=58, ax=ax,
                     legend=False, edgecolor="white", linewidth=0.6,
                 )
     scatter_stars(stars, x, y, ax)
@@ -1139,6 +1171,248 @@ def draw_hyper_scores(summary, out_dir):
     fig.savefig(path, dpi=100)
     plt.close(fig)
     return path
+
+
+# The third flag keeps a 0–1 axis. Collision rates sit near zero, so they
+# use the data range. ADE is meters and episode length is steps.
+HUMAN_FIELDS = (
+    ("hr_collision", "HR collision", False),
+    ("hr_at_fault", "HR at-fault", False),
+    ("wosac_meta", "WOSAC meta", True),
+    ("kinematic", "kinematic", True),
+    ("map_metric", "map", True),
+    ("interactive", "interactive", True),
+    ("ade", "ADE", False),
+    ("episode_length", "episode length", False),
+)
+
+
+def halo_palette(keys, best):
+    """One muted color per run. The best run uses the warm accent."""
+    ordered = list(dict.fromkeys(keys))
+    best = set(best or ())
+    others = [key for key in ordered if key not in best]
+    palette = {
+        key: HALO_COLORS[i % len(HALO_COLORS)]
+        for i, key in enumerate(others)
+    }
+    mark = mcolors.to_rgb(HALO_ACCENT)
+    for key in ordered:
+        if key in best:
+            palette[key] = mark
+    return palette
+
+
+def halo_cmap():
+    return mcolors.LinearSegmentedColormap.from_list(
+        "halo", ["#E6EEF2", "#7FA6B8", "#2C4A5A"],
+    )
+
+
+def style_halo(ax):
+    ax.set_axisbelow(True)
+    ax.grid(True, color="#E4EAEE", linewidth=0.6)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for spine in ax.spines.values():
+        spine.set_color("#C5CED6")
+    ax.tick_params(colors="#3E4A54", labelsize=8)
+    ax.title.set_color("#1C2830")
+    ax.xaxis.label.set_color("#3E4A54")
+    ax.yaxis.label.set_color("#3E4A54")
+
+
+def figure_axes_womd():
+    """Training rows, the anchor row, then two taller human-likeness rows.
+
+    Coefficient and network-size rows are omitted.
+    """
+    fig = plt.figure(figsize=(22.4, 26.8), dpi=100, layout="constrained")
+    fig.patch.set_facecolor("white")
+    # Two separate rows. A nested 2x4 grid collapses under constrained layout
+    # and leaves a blank band between the human-likeness panels.
+    outer = fig.add_gridspec(
+        7, 1, height_ratios=[1.0, 1.0, 1.0, 1.02, 0.18, 1.35, 1.35],
+    )
+    top = outer[0].subgridspec(1, 3, wspace=0.28)
+    mid = outer[1].subgridspec(1, 3, wspace=0.28)
+    axes = [fig.add_subplot(top[0, col]) for col in range(3)]
+    axes += [fig.add_subplot(mid[0, col]) for col in range(3)]
+    failure_grid = outer[2].subgridspec(1, 3, wspace=0.28)
+    failure_axes = [fig.add_subplot(failure_grid[0, col]) for col in range(3)]
+    pair = outer[3].subgridspec(1, 4, wspace=0.32)
+    anchor_axes = [fig.add_subplot(pair[0, col]) for col in range(4)]
+    label_ax = fig.add_subplot(outer[4])
+    human_top = outer[5].subgridspec(1, 4, wspace=0.32)
+    human_bot = outer[6].subgridspec(1, 4, wspace=0.32)
+    human_axes = [fig.add_subplot(human_top[0, col]) for col in range(4)]
+    human_axes += [fig.add_subplot(human_bot[0, col]) for col in range(4)]
+    return fig, axes, failure_axes, anchor_axes, label_ax, human_axes
+
+
+def draw_human_metric(ax, summary, key, title, rate, palette, best):
+    present = key in summary.columns and bool(summary[key].notna().any())
+    if not present:
+        blank_panel(ax, title, "no " + title)
+        return
+    scatter_metric(summary, "order", key, ax, palette, best=best)
+    if rate:
+        ax.set_ylim(-0.03, 1.03)
+    else:
+        fit_data_axis(ax, summary[key])
+    ax.set_xlabel("run order")
+    ax.set_ylabel("")
+    ax.set_title(title, fontsize=10)
+
+
+def draw_anchor_scatter(ax, summary, key, ylabel, title, palette, best, unit):
+    present = (
+        key in summary.columns
+        and "anchor_coef" in summary.columns
+        and bool(summary[key].notna().any())
+        and bool(summary["anchor_coef"].notna().any())
+    )
+    if not present:
+        blank_panel(ax, title, "no " + ylabel)
+        return
+    scatter_metric(summary, "anchor_coef", key, ax, palette, best=best)
+    if unit:
+        ax.set_ylim(-0.03, 1.03)
+    else:
+        fit_data_axis(ax, summary[key])
+    ax.set_xlabel("anchor coef")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+
+
+def attach_anchor_kl(summary, losses):
+    """Final logged distance to the anchor, one value per run."""
+    out = summary.copy()
+    if len(losses) == 0 or "anchor_loss" not in losses.columns:
+        out["anchor_kl"] = float("nan")
+        return out
+    last = losses.sort_values("steps").groupby("series", as_index=False).tail(1)
+    kl = last.set_index("series")["anchor_loss"]
+    out["anchor_kl"] = out["series"].map(kl)
+    return out
+
+
+def draw_womd_eval(returns, losses, counts, failures, summary, out):
+    """Sweep panels for a WOMD run. Town scores are left out."""
+    apply_figure_style()
+    summary = with_series(summary)
+    returns = with_series(returns)
+    if len(losses):
+        losses = with_series(losses)
+    if len(counts):
+        counts = with_series(counts)
+    if len(failures):
+        failures = with_series(failures)
+    summary = attach_anchor_kl(summary, losses)
+    best = best_series(summary)
+    global PLOT_ACCENT
+    previous_accent = PLOT_ACCENT
+    PLOT_ACCENT = HALO_ACCENT
+    palette = halo_palette(summary["series"], best)
+    fig, axes, failure_axes, anchor_axes, label_ax, human_axes = (
+        figure_axes_womd()
+    )
+
+    draw_objective(axes[0], summary, palette, "order", best=best)
+
+    lo = float(summary["wall_min"].min())
+    hi = float(summary["wall_min"].max())
+    if lo == hi:
+        lo, hi = lo - 1.0, hi + 1.0
+    norm = plt.Normalize(lo, hi)
+    clock = halo_cmap()
+    scatter_wallclock(
+        summary, "order", "episode_return", axes[1], norm,
+        best=best, cmap=clock,
+    )
+    colorbar = fig.colorbar(
+        plt.cm.ScalarMappable(norm=norm, cmap=clock), ax=axes[1], pad=0.02,
+    )
+    colorbar.set_label("wall clock (min)")
+    colorbar.outline.set_edgecolor("#C5CED6")
+    axes[1].set_xlabel("run order")
+    axes[1].set_ylabel("episode return")
+    axes[1].set_title("Episode return vs run order")
+
+    sns.lineplot(
+        data=returns, x="steps", y="episode_return", hue="series",
+        palette=palette, estimator=None, linewidth=1.3, ax=axes[2], legend=False,
+    )
+    axes[2].ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+    axes[2].set_xlabel("steps")
+    axes[2].set_ylabel("episode return")
+    axes[2].set_title("Episode return vs steps")
+
+    draw_anchor_loss(axes[3], losses, palette)
+
+    has_jerk = bool(summary["jerk"].notna().all() and summary["smooth"].notna().all())
+    if has_jerk:
+        scatter_metric(summary, "jerk", "score", axes[4], palette, best=best)
+        axes[4].set_xlabel("jerk")
+        axes[4].set_ylabel("score")
+        axes[4].set_title("Score vs jerk")
+        axes[4].set_ylim(-0.03, 1.03)
+    else:
+        draw_distance_per_infraction(axes[4], counts, palette)
+
+    scatter_metric(summary, "order", "parameters", axes[5], palette, best=best)
+    axes[5].set_yscale("log")
+    axes[5].axhline(2_000_000, color="0.35", linestyle="--", linewidth=0.9, zorder=0)
+    axes[5].set_xlabel("run order")
+    axes[5].set_ylabel("parameters")
+    axes[5].set_title("Network parameters")
+
+    draw_failure(failure_axes, summary, failures, palette, "order", best=best)
+    step_axes = [axes[2], axes[3], failure_axes[2]]
+    if not has_jerk:
+        step_axes.append(axes[4])
+    for ax in step_axes:
+        ax.xaxis.set_major_formatter(
+            plt.FuncFormatter(lambda value, _pos: f"{value / 1e6:.0f}")
+        )
+        ax.set_xlabel("steps (millions)")
+        ax.xaxis.get_offset_text().set_visible(False)
+    draw_score_vs_anchor(anchor_axes[0], summary, palette, best=best)
+    draw_anchor_scatter(
+        anchor_axes[1], summary, "anchor_kl", "KL to anchor",
+        "KL to anchor vs anchor coef", palette, best, False,
+    )
+    draw_anchor_scatter(
+        anchor_axes[2], summary, "wosac_meta", "WOSAC meta",
+        "WOSAC meta vs anchor coef", palette, best, True,
+    )
+    draw_anchor_scatter(
+        anchor_axes[3], summary, "hr_at_fault", "at-fault collision",
+        "At-fault collision vs anchor coef", palette, best, False,
+    )
+    label_ax.set_xlim(0, 1)
+    label_ax.set_ylim(0, 1)
+    label_ax.set_axis_off()
+    label_ax.add_patch(plt.Rectangle(
+        (0, 0.12), 1, 0.76, color="#E4EEF3", zorder=0,
+    ))
+    label_ax.text(
+        0.012, 0.5, "Human-likeness evals",
+        ha="left", va="center", fontsize=14, color="#1C3A4A",
+    )
+    for ax, (key, title, rate) in zip(human_axes, HUMAN_FIELDS):
+        draw_human_metric(ax, summary, key, title, rate, palette, best)
+        ax.tick_params(axis="x", labelsize=8)
+        ax.title.set_fontsize(12)
+    for ax in list(axes) + list(failure_axes) + list(anchor_axes) + list(human_axes):
+        style_halo(ax)
+        lift_best(ax)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fig.savefig(out, dpi=100)
+    finally:
+        plt.close(fig)
+        PLOT_ACCENT = previous_accent
 
 
 def draw(returns, losses, counts, failures, summary, out):

@@ -19,6 +19,21 @@ typedef Env Drive;
 
 typedef struct Client Client;
 
+// One logged mover at init_steps. Waymo binaries only.
+typedef struct LogSpawn {
+    float x;
+    float y;
+    float heading;
+    float vx;
+    float vy;
+    float gx;
+    float gy;
+    float length;
+    float width;
+    int id;
+    int type;
+} LogSpawn;
+
 struct Log {
     float episode_return;
     float episode_length;
@@ -37,6 +52,12 @@ struct Log {
     float speed_sum;
     float speed_steps;
     float n;
+    // Human-replay. 1 if this car caused the contact. Route progress
+    // is arc length along the log. The two errors are means, in meters.
+    float at_fault_collision_rate;
+    float route_progress;
+    float lateral_error;
+    float longitudinal_error;
 };
 
 typedef struct Entity {
@@ -51,6 +72,7 @@ typedef struct Entity {
     float goal_position_y;
     float goal_position_z;
     int collision_state;
+    int offroad_state;
     float x;
     float y;
     float z;
@@ -75,6 +97,10 @@ typedef struct Entity {
     float dyn_speed;
     float dyn_heading;
     int dyn_ready;
+    // Human-replay sums along the logged path. path_n is the step count.
+    float path_lat;
+    float path_lon;
+    int path_n;
 } Entity;
 
 void free_entity(Entity* entity) {
@@ -245,6 +271,39 @@ struct Env {
     int* bin_head;
     int* bin_next;
     Dict* cfg;
+    // Waymo log spawn, centered with the roads. Empty on CARLA.
+    // control_mode picks who is spawned. max_controlled caps mixed play.
+    LogSpawn* spawns;
+    int spawn_n;
+    int log_spawn;
+    int control_mode;
+    int max_controlled;
+    // 0 uses frame 0. WOSAC eval starts at frame 10.
+    int init_steps;
+    // 0 keeps MIN_DISTANCE_TO_GOAL. WOSAC eval uses 2 m.
+    float goal_radius;
+    float goal_speed;
+    // Hold the logged goal. Training removes the car and can end early.
+    int goal_stop;
+    int wosac_on;
+    int wosac_fill;
+    int wosac_rolls;
+    char wosac_dir[512];
+    float* wosac_x;
+    float* wosac_y;
+    float* wosac_h;
+    // Policy cars plus log-replay partners. Equal to active_agent_count
+    // except in human-replay, where partners sit past the policy slots.
+    int body_count;
+    // Logged poses for human-replay, centered with the roads. Index
+    // spawn * replay_len + frame. Empty unless control_sdc_only.
+    int replay_len;
+    float* replay_x;
+    float* replay_y;
+    float* replay_h;
+    float* replay_vx;
+    float* replay_vy;
+    unsigned char* replay_v;
 };
 
 static int puf_sim_paused(Drive* env) {
@@ -254,7 +313,118 @@ static int puf_sim_paused(Drive* env) {
     return env->sim_paused || env->sim_hold_step;
 }
 
-// Roads only.
+static void read_road(FILE* file, Entity* e, int type, int size) {
+    assert(type >= ROAD_LANE && type <= DRIVEWAY);
+    assert(size >= 1);
+    e->type = type;
+    e->array_size = size;
+    e->pts_x = (float*)malloc((size_t)size * sizeof(float));
+    e->pts_y = (float*)malloc((size_t)size * sizeof(float));
+    float* z = (float*)malloc((size_t)size * sizeof(float));
+    assert(e->pts_x && e->pts_y && z);
+    assert(fread(e->pts_x, sizeof(float), size, file) == (size_t)size);
+    assert(fread(e->pts_y, sizeof(float), size, file) == (size_t)size);
+    assert(fread(z, sizeof(float), size, file) == (size_t)size);
+    free(z);
+    int mark = 0;
+    assert(fread(&e->width, sizeof(float), 1, file) == 1);
+    assert(fread(&e->length, sizeof(float), 1, file) == 1);
+    assert(fread(&e->height, sizeof(float), 1, file) == 1);
+    assert(fread(&e->goal_position_x, sizeof(float), 1, file) == 1);
+    assert(fread(&e->goal_position_y, sizeof(float), 1, file) == 1);
+    assert(fread(&e->goal_position_z, sizeof(float), 1, file) == 1);
+    assert(fread(&mark, sizeof(int), 1, file) == 1);
+}
+
+static void skip_bytes(FILE* file, long n) {
+    assert(n >= 0);
+    assert(fseek(file, n, SEEK_CUR) == 0);
+}
+
+// One sample at `step`, then skip the rest of a length-traj series.
+static float read_at(FILE* file, int traj, int step) {
+    assert(step >= 0 && step < traj);
+    if (step > 0) {
+        skip_bytes(file, (long)step * (long)sizeof(float));
+    }
+    float v = 0.0f;
+    assert(fread(&v, sizeof(float), 1, file) == 1);
+    int rest = traj - step - 1;
+    if (rest > 0) {
+        skip_bytes(file, (long)rest * (long)sizeof(float));
+    }
+    return v;
+}
+
+#define CONTROL_VEHICLES 0
+#define CONTROL_AGENTS 1
+#define CONTROL_WOSAC 2
+#define CONTROL_SDC_ONLY 3
+#define CONTROL_MIXED_PLAY 4
+// PufferDrive keeps this many actors in a human-replay scene.
+#define REPLAY_ACTORS 32
+
+static int drive_control_mode(const char* name) {
+    if (strcmp(name, "control_vehicles") == 0) {
+        return CONTROL_VEHICLES;
+    }
+    if (strcmp(name, "control_wosac") == 0) {
+        return CONTROL_WOSAC;
+    }
+    if (strcmp(name, "control_sdc_only") == 0) {
+        return CONTROL_SDC_ONLY;
+    }
+    if (strcmp(name, "control_mixed_play") == 0) {
+        return CONTROL_MIXED_PLAY;
+    }
+    if (strcmp(name, "control_agents") == 0) {
+        return CONTROL_AGENTS;
+    }
+    fprintf(stderr,
+        "control_mode must be control_vehicles, control_agents, "
+        "control_wosac, control_sdc_only, or control_mixed_play, got %s\n",
+        name);
+    exit(1);
+}
+
+static int control_type_ok(int mode, int type) {
+    if (type == VEHICLE) {
+        return 1;
+    }
+    if (mode == CONTROL_VEHICLES) {
+        return 0;
+    }
+    return type == PEDESTRIAN || type == CYCLIST;
+}
+
+// map_id-th int in <map dir>/sdc.bin. -1 if that file is absent.
+static int read_map_sdc(const char* map_file, int map_id) {
+    const char* slash = strrchr(map_file, '/');
+    assert(slash && map_id >= 0);
+    char path[512];
+    int dir_n = (int)(slash - map_file);
+    assert(dir_n > 0 && dir_n + 9 < (int)sizeof(path));
+    memcpy(path, map_file, (size_t)dir_n);
+    memcpy(path + dir_n, "/sdc.bin", 9);
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        return -1;
+    }
+    int count = 0;
+    int sdc = 0;
+    assert(fread(&count, sizeof(int), 1, f) == 1);
+    assert(map_id < count);
+    assert(fseek(f, (long)map_id * (long)sizeof(int), SEEK_CUR) == 0);
+    assert(fread(&sdc, sizeof(int), 1, f) == 1);
+    fclose(f);
+    return sdc;
+}
+
+// CARLA files are roads only: int count, then road records.
+// Waymo files are int objects, roads, first agent type, trajectory
+// length 91, then each object (series, size, goal, mark, next type,
+// next length). The last object's next type and length are the first
+// road header. Roads then use the CARLA record.
 Entity* load_map_binary(const char* filename, Drive* env) {
     FILE* file = fopen(filename, "rb");
     if (!file) {
@@ -262,37 +432,264 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             filename ? filename : "(null)", strerror(errno));
         exit(1);
     }
-    assert(fread(&env->num_roads, sizeof(int), 1, file) == 1);
-    assert(env->num_roads >= 0);
-    env->num_objects = 0;
-    env->num_entities = env->num_roads;
-    Entity* entities = (Entity*)calloc((size_t)env->num_roads, sizeof(Entity));
-    assert(entities || env->num_roads == 0);
-    for (int i = 0; i < env->num_roads; i++) {
-        int size = 0;
-        assert(fread(&entities[i].type, sizeof(int), 1, file) == 1);
-        assert(fread(&size, sizeof(int), 1, file) == 1);
-        assert(entities[i].type >= ROAD_LANE && entities[i].type <= DRIVEWAY);
-        assert(size >= 1);
-        entities[i].array_size = size;
-        entities[i].pts_x = (float*)malloc((size_t)size * sizeof(float));
-        entities[i].pts_y = (float*)malloc((size_t)size * sizeof(float));
-        float* z = (float*)malloc((size_t)size * sizeof(float));
-        assert(entities[i].pts_x && entities[i].pts_y && z);
-        assert(fread(entities[i].pts_x, sizeof(float), size, file)
-            == (size_t)size);
-        assert(fread(entities[i].pts_y, sizeof(float), size, file)
-            == (size_t)size);
-        assert(fread(z, sizeof(float), size, file) == (size_t)size);
-        free(z);
+    free(env->spawns);
+    env->spawns = NULL;
+    env->spawn_n = 0;
+    env->log_spawn = 0;
+    free(env->replay_x);
+    free(env->replay_y);
+    free(env->replay_h);
+    free(env->replay_vx);
+    free(env->replay_vy);
+    free(env->replay_v);
+    env->replay_x = NULL;
+    env->replay_y = NULL;
+    env->replay_h = NULL;
+    env->replay_vx = NULL;
+    env->replay_vy = NULL;
+    env->replay_v = NULL;
+    env->replay_len = 0;
+    int head[4];
+    assert(fread(head, sizeof(int), 4, file) == 4);
+    int log_map = head[3] == 91 && head[0] >= 0 && head[0] <= 512
+        && head[1] > 0 && head[2] >= VEHICLE && head[2] <= 3;
+    if (!log_map) {
+        assert(fseek(file, 0, SEEK_SET) == 0);
+        assert(fread(&env->num_roads, sizeof(int), 1, file) == 1);
+        assert(env->num_roads >= 0);
+        env->num_objects = 0;
+        env->log_spawn = 0;
+        env->num_entities = env->num_roads;
+        Entity* entities = (Entity*)calloc((size_t)env->num_roads, sizeof(Entity));
+        assert(entities || env->num_roads == 0);
+        for (int i = 0; i < env->num_roads; i++) {
+            int type = 0;
+            int size = 0;
+            assert(fread(&type, sizeof(int), 1, file) == 1);
+            assert(fread(&size, sizeof(int), 1, file) == 1);
+            read_road(file, &entities[i], type, size);
+        }
+        unsigned char extra = 0;
+        assert(fread(&extra, 1, 1, file) == 0);
+        fclose(file);
+        return entities;
+    }
+
+    int nobj = head[0];
+    int nroads = head[1];
+    int type = head[2];
+    int traj = head[3];
+    int replay = env->control_mode == CONTROL_SDC_ONLY;
+    // Five pose series per object, kept only for human-replay.
+    float* series = NULL;
+    int* vseries = NULL;
+    if (replay && nobj > 0) {
+        series = (float*)malloc(
+            (size_t)5 * (size_t)nobj * (size_t)traj * sizeof(float));
+        vseries = (int*)malloc((size_t)nobj * (size_t)traj * sizeof(int));
+        assert(series && vseries);
+    }
+    LogSpawn cand[512];
+    int cand_i[512];
+    int cand_type[512];
+    int cand_expert[512];
+    float dist2[512];
+    int nc = 0;
+    int road_type = 0;
+    int road_size = 0;
+    for (int i = 0; i < nobj; i++) {
+        int step = env->init_steps;
+        assert(step >= 0 && step < traj);
+        float x = 0.0f;
+        float y = 0.0f;
+        float vx = 0.0f;
+        float vy = 0.0f;
+        float heading = 0.0f;
+        int valid = 0;
+        if (replay) {
+            float* row = series + (size_t)i * 5 * (size_t)traj;
+            assert(fread(row, sizeof(float), (size_t)traj, file)
+                == (size_t)traj);
+            assert(fread(row + traj, sizeof(float), (size_t)traj, file)
+                == (size_t)traj);
+            skip_bytes(file, (long)traj * (long)sizeof(float));
+            assert(fread(row + 2 * traj, sizeof(float), (size_t)traj, file)
+                == (size_t)traj);
+            assert(fread(row + 3 * traj, sizeof(float), (size_t)traj, file)
+                == (size_t)traj);
+            skip_bytes(file, (long)traj * (long)sizeof(float));
+            assert(fread(row + 4 * traj, sizeof(float), (size_t)traj, file)
+                == (size_t)traj);
+            int* vv = vseries + (size_t)i * (size_t)traj;
+            assert(fread(vv, sizeof(int), (size_t)traj, file) == (size_t)traj);
+            x = row[step];
+            y = row[traj + step];
+            vx = row[2 * traj + step];
+            vy = row[3 * traj + step];
+            heading = row[4 * traj + step];
+            valid = vv[step];
+        } else {
+            x = read_at(file, traj, step);
+            y = read_at(file, traj, step);
+            skip_bytes(file, (long)traj * (long)sizeof(float));
+            vx = read_at(file, traj, step);
+            vy = read_at(file, traj, step);
+            skip_bytes(file, (long)traj * (long)sizeof(float));
+            heading = read_at(file, traj, step);
+            if (step > 0) {
+                skip_bytes(file, (long)step * (long)sizeof(int));
+            }
+            assert(fread(&valid, sizeof(int), 1, file) == 1);
+            int rest = traj - step - 1;
+            if (rest > 0) {
+                skip_bytes(file, (long)rest * (long)sizeof(int));
+            }
+        }
+        float width = 0.0f;
+        float length = 0.0f;
+        float height = 0.0f;
+        float gx = 0.0f;
+        float gy = 0.0f;
+        float gz = 0.0f;
         int mark = 0;
-        assert(fread(&entities[i].width, sizeof(float), 1, file) == 1);
-        assert(fread(&entities[i].length, sizeof(float), 1, file) == 1);
-        assert(fread(&entities[i].height, sizeof(float), 1, file) == 1);
-        assert(fread(&entities[i].goal_position_x, sizeof(float), 1, file) == 1);
-        assert(fread(&entities[i].goal_position_y, sizeof(float), 1, file) == 1);
-        assert(fread(&entities[i].goal_position_z, sizeof(float), 1, file) == 1);
+        assert(fread(&width, sizeof(float), 1, file) == 1);
+        assert(fread(&length, sizeof(float), 1, file) == 1);
+        assert(fread(&height, sizeof(float), 1, file) == 1);
+        assert(fread(&gx, sizeof(float), 1, file) == 1);
+        assert(fread(&gy, sizeof(float), 1, file) == 1);
+        assert(fread(&gz, sizeof(float), 1, file) == 1);
         assert(fread(&mark, sizeof(int), 1, file) == 1);
+        assert(fread(&road_type, sizeof(int), 1, file) == 1);
+        assert(fread(&road_size, sizeof(int), 1, file) == 1);
+        int moving = type == VEHICLE || type == PEDESTRIAN || type == CYCLIST;
+        if (moving && valid) {
+            assert(nc < 512);
+            float dx = gx - x;
+            float dy = gy - y;
+            cand[nc].x = x;
+            cand[nc].y = y;
+            cand[nc].heading = heading;
+            cand[nc].vx = vx;
+            cand[nc].vy = vy;
+            cand[nc].gx = gx;
+            cand[nc].gy = gy;
+            cand[nc].length = length;
+            cand[nc].width = width;
+            cand[nc].id = i;
+            cand[nc].type = type;
+            cand_i[nc] = i;
+            cand_type[nc] = type;
+            cand_expert[nc] = mark != 0;
+            dist2[nc] = dx * dx + dy * dy;
+            nc++;
+        }
+        type = road_type;
+    }
+    // File order, self-driving car first. WOSAC keeps every valid mover.
+    // Human-replay keeps the SDC plus other valid movers, capped at
+    // REPLAY_ACTORS, and does not drop experts or near goals.
+    // The other modes skip expert tracks and goals closer than 5 m.
+    int mode = env->control_mode;
+    int sdc = read_map_sdc(filename, env->map_id);
+    int sdc_at = -1;
+    if (sdc >= 0) {
+        for (int i = 0; i < nc; i++) {
+            if (cand_i[i] == sdc) {
+                sdc_at = i;
+                break;
+            }
+        }
+    }
+    int cap = env->max_agents;
+    if (mode == CONTROL_MIXED_PLAY && env->max_controlled > 0
+            && env->max_controlled < cap) {
+        cap = env->max_controlled;
+    }
+    float min2 = MIN_DISTANCE_TO_GOAL * MIN_DISTANCE_TO_GOAL;
+    LogSpawn keep[512];
+    int keep_from[512];
+    int nk = 0;
+    if (mode == CONTROL_SDC_ONLY) {
+        assert(sdc_at >= 0);
+        keep[0] = cand[sdc_at];
+        keep_from[0] = cand_i[sdc_at];
+        nk = 1;
+        for (int i = 0; i < nc && nk < REPLAY_ACTORS; i++) {
+            if (i == sdc_at) {
+                continue;
+            }
+            if (!control_type_ok(mode, cand_type[i])) {
+                continue;
+            }
+            keep[nk] = cand[i];
+            keep_from[nk] = cand_i[i];
+            nk++;
+        }
+    } else {
+        if (sdc_at >= 0 && control_type_ok(mode, cand_type[sdc_at])) {
+            keep[nk++] = cand[sdc_at];
+        }
+        for (int i = 0; i < nc && nk < cap; i++) {
+            if (i == sdc_at) {
+                continue;
+            }
+            if (!control_type_ok(mode, cand_type[i])) {
+                continue;
+            }
+            if (mode != CONTROL_WOSAC
+                    && (cand_expert[i] || dist2[i] < min2)) {
+                continue;
+            }
+            keep[nk++] = cand[i];
+        }
+    }
+    if (nk > 0) {
+        env->spawns = (LogSpawn*)malloc((size_t)nk * sizeof(LogSpawn));
+        assert(env->spawns);
+        memcpy(env->spawns, keep, (size_t)nk * sizeof(LogSpawn));
+    }
+    if (replay && nk > 0) {
+        size_t m = (size_t)nk * (size_t)traj;
+        env->replay_len = traj;
+        env->replay_x = (float*)malloc(m * sizeof(float));
+        env->replay_y = (float*)malloc(m * sizeof(float));
+        env->replay_h = (float*)malloc(m * sizeof(float));
+        env->replay_vx = (float*)malloc(m * sizeof(float));
+        env->replay_vy = (float*)malloc(m * sizeof(float));
+        env->replay_v = (unsigned char*)malloc(m);
+        assert(env->replay_x && env->replay_y && env->replay_h
+            && env->replay_vx && env->replay_vy && env->replay_v);
+        for (int j = 0; j < nk; j++) {
+            float* row = series + (size_t)keep_from[j] * 5 * (size_t)traj;
+            int* vv = vseries + (size_t)keep_from[j] * (size_t)traj;
+            for (int t = 0; t < traj; t++) {
+                size_t k = (size_t)j * (size_t)traj + (size_t)t;
+                env->replay_x[k] = row[t];
+                env->replay_y[k] = row[traj + t];
+                env->replay_vx[k] = row[2 * traj + t];
+                env->replay_vy[k] = row[3 * traj + t];
+                env->replay_h[k] = row[4 * traj + t];
+                env->replay_v[k] = vv[t] ? 1 : 0;
+            }
+        }
+    }
+    free(series);
+    free(vseries);
+    env->spawn_n = nk;
+    env->log_spawn = 1;
+    env->num_roads = nroads;
+    env->num_objects = 0;
+    env->num_entities = nroads;
+    Entity* entities = (Entity*)calloc((size_t)nroads, sizeof(Entity));
+    assert(entities);
+    for (int i = 0; i < nroads; i++) {
+        int rtype = road_type;
+        int rsize = road_size;
+        if (i > 0) {
+            assert(fread(&rtype, sizeof(int), 1, file) == 1);
+            assert(fread(&rsize, sizeof(int), 1, file) == 1);
+        }
+        read_road(file, &entities[i], rtype, rsize);
     }
     unsigned char extra = 0;
     assert(fread(&extra, 1, 1, file) == 0);
@@ -878,6 +1275,7 @@ static int agent_cell(Drive* env, float x, float y) {
 int collision_check(Drive* env, int agent_idx) {
     Entity* agent = &env->entities[agent_idx];
     if (agent->x == INVALID_POSITION) {
+        agent->offroad_state = 0;
         return -1;
     }
 
@@ -894,6 +1292,7 @@ int collision_check(Drive* env, int agent_idx) {
     }
 
     int collided = NO_COLLISION;
+    int offroad = 0;
     int car_collided_with_index = -1;
 
     // Check road edge collisions via grid
@@ -919,11 +1318,12 @@ int collision_check(Drive* env, int agent_idx) {
         for (int k = 0; k < 4; k++) {
             int next = (k + 1) % 4;
             if (check_line_intersection(corners[k], corners[next], start, end)) {
+                offroad = 1;
                 collided = OFFROAD;
                 break;
             }
         }
-        if (collided == OFFROAD) {
+        if (offroad) {
             break;
         }
     }
@@ -933,7 +1333,7 @@ int collision_check(Drive* env, int agent_idx) {
     if (!env->bins_ready) {
         int cells = env->near_cols * env->near_rows;
         memset(env->bin_head, 0xff, (size_t)cells * sizeof(int));
-        for (int i = 0; i < env->active_agent_count; i++) {
+        for (int i = 0; i < env->body_count; i++) {
             Entity* e = &env->entities[i];
             if (e->x == INVALID_POSITION || e->y == INVALID_POSITION) {
                 continue;
@@ -971,6 +1371,7 @@ int collision_check(Drive* env, int agent_idx) {
         }
     }
 
+    agent->offroad_state = offroad;
     agent->collision_state = collided;
     return car_collided_with_index;
 }
@@ -1112,6 +1513,29 @@ static void release_world(Drive* env) {
     free(env->bin_next);
     env->bin_next = NULL;
     env->bins_ready = 0;
+    free(env->spawns);
+    env->spawns = NULL;
+    env->spawn_n = 0;
+    env->log_spawn = 0;
+    free(env->replay_x);
+    free(env->replay_y);
+    free(env->replay_h);
+    free(env->replay_vx);
+    free(env->replay_vy);
+    free(env->replay_v);
+    env->replay_x = NULL;
+    env->replay_y = NULL;
+    env->replay_h = NULL;
+    env->replay_vx = NULL;
+    env->replay_vy = NULL;
+    env->replay_v = NULL;
+    env->replay_len = 0;
+    free(env->wosac_x);
+    free(env->wosac_y);
+    free(env->wosac_h);
+    env->wosac_x = NULL;
+    env->wosac_y = NULL;
+    env->wosac_h = NULL;
 }
 
 static void load_world(Drive* env) {
@@ -1119,17 +1543,23 @@ static void load_world(Drive* env) {
     assert(env->entities);
     int n = env->max_agents;
     assert(n >= 1 && n <= DRIVE_AGENT_MAX);
+    int extra = 0;
+    if (env->control_mode == CONTROL_SDC_ONLY && env->spawn_n > 1) {
+        extra = env->spawn_n - 1;
+    }
+    int bodies = n + extra;
+    assert(bodies <= DRIVE_AGENT_MAX);
     int nroads = env->num_roads;
     Entity* neu = (Entity*)calloc(
-        (size_t)n + (size_t)nroads, sizeof(Entity));
+        (size_t)bodies + (size_t)nroads, sizeof(Entity));
     assert(neu);
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < bodies; i++) {
         Entity* e = &neu[i];
         e->type = VEHICLE;
         e->width = CAR_WIDTH * COLLISION_BOX_SCALE;
         e->length = CAR_LENGTH * COLLISION_BOX_SCALE;
         e->height = CAR_HEIGHT;
-        e->active_agent = 1;
+        e->active_agent = i < n;
         e->valid = 1;
         e->collision_state = NO_COLLISION;
         e->x = INVALID_POSITION;
@@ -1137,15 +1567,35 @@ static void load_world(Drive* env) {
         e->lane_node = -1;
     }
     if (nroads > 0) {
-        memcpy(neu + n, env->entities, (size_t)nroads * sizeof(Entity));
+        memcpy(neu + bodies, env->entities, (size_t)nroads * sizeof(Entity));
     }
     free(env->entities);
     env->entities = neu;
-    env->num_objects = n;
-    env->num_entities = n + nroads;
+    env->num_objects = bodies;
+    env->num_entities = bodies + nroads;
     env->active_agent_count = n;
+    env->body_count = bodies;
     env->num_agents = n;
     set_means(env);
+    for (int i = 0; i < env->spawn_n; i++) {
+        env->spawns[i].x -= env->world_mean_x;
+        env->spawns[i].y -= env->world_mean_y;
+        env->spawns[i].gx -= env->world_mean_x;
+        env->spawns[i].gy -= env->world_mean_y;
+    }
+    if (env->replay_x) {
+        int len = env->replay_len;
+        for (int s = 0; s < env->spawn_n; s++) {
+            for (int t = 0; t < len; t++) {
+                int k = s * len + t;
+                if (!env->replay_v[k]) {
+                    continue;
+                }
+                env->replay_x[k] -= env->world_mean_x;
+                env->replay_y[k] -= env->world_mean_y;
+            }
+        }
+    }
     build_lanes(env);
     init_grid_map(env);
     env->vision_range = VISION_RANGE;
@@ -1272,7 +1722,7 @@ void compute_observations(Drive* env) {
         // First MAX_AGENTS partners in index order, inside range.
         int obs_idx = EGO_FEATURES;
         int cars_seen = 0;
-        int nscan = env->active_agent_count;
+        int nscan = env->body_count;
         if (nscan > DRIVE_AGENT_MAX) {
             nscan = DRIVE_AGENT_MAX;
         }
@@ -1698,15 +2148,184 @@ void initialize_env(Drive* env) {
     }
 }
 
+// Logged pose and logged goal. scored cars count in the return.
+// A null spawn is a pad: off the map and out of the score.
+static void seat_logged(Entity* e, LogSpawn* s, int scored) {
+    e->collided_before_goal = 0;
+    e->reached_goal = 0;
+    e->goals_sampled = 0;
+    e->goals_completed = 0;
+    e->goals_clean = 0;
+    e->collided_this_goal = 0;
+    e->failed = 0;
+    e->dyn_ready = 0;
+    e->lane_node = -1;
+    e->offroad_state = 0;
+    e->path_lat = 0.0f;
+    e->path_lon = 0.0f;
+    e->path_n = 0;
+    e->valid = 0;
+    e->active_agent = 0;
+    e->vx = 0.0f;
+    e->vy = 0.0f;
+    e->vz = 0.0f;
+    e->collision_state = NO_COLLISION;
+    if (!s) {
+        e->x = INVALID_POSITION;
+        e->y = INVALID_POSITION;
+        return;
+    }
+    e->x = s->x;
+    e->y = s->y;
+    e->z = 0.0f;
+    e->heading = s->heading;
+    e->heading_x = cosf(e->heading);
+    e->heading_y = sinf(e->heading);
+    e->vx = s->vx;
+    e->vy = s->vy;
+    float length = s->length * COLLISION_BOX_SCALE;
+    float width = s->width * COLLISION_BOX_SCALE;
+    if (s->type == VEHICLE && length < 1.0f) {
+        length = CAR_LENGTH * COLLISION_BOX_SCALE;
+    }
+    if (s->type == VEHICLE && width < 0.5f) {
+        width = CAR_WIDTH * COLLISION_BOX_SCALE;
+    }
+    e->length = length;
+    e->width = width;
+    e->valid = 1;
+    e->active_agent = scored;
+    write_goal(e, s->gx, s->gy);
+    e->goals_sampled = scored;
+}
+
+// Policy slot 0 is the self-driving car. Human-replay partners occupy
+// the body slots past active_agent_count and are not scored.
+static void place_logged(Drive* env) {
+    int n = env->active_agent_count;
+    int replay = env->control_mode == CONTROL_SDC_ONLY;
+    for (int i = 0; i < env->body_count; i++) {
+        LogSpawn* s = NULL;
+        int scored = 0;
+        if (replay) {
+            if (i == 0 && env->spawn_n > 0) {
+                s = &env->spawns[0];
+                scored = 1;
+            } else if (i >= n) {
+                int si = i - n + 1;
+                if (si < env->spawn_n) {
+                    s = &env->spawns[si];
+                }
+            }
+        } else if (i < env->spawn_n) {
+            s = &env->spawns[i];
+            scored = 1;
+        }
+        seat_logged(&env->entities[i], s, scored);
+    }
+    env->bins_ready = 0;
+}
+
 void puf_reset(Drive* env) {
     env->timestep = 0;
     set_start_position(env);
-    initialize_env(env);
+    if (env->log_spawn) {
+        place_logged(env);
+    } else {
+        initialize_env(env);
+    }
     for (int i = 0; i < env->active_agent_count; i++) {
         env->logs[i] = (Log){0};
         env->entities[i].dyn_ready = 0;
     }
+    env->wosac_fill = 0;
     compute_observations(env);
+}
+
+// Centered poses, one record per finished horizon. Python scores them.
+static void wosac_record(Drive* env) {
+    if (!env->wosac_on || env->wosac_fill >= env->episode_length) {
+        return;
+    }
+    int steps = env->episode_length;
+    int t = env->wosac_fill++;
+    for (int i = 0; i < env->spawn_n; i++) {
+        int k = i * steps + t;
+        env->wosac_x[k] = env->entities[i].x;
+        env->wosac_y[k] = env->entities[i].y;
+        env->wosac_h[k] = env->entities[i].heading;
+    }
+}
+
+static void wosac_dump(Drive* env) {
+    if (!env->wosac_on || env->wosac_fill != env->episode_length) {
+        return;
+    }
+    char path[576];
+    int nw = snprintf(path, sizeof(path), "%s/map_%04d.bin",
+        env->wosac_dir, env->map_id);
+    assert(nw > 0 && nw < (int)sizeof(path));
+    FILE* f = fopen(path, "ab");
+    assert(f);
+    int n = env->spawn_n;
+    int steps = env->episode_length;
+    int roll = env->wosac_rolls;
+    assert(fwrite(&roll, sizeof(int), 1, f) == 1);
+    assert(fwrite(&n, sizeof(int), 1, f) == 1);
+    assert(fwrite(&steps, sizeof(int), 1, f) == 1);
+    int ids[DRIVE_AGENT_MAX];
+    int types[DRIVE_AGENT_MAX];
+    float lens[DRIVE_AGENT_MAX];
+    float widths[DRIVE_AGENT_MAX];
+    assert(n <= DRIVE_AGENT_MAX);
+    for (int i = 0; i < n; i++) {
+        ids[i] = env->spawns[i].id;
+        types[i] = env->spawns[i].type;
+        lens[i] = env->spawns[i].length;
+        widths[i] = env->spawns[i].width;
+    }
+    if (n > 0) {
+        assert(fwrite(ids, sizeof(int), n, f) == (size_t)n);
+        assert(fwrite(types, sizeof(int), n, f) == (size_t)n);
+        assert(fwrite(lens, sizeof(float), n, f) == (size_t)n);
+        assert(fwrite(widths, sizeof(float), n, f) == (size_t)n);
+        size_t m = (size_t)n * (size_t)steps;
+        assert(fwrite(env->wosac_x, sizeof(float), m, f) == m);
+        assert(fwrite(env->wosac_y, sizeof(float), m, f) == m);
+        assert(fwrite(env->wosac_h, sizeof(float), m, f) == m);
+    }
+    assert(fclose(f) == 0);
+    env->wosac_rolls++;
+}
+
+static void wosac_meta(Drive* env) {
+    char path[576];
+    int nw = snprintf(path, sizeof(path), "%s/map_%04d.meta",
+        env->wosac_dir, env->map_id);
+    assert(nw > 0 && nw < (int)sizeof(path));
+    FILE* f = fopen(path, "wb");
+    assert(f);
+    assert(fwrite(&env->world_mean_x, sizeof(float), 1, f) == 1);
+    assert(fwrite(&env->world_mean_y, sizeof(float), 1, f) == 1);
+    int nedges = 0;
+    for (int i = env->num_objects; i < env->num_entities; i++) {
+        if (env->entities[i].type == ROAD_EDGE) {
+            nedges++;
+        }
+    }
+    assert(fwrite(&nedges, sizeof(int), 1, f) == 1);
+    for (int i = env->num_objects; i < env->num_entities; i++) {
+        Entity* e = &env->entities[i];
+        if (e->type != ROAD_EDGE) {
+            continue;
+        }
+        assert(fwrite(&e->array_size, sizeof(int), 1, f) == 1);
+        assert(fwrite(e->pts_x, sizeof(float), e->array_size, f)
+            == (size_t)e->array_size);
+        assert(fwrite(e->pts_y, sizeof(float), e->array_size, f)
+            == (size_t)e->array_size);
+    }
+    assert(fclose(f) == 0);
 }
 
 static void human_controls(Drive* env) {
@@ -1918,61 +2537,227 @@ float speed_bonus(Drive* env, Entity* agent) {
     return SPEED_ALPHA * SIM_DT * align;
 }
 
+// Arc length along the logged SDC track. lateral is meters to the
+// closest logged point. longitudinal is signed meters versus the
+// log at this frame, positive when the car is ahead of the log.
+static float route_progress(Drive* env, float px, float py, int frame,
+        float* lateral, float* longitudinal) {
+    int len = env->replay_len;
+    float* xs = env->replay_x;
+    float* ys = env->replay_y;
+    unsigned char* vs = env->replay_v;
+    float cumulative = 0.0f;
+    float d_p = 0.0f;
+    float d_q = 0.0f;
+    float d_xt = 0.0f;
+    float d_now = 0.0f;
+    float best = 1.0e30f;
+    float prev_x = xs[0];
+    float prev_y = ys[0];
+    int t_lookup = frame;
+    int init = env->init_steps;
+    if (t_lookup < 0) {
+        t_lookup = 0;
+    }
+    if (t_lookup >= len) {
+        t_lookup = len - 1;
+    }
+    if (init < 0) {
+        init = 0;
+    }
+    if (init >= len) {
+        init = len - 1;
+    }
+    for (int t = 0; t < len; t++) {
+        if (!vs[t]) {
+            prev_x = xs[t];
+            prev_y = ys[t];
+            continue;
+        }
+        if (t > 0 && vs[t - 1]) {
+            float dx = xs[t] - prev_x;
+            float dy = ys[t] - prev_y;
+            cumulative += sqrtf(dx * dx + dy * dy);
+        }
+        if (t == init) {
+            d_p = cumulative;
+        }
+        if (t == t_lookup) {
+            d_now = cumulative;
+        }
+        d_q = cumulative;
+        float dx = px - xs[t];
+        float dy = py - ys[t];
+        float dist = dx * dx + dy * dy;
+        if (dist < best) {
+            best = dist;
+            d_xt = cumulative;
+        }
+        prev_x = xs[t];
+        prev_y = ys[t];
+    }
+    *lateral = sqrtf(best);
+    *longitudinal = d_xt - d_now;
+    float denom = d_q - d_p;
+    if (denom < 1.0e-3f) {
+        return 0.0f;
+    }
+    float ratio = (d_xt - d_p) / denom;
+    if (ratio < 0.0f) {
+        return 0.0f;
+    }
+    return ratio;
+}
+
+// Partners follow the log. Past the last logged frame they leave
+// the map, matching PufferDrive move_expert. The SDC is not moved.
+static void replay_partners(Drive* env) {
+    if (env->control_mode != CONTROL_SDC_ONLY || !env->replay_x) {
+        return;
+    }
+    int frame = env->init_steps + env->timestep;
+    int len = env->replay_len;
+    int base = env->active_agent_count;
+    for (int s = 1; s < env->spawn_n; s++) {
+        Entity* e = &env->entities[base + s - 1];
+        int ok = frame >= 0 && frame < len;
+        int k = s * len + frame;
+        if (ok) {
+            ok = env->replay_v[k];
+        }
+        if (!ok) {
+            e->x = INVALID_POSITION;
+            e->y = INVALID_POSITION;
+            e->vx = 0.0f;
+            e->vy = 0.0f;
+            continue;
+        }
+        e->x = env->replay_x[k];
+        e->y = env->replay_y[k];
+        e->heading = env->replay_h[k];
+        e->heading_x = cosf(e->heading);
+        e->heading_y = sinf(e->heading);
+        e->vx = env->replay_vx[k];
+        e->vy = env->replay_vy[k];
+        e->valid = 1;
+    }
+    env->bins_ready = 0;
+}
+
+// Pads (goals_sampled == 0) are not cars. A logged scene ends when
+// every spawned car has arrived, or at episode_length, whichever
+// comes first. goal_stop runs the full horizon. CARLA respawns.
+static void end_episode(Drive* env) {
+    if (env->wosac_on) {
+        assert(env->wosac_fill == env->episode_length);
+        wosac_dump(env);
+        env->log.n += 1.0f;
+        puf_reset(env);
+        return;
+    }
+    if (env->replay_x && env->entities[0].goals_sampled > 0) {
+        Entity* sdc = &env->entities[0];
+        Log* lg = &env->logs[0];
+        if (sdc->path_n > 0) {
+            lg->lateral_error = sdc->path_lat / (float)sdc->path_n;
+            lg->longitudinal_error = sdc->path_lon / (float)sdc->path_n;
+        }
+        if (!sdc->reached_goal && sdc->x != INVALID_POSITION) {
+            float lat = 0.0f;
+            float lon = 0.0f;
+            int frame = env->init_steps + env->timestep - 1;
+            lg->route_progress = route_progress(
+                env, sdc->x, sdc->y, frame, &lat, &lon);
+        }
+    }
+    for (int i = 0; i < env->active_agent_count; i++) {
+        if (env->entities[i].goals_sampled <= 0) {
+            continue;
+        }
+        float sampled = (float)env->entities[i].goals_sampled;
+        float completion = (float)env->entities[i].goals_completed / sampled;
+        env->logs[i].completion_rate = completion;
+        env->log.completion_rate += completion;
+        env->log.offroad_rate += env->logs[i].offroad_rate;
+        env->log.collision_rate += env->logs[i].collision_rate;
+        env->log.collision_count += env->logs[i].collision_count;
+        env->log.steps_before_first_failure += env->logs[i].steps_before_first_failure;
+        env->log.total_distance_travelled += env->logs[i].total_distance_travelled;
+        env->log.total_infractions += env->logs[i].total_infractions;
+        env->log.distance_before_first_failure += env->logs[i].distance_before_first_failure;
+        int reached = env->entities[i].goals_completed;
+        float safe = 0.0f;
+        if (reached > 0) {
+            safe = (float)env->entities[i].goals_clean / (float)reached;
+        }
+        env->logs[i].score = safe;
+        env->log.score += env->logs[i].score;
+        env->log.jerk += env->logs[i].jerk;
+        env->log.perf += env->logs[i].perf;
+        env->log.episode_length += env->logs[i].episode_length;
+        env->log.episode_return += env->logs[i].episode_return;
+        env->log.speed_sum += env->logs[i].speed_sum;
+        env->log.speed_steps += env->logs[i].speed_steps;
+        env->log.at_fault_collision_rate +=
+            env->logs[i].at_fault_collision_rate;
+        env->log.route_progress += env->logs[i].route_progress;
+        env->log.lateral_error += env->logs[i].lateral_error;
+        env->log.longitudinal_error += env->logs[i].longitudinal_error;
+        env->log.n += 1;
+    }
+    puf_reset(env);
+}
+
+static int logs_finished(Drive* env) {
+    int any = 0;
+    for (int i = 0; i < env->active_agent_count; i++) {
+        if (env->entities[i].goals_sampled <= 0) {
+            continue;
+        }
+        any = 1;
+        if (!env->entities[i].reached_goal) {
+            return 0;
+        }
+    }
+    return any;
+}
+
 void puf_step(Drive* env) {
     human_controls(env);
     if (!env->entities || env->active_agent_count <= 0) {
         return;
     }
+    wosac_record(env);
     for (int i = 0; i < env->active_agent_count; i++) {
         if (!env->agents[i].rewards) {
             continue;
         }
         env->agents[i].rewards[0] = 0;
         env->agents[i].terminals[0] = 0;
+        int pad = env->entities[i].goals_sampled <= 0;
+        int done = env->entities[i].reached_goal && !env->goal_stop;
+        if (env->log_spawn && (pad || done)) {
+            env->agents[i].terminals[0] = 1;
+        }
     }
     env->timestep++;
 
     if (env->timestep == env->episode_length) {
-        for (int i = 0; i < env->active_agent_count; i++) {
-            float completion = 0.0f;
-            if (env->entities[i].goals_sampled > 0) {
-                float sampled = (float)env->entities[i].goals_sampled;
-                completion = (float)env->entities[i].goals_completed / sampled;
-            }
-            env->logs[i].completion_rate = completion;
-            env->log.completion_rate += completion;
-            env->log.offroad_rate += env->logs[i].offroad_rate;
-            env->log.collision_rate += env->logs[i].collision_rate;
-            env->log.collision_count += env->logs[i].collision_count;
-            env->log.steps_before_first_failure += env->logs[i].steps_before_first_failure;
-            env->log.total_distance_travelled += env->logs[i].total_distance_travelled;
-            env->log.total_infractions += env->logs[i].total_infractions;
-            env->log.distance_before_first_failure += env->logs[i].distance_before_first_failure;
-            // Every arrival this episode. The goal still open is not in n.
-            int reached = env->entities[i].goals_completed;
-            float safe = 0.0f;
-            if (reached > 0) {
-                safe = (float)env->entities[i].goals_clean / (float)reached;
-            }
-            env->logs[i].score = safe;
-            env->log.score += env->logs[i].score;
-            env->log.jerk += env->logs[i].jerk;
-            env->log.perf += env->logs[i].perf;
-            env->log.episode_length += env->logs[i].episode_length;
-            env->log.episode_return += env->logs[i].episode_return;
-            env->log.speed_sum += env->logs[i].speed_sum;
-            env->log.speed_steps += env->logs[i].speed_steps;
-            env->log.n += 1;
-        }
-        puf_reset(env);
+        end_episode(env);
         return;
     }
+    replay_partners(env);
 
     float step_jerk[DRIVE_AGENT_MAX] = {0};
     float step_distance[DRIVE_AGENT_MAX] = {0};
     for (int i = 0; i < env->active_agent_count; i++) {
         Entity* agent = &env->entities[i];
         if (agent->x == INVALID_POSITION) {
+            continue;
+        }
+        if (env->goal_stop && agent->reached_goal) {
+            agent->vx = 0.0f;
+            agent->vy = 0.0f;
             continue;
         }
         env->logs[i].episode_length += 1;
@@ -2000,17 +2785,33 @@ void puf_step(Drive* env) {
             continue;
         }
         agent->collision_state = NO_COLLISION;
-        collision_check(env, i);
+        int other = collision_check(env, i);
         int collision_state = agent->collision_state;
         if (collision_state == AGENT_COLLISION) {
             env->agents[i].rewards[0] = env->reward_vehicle_collision;
             env->logs[i].episode_return += env->reward_vehicle_collision;
             env->logs[i].collision_rate = 1.0f;
             env->logs[i].collision_count += 1.0f;
+            // NAVSIM at-fault: the other body is ahead and this car
+            // is moving toward it. A replay car that arrives from
+            // behind does not set the flag.
+            if (other >= 0) {
+                Entity* b = &env->entities[other];
+                float dx = b->x - agent->x;
+                float dy = b->y - agent->y;
+                float forward = dx * agent->heading_x + dy * agent->heading_y;
+                float approach = agent->vx * dx + agent->vy * dy;
+                if (forward > 0.0f && approach > 0.0f) {
+                    env->logs[i].at_fault_collision_rate = 1.0f;
+                }
+            }
         } else if (collision_state == OFFROAD) {
             env->agents[i].rewards[0] = env->reward_offroad_collision;
             env->logs[i].offroad_rate = 1.0f;
             env->logs[i].episode_return += env->reward_offroad_collision;
+        }
+        if (agent->offroad_state) {
+            env->logs[i].offroad_rate = 1.0f;
         }
         if (collision_state > NO_COLLISION) {
             env->logs[i].total_infractions += 1.0f;
@@ -2028,14 +2829,38 @@ void puf_step(Drive* env) {
             agent->x, agent->y,
             agent->goal_position_x, agent->goal_position_y);
 
-        // Inside 5 m, once per goal. Respawn samples the next one.
-        // Staying on the same point does not pay again.
-        int arrived = distance_to_goal < MIN_DISTANCE_TO_GOAL
-            && !agent->reached_goal;
+        // Inside the goal radius, once per goal. Respawn samples the next one.
+        // Staying on the same point does not pay again. goal_stop also
+        // requires speed at or under goal_speed, matching PufferDrive.
+        float radius = MIN_DISTANCE_TO_GOAL;
+        if (env->goal_radius > 0.0f) {
+            radius = env->goal_radius;
+        }
+        int arrived = distance_to_goal < radius && !agent->reached_goal;
+        if (arrived && env->goal_stop) {
+            float speed = sqrtf(agent->vx * agent->vx + agent->vy * agent->vy);
+            if (speed > env->goal_speed) {
+                arrived = 0;
+            }
+        }
+        if (env->replay_x && i == 0 && agent->goals_sampled > 0
+                && agent->x != INVALID_POSITION) {
+            float lat = 0.0f;
+            float lon = 0.0f;
+            int frame = env->init_steps + env->timestep;
+            route_progress(env, agent->x, agent->y, frame, &lat, &lon);
+            agent->path_lat += lat;
+            agent->path_lon += fabsf(lon);
+            agent->path_n += 1;
+        }
+
         if (arrived) {
             env->agents[i].rewards[0] += env->reward_goal;
             env->logs[i].episode_return += env->reward_goal;
             agent->reached_goal = 1;
+            if (env->replay_x && i == 0) {
+                env->logs[i].route_progress = 1.0f;
+            }
             agent->goals_completed++;
             if (!agent->collided_this_goal) {
                 agent->goals_clean++;
@@ -2053,12 +2878,29 @@ void puf_step(Drive* env) {
         float bonus = speed_bonus(env, agent);
         env->agents[i].rewards[0] += bonus;
         env->logs[i].episode_return += bonus;
-        if (arrived) {
+        if (arrived && env->log_spawn && env->goal_stop) {
+            agent->vx = 0.0f;
+            agent->vy = 0.0f;
+        } else if (arrived && env->log_spawn) {
+            env->agents[i].terminals[0] = 1;
+            agent->vx = 0.0f;
+            agent->vy = 0.0f;
+            agent->x = INVALID_POSITION;
+            agent->y = INVALID_POSITION;
+            env->bins_ready = 0;
+        } else if (arrived) {
             respawn_agent(env, i);
         }
     }
 
     bump_agents(env);
+    // Human-replay runs to episode_length. Stopping at the goal would
+    // reset inside a trainer horizon and count another episode.
+    if (env->log_spawn && !env->goal_stop && !env->replay_x
+            && logs_finished(env)) {
+        end_episode(env);
+        return;
+    }
 
     compute_observations(env);
 }
@@ -2088,6 +2930,15 @@ void puf_init(Env* env, Dict* kwargs) {
     env->speed_band = dict_get(kwargs, "speed_band") * KMH_TO_MPS;
     env->cfg = kwargs;
     env->use_action_values = 0;
+    DictItem* control = dict_find(kwargs, "control_mode");
+    env->control_mode = drive_control_mode(
+        (control && control->str && control->str[0])
+            ? control->str : "control_agents");
+    DictItem* cap = dict_find(kwargs, "max_controlled_agents");
+    env->max_controlled = 32;
+    if (cap && cap->value > 0.0) {
+        env->max_controlled = (int)cap->value;
+    }
     int map_id = dict_get(kwargs, "map_id");
     env->map_id = map_id;
     char bin_dir[480];
@@ -2100,7 +2951,48 @@ void puf_init(Env* env, Dict* kwargs) {
     env->goal_distance_max = (float)dict_get(kwargs, "goal_distance_max");
     env->timestep = 0;
     env->episode_length = (int)dict_get(kwargs, "episode_length");
+    env->init_steps = 0;
+    env->goal_radius = 0.0f;
+    env->goal_speed = 100.0f;
+    env->goal_stop = 0;
+    env->wosac_on = 0;
+    env->wosac_fill = 0;
+    env->wosac_rolls = 0;
+    env->wosac_dir[0] = 0;
+    DictItem* init_at = dict_find(kwargs, "init_steps");
+    if (init_at && init_at->value > 0.0) {
+        env->init_steps = (int)init_at->value;
+    }
+    DictItem* radius = dict_find(kwargs, "goal_radius");
+    if (radius && radius->value > 0.0) {
+        env->goal_radius = (float)radius->value;
+    }
+    DictItem* gspeed = dict_find(kwargs, "goal_speed");
+    if (gspeed && gspeed->value > 0.0) {
+        env->goal_speed = (float)gspeed->value;
+    }
+    DictItem* gstop = dict_find(kwargs, "goal_stop");
+    if (gstop && gstop->value != 0.0) {
+        env->goal_stop = 1;
+    }
+    DictItem* wdir = dict_find(kwargs, "wosac_dir");
+    if (wdir && wdir->str && wdir->str[0]
+            && strcmp(wdir->str, "none") != 0) {
+        assert(strlen(wdir->str) < sizeof(env->wosac_dir));
+        memcpy(env->wosac_dir, wdir->str, strlen(wdir->str) + 1);
+        env->wosac_on = 1;
+    }
     load_world(env);
+    if (env->wosac_on) {
+        int steps = env->episode_length;
+        assert(steps > 0 && steps <= 256);
+        size_t m = (size_t)env->num_agents * (size_t)steps;
+        env->wosac_x = (float*)calloc(m, sizeof(float));
+        env->wosac_y = (float*)calloc(m, sizeof(float));
+        env->wosac_h = (float*)calloc(m, sizeof(float));
+        assert(env->wosac_x && env->wosac_y && env->wosac_h);
+        wosac_meta(env);
+    }
     for (int i = 0; i < env->num_agents; i++) {
         env->agents[i].policy = 0;
         env->agents[i].action_mask = NULL;
@@ -2136,6 +3028,10 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "avg_distance_per_infraction", avg_distance_per_infraction);
     dict_set(out, "n", log->n);
     dict_set(out, "completion_rate", log->completion_rate);
+    dict_set(out, "at_fault_collision_rate", log->at_fault_collision_rate);
+    dict_set(out, "route_progress", log->route_progress);
+    dict_set(out, "lateral_error", log->lateral_error);
+    dict_set(out, "longitudinal_error", log->longitudinal_error);
     // km/h. Mean over every active car-step in the finished episodes.
     float avg_speed = 0.0f;
     if (log->speed_steps > 0.0f) {

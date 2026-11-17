@@ -8,6 +8,8 @@
 // Entity types
 #define NONE 0
 #define VEHICLE 1
+#define PEDESTRIAN 2
+#define CYCLIST 3
 #define ROAD_LANE 4
 #define ROAD_LINE 5
 #define ROAD_EDGE 6

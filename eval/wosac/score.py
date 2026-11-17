@@ -488,7 +488,7 @@ def n_rolls(path):
     return len(read_rollouts(path))
 
 
-def rollout(name, ckpt, outdir, rollouts=ROLLOUTS):
+def rollout(name, ckpt, outdir, rollouts=ROLLOUTS, hidden=None, layers=None):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     batch = 32
@@ -528,6 +528,10 @@ def rollout(name, ckpt, outdir, rollouts=ROLLOUTS):
             f"--base.eval_agents={total}",
             f"--base.eval_episodes={n * rollouts}",
         ]
+        if hidden is not None:
+            cmd.append(f"--policy.hidden_size={int(hidden)}")
+        if layers is not None:
+            cmd.append(f"--policy.num_layers={int(layers)}")
         print(f"{name} maps {start}-{start + n - 1}", flush=True)
         with log.open("a") as fh:
             fh.write(" ".join(cmd) + "\n")
