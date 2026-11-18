@@ -4173,6 +4173,9 @@ static void sweep_metric_key(Ini* ini, char* buf, size_t n) {
 }
 
 // board!=NULL: merge env/* into train last_log (uptime + util/* stay frozen).
+static const char* eval_record_path;
+static int eval_record_frames;
+
 static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
         int render, long eval_episodes, Dict* board, int epoch) {
     int match = mode == EVAL_MATCH;
@@ -4188,6 +4191,9 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
     while (true) {
         if (render) {
             puf_render(p->vec->envs);
+            if (puf_record_enabled() && puf_record_done()) {
+                return result;
+            }
             if (WindowShouldClose()) {
                 return result;
             }
@@ -4307,6 +4313,11 @@ EvalResult run_eval(Ini* ini, TrainContext* ctx, int mode, int verbose,
         int render) {
     long n = puf_ini_get(ini, "base", "eval_episodes");
     assert((render || n > 0) && "eval requires positive base.eval_episodes");
+    if (eval_record_path && eval_record_path[0]) {
+        int frames = eval_record_frames > 0 ? eval_record_frames : 91;
+        puf_record_request(eval_record_path, frames, 10);
+        render = 1;
+    }
     PuffeRL* p = eval_make(ini, ctx, mode, render);
     EvalResult r = eval_loop(ini, p, mode, verbose, render, n, NULL, 0);
     if (!render) {
@@ -5026,6 +5037,14 @@ int main(int argc, char** argv) {
     for (int i = argi; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0) {
             headless = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--record") == 0 && i + 1 < argc) {
+            eval_record_path = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--record-frames") == 0 && i + 1 < argc) {
+            eval_record_frames = atoi(argv[++i]);
             continue;
         }
         ini_argv[ini_argc++] = argv[i];

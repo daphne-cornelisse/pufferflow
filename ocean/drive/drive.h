@@ -274,6 +274,8 @@ struct Env {
     LogSpawn* spawns;
     int spawn_n;
     int log_spawn;
+    // State count of this log. 0 on a road map. Waymo is 91.
+    int log_traj;
     int control_mode;
     int max_controlled;
     // 0 uses frame 0. WOSAC eval starts at frame 10.
@@ -435,6 +437,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     env->spawns = NULL;
     env->spawn_n = 0;
     env->log_spawn = 0;
+    env->log_traj = 0;
     free(env->replay_x);
     free(env->replay_y);
     free(env->replay_h);
@@ -678,6 +681,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     free(vseries);
     env->spawn_n = nk;
     env->log_spawn = 1;
+    env->log_traj = traj;
     env->num_roads = nroads;
     env->num_objects = 0;
     env->num_entities = nroads;
@@ -1325,6 +1329,7 @@ static void release_world(Drive* env) {
     env->spawns = NULL;
     env->spawn_n = 0;
     env->log_spawn = 0;
+    env->log_traj = 0;
     free(env->replay_x);
     free(env->replay_y);
     free(env->replay_h);
@@ -2451,7 +2456,8 @@ static void replay_partners(Drive* env) {
 
 // Pads (goals_sampled == 0) are not cars. A logged scene ends when
 // every spawned car has arrived, or at episode_length, whichever
-// comes first. goal_stop runs the full horizon. CARLA respawns.
+// comes first. That length is this log's state count, unless the
+// ini is shorter. goal_stop runs the configured horizon. CARLA respawns.
 static void end_episode(Drive* env) {
     if (env->wosac_on) {
         assert(env->wosac_fill == env->episode_length);
@@ -2774,6 +2780,14 @@ void puf_init(Env* env, Dict* kwargs) {
         env->wosac_on = 1;
     }
     load_world(env);
+    // Waymo training stops at the scenario length (91). The ini value
+    // is the longest log, so a shorter scene is not held open past its
+    // last frame. Human-replay and goal_stop keep the ini horizon.
+    if (env->log_spawn && !env->wosac_on && !env->replay_x
+            && !env->goal_stop && env->log_traj > 1
+            && env->episode_length > env->log_traj) {
+        env->episode_length = env->log_traj;
+    }
     if (env->wosac_on) {
         int steps = env->episode_length;
         assert(steps > 0 && steps <= 256);

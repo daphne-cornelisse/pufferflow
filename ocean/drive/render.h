@@ -32,6 +32,59 @@ struct Client {
     int font_ready;
 };
 
+// Street view for a town. A highway longer than 700 m is framed
+// from farther back so the whole roadway fits.
+static void sim_camera_distance(Drive* env, float* back, float* up) {
+    float cam_back = 120.0f;
+    float cam_up = 175.0f;
+    float span = 0.0f;
+    if (env->sim_user_size) {
+        cam_back = 48.0f;
+        cam_up = 72.0f;
+    } else if (env->map_corners) {
+        float span_x = env->map_corners[2] - env->map_corners[0];
+        float span_y = env->map_corners[3] - env->map_corners[1];
+        span = span_x > span_y ? span_x : span_y;
+        if (span > 700.0f) {
+            float dist = span * 0.85f;
+            cam_back = dist * 0.50f;
+            cam_up = dist * 0.90f;
+        }
+    }
+    *back = cam_back;
+    *up = cam_up;
+}
+
+static void sim_frame_camera(Drive* env) {
+    Client* client = env->client;
+    float cx = 0.0f;
+    float cy = 0.0f;
+    float back = 120.0f;
+    float up = 175.0f;
+    if (!client || !env->map_corners) {
+        return;
+    }
+    cx = (env->map_corners[0] + env->map_corners[2]) * 0.5f;
+    cy = (env->map_corners[1] + env->map_corners[3]) * 0.5f;
+    sim_camera_distance(env, &back, &up);
+    client->default_camera_target = (Vector3){cx, cy, 1.0f};
+    client->default_camera_position = (Vector3){cx, cy + back, up};
+    client->camera.up = (Vector3){0.0f, -1.0f, 0.0f};
+    client->camera.fovy = 45.0f;
+    client->camera.projection = CAMERA_PERSPECTIVE;
+    client->camera.target = client->default_camera_target;
+    client->camera.position = client->default_camera_position;
+    if (env->sim_follow) {
+        back = 120.0f;
+        up = 175.0f;
+        if (env->sim_user_size) {
+            back = 48.0f;
+            up = 72.0f;
+        }
+        client->camera.position = (Vector3){cx, cy + back, up};
+    }
+}
+
 Client* make_client(Drive* env) {
     Client* client = (Client*)calloc(1, sizeof(Client));
     client->width = 1280;
@@ -89,32 +142,9 @@ Client* make_client(Drive* env) {
     for (int i = 0; i < DRIVE_AGENT_MAX; i++) {
         client->car_assignments[i] = rand_r(&env->rng) % 2;
     }
-    // Get initial target position from first active agent
-    float map_center_x = 0.0f;
-    float map_center_y = 0.0f;
-    if (env->map_corners) {
-        map_center_x = (env->map_corners[0] + env->map_corners[2]) / 2.0f;
-        map_center_y = (env->map_corners[1] + env->map_corners[3]) / 2.0f;
-    }
-    Vector3 target_pos = { map_center_x, map_center_y, 1.0f };
-    float cam_back = 120.0f;
-    float cam_up = 175.0f;
-    if (env->sim_user_size) {
-        cam_back = 48.0f;
-        cam_up = 72.0f;
-    }
-    client->default_camera_position = (Vector3){
-        map_center_x,
-        map_center_y + cam_back,
-        cam_up
-    };
-    client->default_camera_target = target_pos;
-    client->camera.position = client->default_camera_position;
-    client->camera.target = client->default_camera_target;
-    client->camera.up = (Vector3){ 0.0f, -1.0f, 0.0f };  // Y is up
-    client->camera.fovy = 45.0f;
-    client->camera.projection = CAMERA_PERSPECTIVE;
+    env->client = client;
     client->camera_zoom = 1.0f;
+    sim_frame_camera(env);
     // Nimbus Sans is the Helvetica clone, but it is CFF and will not load.
     // Liberation Sans is the TrueType stand-in.
     const char* sans_paths[] = {

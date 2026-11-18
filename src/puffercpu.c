@@ -1316,6 +1316,73 @@ static void drive_note_value(PufferNet* net, Drive* env) {
     env->predicted_value = puffernet_value(net, obs, slot);
     env->predicted_ready = 1;
 }
+
+static obs_t* vis_obs;
+static float* vis_act;
+static float* vis_rew;
+static float* vis_term;
+static unsigned char* vis_mask;
+static int vis_mask_n;
+
+static void vis_rebind(Drive* env) {
+    int n = env->num_agents;
+    int i;
+    for (i = 0; i < n; i++) {
+        env->agents[i].observations = vis_obs + (size_t)i * OBS_SIZE;
+        env->agents[i].actions = vis_act + (size_t)i * NUM_ATNS;
+        env->agents[i].rewards = vis_rew + i;
+        env->agents[i].terminals = vis_term + i;
+        env->agents[i].action_mask = vis_mask + (size_t)i * vis_mask_n;
+        env->agents[i].policy = 0;
+    }
+}
+
+// Logged datasets with more than one map. New scene loads the next file.
+static void vis_next_map(Drive* env) {
+    DictItem* item = dict_find(env->cfg, "num_maps");
+    int nmaps = 1;
+    int id;
+    Client* client;
+    int follow;
+    int paused;
+    float span;
+    if (item && item->value > 1.0) {
+        nmaps = (int)item->value;
+    }
+    if (nmaps < 2) {
+        return;
+    }
+    id = env->map_id + 1;
+    if (id >= nmaps) {
+        id = 0;
+    }
+    dict_set(env->cfg, "map_id", (double)id);
+    client = env->client;
+    follow = env->sim_follow;
+    paused = env->sim_paused;
+    puf_close(env);
+    free(env->map_name);
+    env->map_name = NULL;
+    env->client = client;
+    puf_init(env, env->cfg);
+    env->client = client;
+    env->sim_follow = follow;
+    env->sim_paused = paused;
+    env->sim_scene = vis_next_map;
+    vis_rebind(env);
+    puf_reset(env);
+    sim_frame_camera(env);
+    if (IsWindowReady()) {
+        SetWindowTitle(TextFormat("Pufferflow  map %d", env->map_id));
+    }
+    span = 0.0f;
+    if (env->map_corners) {
+        span = env->map_corners[2] - env->map_corners[0];
+    }
+    printf("map %d  horizon %d  span %.0f m  %s\n",
+        env->map_id, env->episode_length, span, env->map_name);
+    fflush(stdout);
+}
 #endif
 
 int main(int argc, char** argv) {
@@ -1681,6 +1748,33 @@ int main(int argc, char** argv) {
         env.agents[i].policy = 0;
     }
     puf_reset(&env);
+#ifdef PUFFER_DRIVE
+    if (!anchor_path && env.log_spawn) {
+        DictItem* maps = dict_find(env.cfg, "num_maps");
+        int nmaps = maps ? (int)maps->value : 1;
+        float span = 0.0f;
+        vis_obs = observations;
+        vis_act = actions;
+        vis_rew = rewards;
+        vis_term = terminals;
+        vis_mask = masks;
+        vis_mask_n = act_n;
+        if (env.map_corners) {
+            float span_x = env.map_corners[2] - env.map_corners[0];
+            float span_y = env.map_corners[3] - env.map_corners[1];
+            span = span_x > span_y ? span_x : span_y;
+        }
+        if (span > 700.0f) {
+            env.sim_follow = 1;
+        }
+        if (nmaps > 1) {
+            env.sim_scene = vis_next_map;
+        }
+        printf("map %d  horizon %d  span %.0f m  %s\n",
+            env.map_id, env.episode_length, span, env.map_name);
+        fflush(stdout);
+    }
+#endif
 
 
 
