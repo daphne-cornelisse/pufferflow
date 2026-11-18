@@ -194,7 +194,7 @@ class I24ConversionTest(unittest.TestCase):
             obj["width_m"], 6.0 * CONVERTER.FEET_TO_METERS * CONVERTER.BOX_SCALE
         )
 
-    def test_heading_stabilization_is_opt_in_and_only_changes_headings(self):
+    def test_heading_stabilization_is_default_and_only_changes_headings(self):
         raw = self.raw_object_with_noisy_stop()
         default = CONVERTER.normalize_object(raw, self.road_grid)
         explicit_off = CONVERTER.normalize_object(
@@ -203,15 +203,15 @@ class I24ConversionTest(unittest.TestCase):
         stabilized = CONVERTER.normalize_object(
             raw, self.road_grid, stabilize_headings=True
         )
-        self.assertEqual(default["heading_rad"], explicit_off["heading_rad"])
-        self.assertEqual(default["position_m"], stabilized["position_m"])
-        self.assertEqual(default["velocity_mps"], stabilized["velocity_mps"])
+        self.assertEqual(default["heading_rad"], stabilized["heading_rad"])
+        self.assertEqual(default["position_m"], explicit_off["position_m"])
+        self.assertEqual(default["velocity_mps"], explicit_off["velocity_mps"])
         stop_slice = slice(25, 36)
         self.assertGreater(
-            max(abs(value) for value in default["heading_rad"][stop_slice]), 0.5
+            max(abs(value) for value in explicit_off["heading_rad"][stop_slice]), 0.5
         )
         self.assertLess(
-            max(abs(value) for value in stabilized["heading_rad"][stop_slice]), 0.1
+            max(abs(value) for value in default["heading_rad"][stop_slice]), 0.1
         )
 
     def test_builds_native_length_scenario_and_log_binary(self):
@@ -259,6 +259,71 @@ class I24ConversionTest(unittest.TestCase):
         self.assertAlmostEqual(scenario["metadata"]["duration_seconds"], 90.0)
         end_x = 90.0 * 30.0 * CONVERTER.FEET_TO_METERS
         self.assertAlmostEqual(scenario["objects"][0]["position"][-1]["x"], end_x)
+
+    def test_box_intersection_area(self):
+        box = CONVERTER._box_corners(0.0, 0.0, 0.0, 4.0, 2.0)
+        self.assertAlmostEqual(CONVERTER._intersection_area(box, box), 8.0)
+        shifted = CONVERTER._box_corners(1.0, 0.0, 0.0, 4.0, 2.0)
+        self.assertAlmostEqual(CONVERTER._intersection_area(box, shifted), 6.0)
+        far = CONVERTER._box_corners(10.0, 0.0, 0.0, 4.0, 2.0)
+        self.assertAlmostEqual(CONVERTER._intersection_area(box, far), 0.0)
+
+    def _placed(self, object_id, x_pos, length, width, frames):
+        return {
+            "id": object_id,
+            "type": "vehicle",
+            "length": length,
+            "width": width,
+            "height": 1.5,
+            "position": [{"x": x_pos, "y": 0.0, "z": 0.0} for _ in range(frames)],
+            "velocity": [{"x": 0.0, "y": 0.0, "z": 0.0} for _ in range(frames)],
+            "heading": [0.0] * frames,
+            "valid": [True] * frames,
+            "goalPosition": {"x": x_pos, "y": 0.0, "z": 0.0},
+            "mark_as_expert": 0,
+        }
+
+    def test_deep_overlap_drops_smaller_cars_in_one_pass(self):
+        # B sits inside A. C overlaps B and only grazes A.
+        # Six frames drops B and C. Five frames drops neither.
+        for frames, dropped in ((6, {2, 3}), (5, set())):
+            objects = [
+                self._placed(1, 0.0, 10.0, 2.0, frames),
+                self._placed(2, 4.0, 4.0, 2.0, frames),
+                self._placed(3, 5.5, 2.0, 2.0, frames),
+            ]
+            pairs, focal = CONVERTER._deep_overlap_ids(objects)
+            self.assertEqual({item["id"] for item in pairs}, dropped)
+            self.assertEqual(focal, [])
+
+    def test_wrong_way_and_deep_overlap_are_removed_from_the_scenario(self):
+        sdc = CONVERTER.normalize_object(self.raw_object(4, 6.0), self.road_grid)
+        neighbor = CONVERTER.normalize_object(self.raw_object(9, 18.0), self.road_grid)
+        westbound = self.raw_object(12, 80.0)
+        # Upper carriageway travels toward -x.
+        westbound["x_position"] = [-value for value in westbound["x_position"]]
+        westbound["direction"] = -1
+        westbound = CONVERTER.normalize_object(westbound, self.road_grid)
+        ghost = self.raw_object(11, 6.0)
+        ghost["x_position"] = [-value for value in ghost["x_position"]]
+        ghost["direction"] = -1
+        ghost = CONVERTER.normalize_object(ghost, self.road_grid)
+        small = self.raw_object(15, 18.0)
+        small["l"] = 8.0
+        small["w"] = 4.0
+        small = CONVERTER.normalize_object(small, self.road_grid)
+        scene = {
+            "scene": 2,
+            "objects": [sdc, neighbor, westbound, ghost, small],
+            "map": self.road_grid,
+        }
+        scenario = CONVERTER.build_track_scenario(scene, sdc_id=4, max_objects=8)
+        CONVERTER.validate_scenario(scenario)
+        self.assertEqual({obj["id"] for obj in scenario["objects"]}, {4, 9, 12})
+        cleanup = scenario["metadata"]["track_cleanup"]
+        self.assertIn(11, {item["id"] for item in cleanup["removed_wrong_way"]})
+        self.assertIn(15, {item["id"] for item in cleanup["removed_deep_overlap"]})
+        self.assertFalse(cleanup["focal_kept_despite_wrong_way"])
 
     def test_native_length_keeps_a_late_neighbor_in_the_log_binary(self):
         sdc = CONVERTER.normalize_object(

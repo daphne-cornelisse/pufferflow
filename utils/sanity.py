@@ -321,8 +321,10 @@ def _sheet(columns, agents, frames, data_dir, map_id, json_path, seed):
 
 
 def _write_clip(path, columns, agents, frames, data_dir, map_id, json_path):
-    fig, axes = plt.subplots(2, 2, figsize=(8.0, 7.0), squeeze=False)
-    fig.subplots_adjust(left=0.04, right=0.98, bottom=0.04, top=0.88, wspace=0.08, hspace=0.18)
+    fig, axes = plt.subplots(
+        2, len(agents), figsize=(4.0 * len(agents), 7.0), squeeze=False,
+    )
+    fig.subplots_adjust(left=0.03, right=0.99, bottom=0.04, top=0.88, wspace=0.08, hspace=0.18)
     writer = PillowWriter(fps=SAMPLE_HZ)
     with writer.saving(fig, str(path), dpi=FIGURE_DPI):
         for frame in frames:
@@ -345,13 +347,43 @@ def _write_clip(path, columns, agents, frames, data_dir, map_id, json_path):
     plt.close(fig)
 
 
-def render(data_dir: Path, out_dir: Path, seed: int):
-    map_id, json_path, agents, frames = pick_scene(data_dir, seed)
+def render(
+    data_dir: Path,
+    out_dir: Path,
+    seed: int,
+    map_id: int | None = None,
+    agents: list[int] | None = None,
+    steps: int | None = None,
+):
+    jsons = sorted((data_dir / "json").glob("*.json"))
+    if map_id is None:
+        map_id, json_path, picked, frames = pick_scene(data_dir, seed)
+        if agents is None:
+            agents = picked
+    else:
+        if not 0 <= map_id < len(jsons):
+            raise SystemExit(f"map {map_id} is outside {data_dir / 'json'}")
+        json_path = jsons[map_id]
+        with json_path.open() as handle:
+            scenario = json.load(handle)
+        states = len((scenario.get("objects") or [{}])[0].get("position") or [])
+        count = states if steps is None else min(states, steps)
+        if count < 1:
+            raise SystemExit(f"{json_path.name} has no states")
+        frames = list(range(count))
+        if agents is None:
+            _, _, agents, _ = pick_scene(data_dir, seed)
+    if steps is not None:
+        frames = frames[:steps]
     lib = load_lib()
     handle = open_scene(lib, data_dir, map_id, json_path)
     try:
         columns = {}
-        for frame in frames:
+        with json_path.open() as file:
+            state_count = len(json.load(file)["objects"][0]["position"])
+        # The sheet stays one frame per second. A short GIF does not drop it.
+        sheet = [t for t in still_frames() if t < state_count]
+        for frame in sorted(set(frames) | set(sheet)):
             lib.pf_place(handle, frame)
             lib.pf_recompute(handle)
             columns[frame] = scene_frame(lib, handle)
@@ -360,12 +392,12 @@ def render(data_dir: Path, out_dir: Path, seed: int):
 
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{data_dir.name}_map_{map_id:03d}_sanity"
-    sheet = _sheet(
-        columns, agents, still_frames(), data_dir, map_id, json_path, seed,
+    sheet_fig = _sheet(
+        columns, agents, sheet, data_dir, map_id, json_path, seed,
     )
     png = out_dir / f"{stem}.png"
-    sheet.savefig(png, dpi=FIGURE_DPI)
-    plt.close(sheet)
+    sheet_fig.savefig(png, dpi=FIGURE_DPI)
+    plt.close(sheet_fig)
     gif = out_dir / f"{stem}.gif"
     _write_clip(gif, columns, agents, frames, data_dir, map_id, json_path)
     return png, gif, map_id, json_path, agents, len(frames) / SAMPLE_HZ
@@ -379,10 +411,23 @@ def main():
         help="Default: <data-dir>/assets",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--map-id", type=int, default=None)
+    parser.add_argument(
+        "--agents", type=str, default=None,
+        help="Comma-separated agent indices. Default: two vehicles from --seed.",
+    )
+    parser.add_argument(
+        "--steps", type=int, default=None,
+        help="GIF length in 10 Hz steps. Default: 10 seconds, or the whole log.",
+    )
     args = parser.parse_args()
     out_dir = args.out_dir or (args.data_dir / "assets")
+    agents = None
+    if args.agents is not None:
+        agents = [int(part) for part in args.agents.split(",") if part.strip()]
     png, gif, map_id, json_path, agents, video_seconds = render(
         args.data_dir, out_dir, args.seed,
+        map_id=args.map_id, agents=agents, steps=args.steps,
     )
     print(json.dumps({
         "png": str(png),

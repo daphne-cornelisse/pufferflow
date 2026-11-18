@@ -73,6 +73,14 @@ MAX_TRAJECTORY_STATES = MAX_SCENARIO_SECONDS * SAMPLE_HZ + 1
 assert MAX_TRAJECTORY_STATES == DRIVE_LOG_MAX
 HEADING_WINDOW_HALF_SECONDS = 0.5
 HEADING_MIN_RELIABLE_SPEED_MPS = 0.5
+# A track that drives this far against its carriageway is removed.
+# The carriageway direction is the majority of tracks there, and the
+# lower carriageway is eastbound (+x) when that vote is tied.
+WRONG_WAY_MIN_METERS = 10.0
+# Intersection area above half the smaller box, on more than this
+# many timesteps, drops the smaller track. Pairs are collected first.
+DEEP_OVERLAP_FRACTION = 0.5
+DEEP_OVERLAP_MIN_STEPS = 5
 MAJOR_QUALITY_FLAGS = {
     "speed_above_60_mps",
     "more_than_200m_outside_calibrated_x_range",
@@ -121,6 +129,15 @@ def _edge_y_m(boundary_y_ft: float, lane_mid_ft: float) -> float:
     """Lane-line y, shifted 1.5 ft away from the carriageway center."""
     outward = -1.0 if boundary_y_ft < lane_mid_ft else 1.0
     return boundary_y_ft * FEET_TO_METERS + outward * ROAD_EDGE_OUTWARD_M
+
+
+def _carriageway_split_y(boundary_y_m: list[float]) -> float:
+    """Y of the median, the largest gap between calibration lines."""
+    gaps = [right - left for left, right in zip(boundary_y_m, boundary_y_m[1:])]
+    if not gaps:
+        raise ValueError("The road grid has no carriageway split")
+    median_index = max(range(len(gaps)), key=gaps.__getitem__)
+    return 0.5 * (boundary_y_m[median_index] + boundary_y_m[median_index + 1])
 
 
 def load_road_grid(homography_path: Path) -> dict[str, Any]:
@@ -201,9 +218,11 @@ def load_road_grid(homography_path: Path) -> dict[str, Any]:
             )
             road_id += 1
 
+    boundary_y_m = [value * FEET_TO_METERS for value in y_values]
     return {
         "source": homography_path.name,
-        "boundary_y_m": [value * FEET_TO_METERS for value in y_values],
+        "boundary_y_m": boundary_y_m,
+        "carriageway_split_y_m": _carriageway_split_y(boundary_y_m),
         "x_range_m": [x_min_ft * FEET_TO_METERS, x_max_ft * FEET_TO_METERS],
         "roads": roads,
     }
@@ -288,7 +307,7 @@ def _heading_estimation_metadata(stabilize_headings: bool) -> dict[str, Any]:
 
 
 def normalize_object(
-    raw: dict[str, Any], road_grid: dict[str, Any], stabilize_headings: bool = False
+    raw: dict[str, Any], road_grid: dict[str, Any], stabilize_headings: bool = True
 ) -> dict[str, Any]:
     """Resample one native spline at 10 Hz. Positions are not smoothed."""
     timestamps = [float(value) for value in raw["timestamp"]]
@@ -399,7 +418,7 @@ def normalize_object(
 
 
 def normalize_scene(
-    i24_root: Path, scene: int, stabilize_headings: bool = False
+    i24_root: Path, scene: int, stabilize_headings: bool = True
 ) -> dict[str, Any]:
     splines_path = i24_root / "data" / "spl_obj" / f"scene{scene}_splobj.json"
     homography_path = i24_root / "data" / "hg" / f"scene{scene}_hg.json"
@@ -510,6 +529,295 @@ def _translated_roads(
     return translated
 
 
+def _box_corners(
+    x: float, y: float, heading: float, length: float, width: float
+) -> list[tuple[float, float]]:
+    """Clockwise corners. Length is along heading."""
+    half_length = length * 0.5
+    half_width = width * 0.5
+    cosine = math.cos(heading)
+    sine = math.sin(heading)
+    corners = []
+    for along, across in (
+        (half_length, half_width),
+        (half_length, -half_width),
+        (-half_length, -half_width),
+        (-half_length, half_width),
+    ):
+        corners.append((
+            x + along * cosine - across * sine,
+            y + along * sine + across * cosine,
+        ))
+    return corners
+
+
+def _clip_polygon(
+    subject: list[tuple[float, float]],
+    edge_start: tuple[float, float],
+    edge_end: tuple[float, float],
+) -> list[tuple[float, float]]:
+    """Keep the part of subject on the inside of a clockwise edge."""
+    if not subject:
+        return []
+
+    def cross(point: tuple[float, float]) -> float:
+        return (
+            (edge_end[0] - edge_start[0]) * (point[1] - edge_start[1])
+            - (edge_end[1] - edge_start[1]) * (point[0] - edge_start[0])
+        )
+
+    def intersection(
+        start: tuple[float, float], end: tuple[float, float]
+    ) -> tuple[float, float]:
+        start_cross = cross(start)
+        end_cross = cross(end)
+        denom = start_cross - end_cross
+        if abs(denom) < 1e-12:
+            return end
+        weight = start_cross / denom
+        return (
+            start[0] + weight * (end[0] - start[0]),
+            start[1] + weight * (end[1] - start[1]),
+        )
+
+    output: list[tuple[float, float]] = []
+    previous = subject[-1]
+    previous_cross = cross(previous)
+    for current in subject:
+        current_cross = cross(current)
+        if current_cross <= 1e-9:
+            if previous_cross > 1e-9:
+                output.append(intersection(previous, current))
+            output.append(current)
+        elif previous_cross <= 1e-9:
+            output.append(intersection(previous, current))
+        previous = current
+        previous_cross = current_cross
+    return output
+
+
+def _polygon_area(polygon: list[tuple[float, float]]) -> float:
+    if len(polygon) < 3:
+        return 0.0
+    area = 0.0
+    for index, point in enumerate(polygon):
+        nxt = polygon[(index + 1) % len(polygon)]
+        area += point[0] * nxt[1] - nxt[0] * point[1]
+    return abs(area) * 0.5
+
+
+def _intersection_area(
+    first: list[tuple[float, float]], second: list[tuple[float, float]]
+) -> float:
+    """Area shared by two convex boxes."""
+    polygon = first
+    for index, start in enumerate(second):
+        polygon = _clip_polygon(polygon, start, second[(index + 1) % len(second)])
+        if len(polygon) < 3:
+            return 0.0
+    return _polygon_area(polygon)
+
+
+def _valid_xy(obj: dict[str, Any]) -> list[tuple[float, float]]:
+    return [
+        (float(point["x"]), float(point["y"]))
+        for point, valid in zip(obj["position"], obj["valid"])
+        if valid
+    ]
+
+
+def _opposing_meters(points: list[tuple[float, float]], legal_sign: int) -> float:
+    """Path length traveled against legal_sign (+1 east, -1 west)."""
+    opposing = 0.0
+    previous_x = None
+    for x_pos, _y_pos in points:
+        if previous_x is not None:
+            step = x_pos - previous_x
+            if step * legal_sign < 0.0:
+                opposing += abs(step)
+        previous_x = x_pos
+    return opposing
+
+
+def _legal_directions(
+    tracks: list[tuple[float, list[tuple[float, float]]]],
+) -> dict[str, int]:
+    """Majority of net travel on each side of the median.
+
+    tracks are (mean_y, valid xy). A tie uses eastbound below the
+    median and westbound above it. The caller passes mean_y already
+    compared against the split by the sign of the stored side key.
+    """
+    votes = {"lower": [0, 0], "upper": [0, 0]}
+    for side, points in tracks:
+        if len(points) < 2:
+            continue
+        net = points[-1][0] - points[0][0]
+        if abs(net) < WRONG_WAY_MIN_METERS:
+            continue
+        votes[side][1 if net > 0.0 else 0] += 1
+    legal: dict[str, int] = {}
+    for side, fallback in (("lower", 1), ("upper", -1)):
+        west_votes, east_votes = votes[side]
+        if east_votes == west_votes:
+            legal[side] = fallback
+        else:
+            legal[side] = 1 if east_votes > west_votes else -1
+    return legal
+
+
+def _window_points(obj: dict[str, Any], start_tick: int, end_tick: int) -> list[tuple[float, float]]:
+    points = []
+    for tick in range(start_tick, end_tick + 1):
+        position, _velocity, _heading, valid = _state_at_tick(obj, tick)
+        if valid:
+            points.append((float(position[0]), float(position[1])))
+    return points
+
+
+def _wrong_way_ids(
+    objects: list[dict[str, Any]],
+    start_tick: int,
+    end_tick: int,
+    split_y: float,
+    sdc_id: int,
+) -> tuple[list[dict[str, Any]], dict[str, int], float]:
+    """Tracks that drive WRONG_WAY_MIN_METERS against their carriageway.
+
+    The focal car is reported but not listed for deletion.
+    """
+    samples = []
+    for obj in objects:
+        points = _window_points(obj, start_tick, end_tick)
+        if len(points) < 2:
+            continue
+        mean_y = sum(point[1] for point in points) / len(points)
+        side = "lower" if mean_y < split_y else "upper"
+        samples.append((obj, points, side, mean_y))
+    legal = _legal_directions([(side, points) for _obj, points, side, _mean in samples])
+    removed = []
+    focal_opposing = 0.0
+    for obj, points, side, _mean_y in samples:
+        opposing = _opposing_meters(points, legal[side])
+        if int(obj["id"]) == int(sdc_id):
+            focal_opposing = opposing
+            continue
+        if opposing > WRONG_WAY_MIN_METERS:
+            removed.append(
+                {
+                    "id": int(obj["id"]),
+                    "carriageway": "eastbound" if side == "lower" else "westbound",
+                    "opposing_m": round(opposing, 2),
+                }
+            )
+    removed.sort(key=lambda item: item["id"])
+    return removed, legal, focal_opposing
+
+
+def _deep_overlap_ids(
+    objects: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Smaller car of each pair that overlaps on more than 5 timesteps.
+
+    Overlap means the intersection is more than half the smaller box.
+    Pairs are marked together, then the smaller ids are dropped once.
+    """
+    count = len(objects)
+    if count < 2:
+        return [], []
+    state_count = len(objects[0]["valid"])
+    areas = [float(obj["length"]) * float(obj["width"]) for obj in objects]
+    deep_steps = [[0 for _ in range(count)] for _ in range(count)]
+    for tick in range(state_count):
+        alive = [index for index in range(count) if objects[index]["valid"][tick]]
+        boxes = {}
+        centers = {}
+        reach = {}
+        for index in alive:
+            obj = objects[index]
+            point = obj["position"][tick]
+            centers[index] = (float(point["x"]), float(point["y"]))
+            reach[index] = 0.5 * math.hypot(float(obj["length"]), float(obj["width"]))
+            boxes[index] = _box_corners(
+                float(point["x"]),
+                float(point["y"]),
+                float(obj["heading"][tick]),
+                float(obj["length"]),
+                float(obj["width"]),
+            )
+        for left_pos, left in enumerate(alive):
+            for right in alive[left_pos + 1 :]:
+                dx = centers[left][0] - centers[right][0]
+                dy = centers[left][1] - centers[right][1]
+                limit = reach[left] + reach[right]
+                if dx * dx + dy * dy > limit * limit:
+                    continue
+                shared = _intersection_area(boxes[left], boxes[right])
+                smaller = min(areas[left], areas[right])
+                if smaller > 0.0 and shared > DEEP_OVERLAP_FRACTION * smaller:
+                    deep_steps[left][right] += 1
+    pairs = []
+    focal_smaller = []
+    for left in range(count):
+        for right in range(left + 1, count):
+            steps = deep_steps[left][right]
+            if steps <= DEEP_OVERLAP_MIN_STEPS:
+                continue
+            if areas[left] < areas[right] or (
+                areas[left] == areas[right] and int(objects[left]["id"]) > int(objects[right]["id"])
+            ):
+                small, large = left, right
+            else:
+                small, large = right, left
+            record = {
+                "id": int(objects[small]["id"]),
+                "other_id": int(objects[large]["id"]),
+                "timesteps": int(steps),
+                "area_m2": round(areas[small], 3),
+                "other_area_m2": round(areas[large], 3),
+            }
+            if small == 0:
+                focal_smaller.append(record)
+                continue
+            pairs.append(record)
+    pairs.sort(key=lambda item: (item["id"], item["other_id"]))
+    return pairs, focal_smaller
+
+
+def _cleanup_tracks(
+    scenario_objects: list[dict[str, Any]],
+    scene_objects: list[dict[str, Any]],
+    start_tick: int,
+    end_tick: int,
+    split_y: float,
+    sdc_id: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Drop wrong-way tracks, then the smaller car of each deep overlap."""
+    wrong_way, legal, focal_opposing = _wrong_way_ids(
+        scene_objects, start_tick, end_tick, split_y, sdc_id
+    )
+    wrong_ids = {item["id"] for item in wrong_way}
+    kept = [obj for obj in scenario_objects if int(obj["id"]) not in wrong_ids]
+    overlaps, focal_smaller = _deep_overlap_ids(kept)
+    overlap_ids = {item["id"] for item in overlaps}
+    cleaned = [obj for obj in kept if int(obj["id"]) not in overlap_ids]
+    report = {
+        "wrong_way_min_m": WRONG_WAY_MIN_METERS,
+        "deep_overlap_fraction": DEEP_OVERLAP_FRACTION,
+        "deep_overlap_min_steps": DEEP_OVERLAP_MIN_STEPS,
+        "legal_direction": {
+            "eastbound_lower": "east" if legal["lower"] > 0 else "west",
+            "westbound_upper": "east" if legal["upper"] > 0 else "west",
+        },
+        "focal_opposing_m": round(focal_opposing, 2),
+        "focal_kept_despite_wrong_way": focal_opposing > WRONG_WAY_MIN_METERS,
+        "removed_wrong_way": wrong_way,
+        "removed_deep_overlap": overlaps,
+        "focal_smaller_overlaps_kept": focal_smaller,
+    }
+    return cleaned, report
+
+
 def build_scenario(
     scene_data: dict[str, Any],
     sdc_id: int,
@@ -530,9 +838,18 @@ def build_scenario(
         raise ValueError(f"SDC {sdc_id} does not cover the requested {state_count}-state range")
 
     origin, _, _, _ = _state_at_tick(sdc, start_tick)
+    road_grid = scene_data["map"]
+    if "carriageway_split_y_m" in road_grid:
+        split_y = float(road_grid["carriageway_split_y_m"])
+    else:
+        split_y = _carriageway_split_y(road_grid["boundary_y_m"])
+    wrong_way, _legal, _focal_opposing = _wrong_way_ids(
+        scene_data["objects"], start_tick, end_tick, split_y, sdc_id
+    )
+    wrong_ids = {item["id"] for item in wrong_way}
     candidates = []
     for obj in scene_data["objects"]:
-        if obj["id"] == sdc_id:
+        if obj["id"] == sdc_id or obj["id"] in wrong_ids:
             continue
         if full_range_context:
             overlap_start = max(start_tick, int(obj["start_tick"]))
@@ -603,6 +920,17 @@ def build_scenario(
     roads = _translated_roads(
         scene_data["map"]["roads"], origin, (min(all_x) - 50.0, max(all_x) + 50.0)
     )
+    # Roads keep the pre-cleanup extent. Wrong-way ids were already
+    # left out of the nearest-object cut; this pass drops deep overlaps
+    # and any wrong-way track that still got in.
+    scenario_objects, cleanup = _cleanup_tracks(
+        scenario_objects,
+        scene_data["objects"],
+        start_tick,
+        end_tick,
+        split_y,
+        sdc_id,
+    )
     return {
         "name": scenario_id,
         "scenario_id": scenario_id,
@@ -621,6 +949,7 @@ def build_scenario(
                 "heading_estimation", _heading_estimation_metadata(False)
             ),
             "coordinate_origin_m": {"x": origin[0], "y": origin[1]},
+            "track_cleanup": cleanup,
         },
     }
 
@@ -796,8 +1125,20 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
             "The road model is the scene's 12-foot calibration grid, extended along the roadway and sampled every 5 m. Road edges are 1.5 ft outward from the lane lines. Boxes are 0.90 of the annotated size.",
             "Action labels are the simulator inverse on these logs, as in arXiv 2606.19370 A.4.",
             "Heading stabilization never modifies exported positions or velocities.",
+            "A track that travels more than 10 m against its carriageway is removed. The carriageway direction is the majority of tracks on that side of the median.",
+            "When two boxes overlap by more than half the smaller box for more than 5 timesteps, the smaller track is removed. Pairs are marked before any of those tracks are deleted. The focal track is kept.",
         ],
     }
+    manifest["track_cleanup"] = [
+        {
+            "scenario_id": scenario["scenario_id"],
+            "source_scene": scenario["metadata"]["source_scene"],
+            "source_sdc_id": scenario["metadata"]["source_sdc_id"],
+            "object_count": len(scenario["objects"]),
+            **scenario["metadata"].get("track_cleanup", {}),
+        }
+        for scenario in scenarios
+    ]
     _write_json(args.output_dir / "manifest.json", manifest)
     return manifest
 
@@ -827,10 +1168,13 @@ def parser() -> argparse.ArgumentParser:
         help="Skip focal tracks with extreme speed or range flags",
     )
     argument_parser.add_argument(
-        "--stabilize-headings", action="store_true",
+        "--stabilize-headings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Estimate headings over a 1.0 s position window and hold the last "
-            "reliable orientation below 0.5 m/s"
+            "reliable orientation below 0.5 m/s. This is the default. "
+            "--no-stabilize-headings keeps the per-frame velocity heading."
         ),
     )
     argument_parser.add_argument("--max-objects", type=int, default=128)

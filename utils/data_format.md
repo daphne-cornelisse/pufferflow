@@ -36,8 +36,21 @@ Processing assumptions:
 - Time is 10 Hz with both endpoints. A track keeps its own length, capped at 90 s.
 - Body styles `sedan`, `midsize`, `pickup`, `van`, `semi`, `truck`, and `cs` are vehicles. `cs` is the one car-sized track in scene 3. Any other label is an error.
 - Exported length, width, and height are 0.90 of the annotated size, after the small-size defaults (4.5 m, 1.8 m, 1.5 m).
-- Heading is the direction of travel. Stabilization is off unless requested.
+- Heading is a 1.0 s centered regression on position. Below 0.5 m/s the last reliable heading is held. Positions and velocities are not smoothed. `--no-stabilize-headings` uses the per-frame velocity heading instead.
 - One scenario is one focal track plus nearby traffic, at most 128 objects. The default focal track is the longest clean one. Object 0 is that vehicle and is valid on every state. `mark_as_expert` is 0.
+- Track deletion is only the cleanup below. Quality flags (`speed_above_60_mps`, `more_than_200m_outside_calibrated_x_range`, `outside_calibrated_y_range`, `shorter_than_9_seconds`) are descriptive. `--exclude-major-flags` can skip a focal track. It does not delete neighbors.
+
+#### Cleanup
+
+Cleanup deletes whole tracks. It does not move a kept car or invent positions. When a rule changes, write the new rule here with its threshold and what it deletes, then regenerate the logs.
+
+Rules run in this order. Wrong-way tracks are removed before the nearest-128 cut, so they do not take a neighbor slot. Deep overlaps are judged on the tracks that remain. Those pairs are marked first and deleted together. There is no second pass, and the nearest-128 cut is not filled again after that deletion.
+
+1. Wrong-way track. The median is the midpoint of the largest gap in the calibration y lines. A track belongs to the lower carriageway when the mean of its valid y in the focal window is below that line, and to the upper carriageway otherwise. Each side has one legal direction: the majority sign of net x travel (last valid x minus first valid x) among tracks on that side whose absolute net travel is at least 10 m. A tie leaves the lower side eastbound (+x) and the upper side westbound (−x). Opposing distance is the sum of |Δx| on steps that move against the legal sign. A gap of invalid states breaks the sum. A track whose opposing distance is greater than 10 m is deleted. The focal track is never deleted. Its opposing distance is stored on the scenario.
+
+2. Deep overlap. Boxes are the exported length and width (already scaled by 0.90) at the logged heading. Both cars must be valid at the timestep. The timestep counts when the intersection area of the two rectangles is more than half the smaller box area, `length × width`. A pair qualifies when that count is greater than 5. The smaller car is the one with the smaller area. Equal areas treat the higher source id as the smaller car. Every smaller car in a qualifying pair is deleted, including a car that would no longer overlap once another car was gone. Object 0 is never deleted. If it is the smaller member, both tracks stay and the pair is recorded.
+
+`metadata.track_cleanup` on each scenario lists the removed ids, the legal direction, the focal opposing distance, and any deep overlap that was kept because the focal car was the smaller one.
 - Lanes, broken white lines, and edges come from the 12-foot calibration grid. Eastbound runs toward +x. The lower carriageway is eastbound. The grid is shifted so the focal car starts at the origin, extended along the roadway, and sampled every 5 m. The simulator stores one observation per segment midpoint, so an unsampled chord leaves the view empty.
 - No vehicle in the source data is treated as overlapping a real road edge. The calibration edge is the outer lane line, so each edge, including the median, is moved 1.5 ft away from the lanes.
 
