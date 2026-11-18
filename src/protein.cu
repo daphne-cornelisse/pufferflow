@@ -850,7 +850,8 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     int dim = sw->dim, cost_dim = sw->cost_dim;
     int is_fixed_cost = !isnan(fixed_cost_norm);
 
-    if (sw->suggestion_idx <= sw->num_random_samples || sw->succ_n == 0) {
+    // Sobol covers the box until enough runs exist. Loaded history counts.
+    if (sw->succ_n <= sw->num_random_samples) {
         sobol_fallback(sw, out, is_fixed_cost, fixed_cost_norm);
         info.is_random = 1;
         return info;
@@ -1102,7 +1103,7 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     int *use_pareto = sw->prune_pareto ? sw->pruned_buf : sw->pareto_buf;
     int n_use = sw->prune_pareto ? n_pruned : n_pareto;
 
-    // Search centers
+    // Pareto runs, plus shorter copies of the best scores.
     int n_centers = 0;
     for (int i = 0; i < n_use; i++) {
         memcpy(&sw->centers_buf[n_centers++ * dim],
@@ -1123,7 +1124,6 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         }
     }
 
-    // Target cost
     float target_cost = 0.0f;
     if (!is_fixed_cost) {
         if (sw->pool_remaining <= 0) {

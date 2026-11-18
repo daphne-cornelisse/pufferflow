@@ -500,6 +500,46 @@ const char* PROF_NAMES[] = {
     "train_model",
 };
 
+// Frozen BC MLP from an npz (W*, b*, Wa, ba, Ws, bs, mu, sig). Same obs
+// width and action heads as this env; depth and hidden width may differ.
+#define ANCHOR_MAX_LAYERS 8
+
+struct AnchorLayer {
+    precision_t* W;
+    precision_t* b;
+    int in;
+    int out;
+};
+
+struct Anchor {
+    int on;
+    int dist;
+    float coef;
+    int n_layers;
+    int in_dim;
+    int width;
+    int heads[NUM_ATNS];
+    int a_total;
+    int max_nt;
+    precision_t* mu;
+    precision_t* sig;
+    AnchorLayer layer[ANCHOR_MAX_LAYERS];
+    precision_t* head_w[NUM_ATNS];
+    precision_t* head_b[NUM_ATNS];
+    precision_t* norm;
+    precision_t* hid[2];
+    precision_t* scratch;
+    precision_t* logits;
+    float* partials;
+    // Own stream, not the dW stream: backward reuses that stream and its
+    // events inside this same captured train graph.
+    cudaStream_t stream;
+    cublasHandle_t handle;
+    void* workspace;
+    cudaEvent_t fork_ev;
+    cudaEvent_t done_ev;
+};
+
 // Index must match LossIdx 0..LOSS_N-1 in algo.cu (not LOSS_N counter).
 const char* LOSS_NAMES[] = {
     "loss/policy",
@@ -510,6 +550,7 @@ const char* LOSS_NAMES[] = {
     "loss/kl",
     "loss/clipfrac",
     "importance",
+    "loss/anchor",
 };
 
 typedef struct {
@@ -518,6 +559,18 @@ typedef struct {
     float accum[NUM_PROF];
     int skip_rollout_time;
 } Profile;
+
+// Fixed edges so a CUDA graph can histogram without a host rescale.
+#define ADV_BINS 32
+#define ADV_LO (-32.f)
+#define ADV_HI 32.f
+
+typedef struct {
+    double step;
+    double mean_abs;
+    double var;
+    unsigned int bin[ADV_BINS];
+} AdvSnap;
 
 typedef struct PuffeRL {
     Policy* policies;        // [num_policies]; policies[0] trainable, rest frozen
@@ -545,7 +598,21 @@ typedef struct PuffeRL {
     cudaStream_t train_stream;    // dedicated learner stream (always non-default)
     int* act_sizes;        // device ACT_SIZES (NUM_ATNS ints)
     float* losses;         // device loss accumulator (NUM_LOSSES)
+    // Advantage windows, each sum / |sum| / sq.
+    // 0 is the log window. 3 is the snapshot window.
+    // count matches those two. hist is ADV_BINS.
+    // Bin 0 is below ADV_LO, ADV_BINS-1 is at or above ADV_HI.
+    double* adv_mom;
+    unsigned long long* adv_count;
+    unsigned int* adv_hist;
+    AdvSnap* adv_snaps;
+    int adv_snap_n;
+    int adv_snap_cap;
+    int adv_every;
+    FILE* adv_fp;
+    char adv_path[1024];
     PPOBufs ppo_bufs; // Pre-allocated buffers for ppo_loss_fwd_bwd
+    Anchor anchor;
     Prec actor_param;      // async flat actor params
     Prec grad;
     long* rng_offset;      // device counters (num_buffers+1)
@@ -894,6 +961,9 @@ void pufferl_forward(PuffeRL* pufferl, int buf, int t, cudaStream_t stream) {
     }
 
     if (step_graph) {
+        int block = hypers->total_agents / hypers->num_buffers;
+        int H = pufferl->policies[0].arch.encoder.out_dim;
+        drive_lt_prepare(block, H, stream);
         assert(cudaStreamBeginCapture(
             stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess
             && "cudaStreamBeginCapture failed");
@@ -971,6 +1041,7 @@ static Env* puf_vec_create(int, Dict*, obs_t*, float*, float*, float*) {
 }
 #endif
 
+
 static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     if (PUF_BACKEND == PUF_GPU) {
         assert(vec->buffers == 1 && "GPU env: num_buffers must be 1");
@@ -999,11 +1070,44 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
 #else
     Env* envs = (Env*)calloc(total_agents, sizeof(Env));
     int agents_created = 0;
+    // num_maps 1 leaves map_id alone. Above that, copy i loads map i % num_maps.
+    int num_maps = (int)dict_get(ek, "num_maps");
+    int map_counts[8];
+    double saved_map_id = 0.0;
+    int restore_map_id = 0;
+    memset(map_counts, 0, sizeof(map_counts));
+    if (num_maps < 1) {
+        num_maps = 1;
+    }
+    int map_offset = 0;
+    DictItem* off = dict_find(ek, "map_offset");
+    if (off) {
+        map_offset = (int)off->value;
+    }
+    if (num_maps > 1) {
+        saved_map_id = dict_get(ek, "map_id");
+        restore_map_id = 1;
+    }
     while (agents_created < total_agents) {
         envs[num_envs].rng = num_envs;
+        if (num_maps > 1) {
+            int map_id = map_offset + (num_envs % num_maps);
+            dict_set(ek, "map_id", (double)map_id);
+            if (map_id < 8) {
+                map_counts[map_id]++;
+            }
+        }
         puf_init(&envs[num_envs], ek);
         agents_created += envs[num_envs].num_agents;
         num_envs++;
+    }
+    if (restore_map_id) {
+        dict_set(ek, "map_id", saved_map_id);
+        fprintf(stderr, "maps copies=%d num_maps=%d", num_envs, num_maps);
+        for (int m = 0; m < num_maps && m < 8; m++) {
+            fprintf(stderr, " m%d=%d", m, map_counts[m]);
+        }
+        fprintf(stderr, "\n");
     }
     envs = (Env*)realloc(envs, num_envs * sizeof(Env));
     int buf = 0, buf_agents = 0;
@@ -1262,6 +1366,9 @@ static void rollout_start(PuffeRL* p) {
         double t_cap = 0;
         if (first) {
             t_cap = wall_clock();
+            int block = p->hypers.total_agents / p->hypers.num_buffers;
+            int H = p->policies[0].arch.encoder.out_dim;
+            drive_lt_prepare(block, H, stream);
             assert(cudaStreamBeginCapture(
                 stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess
                 && "cudaStreamBeginCapture failed");
@@ -1361,6 +1468,21 @@ static void env_close(VecEnv* vec) {
 }
 
 void vec_log(VecEnv* vec, Dict* out, int clear) {
+    // Mean score of finished episodes on each town, before the sum clears logs.
+    float town_score[4] = {0};
+    float town_n[4] = {0};
+    int town_seen[4] = {0};
+    if (PUF_BACKEND != PUF_GPU) {
+        for (int i = 0; i < vec->size; i++) {
+            int id = vec->envs[i].map_id;
+            if (id < 0 || id > 3 || !drive_score_town_key(id)) {
+                continue;
+            }
+            town_seen[id] = 1;
+            town_score[id] += vec->envs[i].log.score;
+            town_n[id] += vec->envs[i].log.n;
+        }
+    }
     Log aggregate = {0};
     float* acc = (float*)&aggregate;
     env_log_sum(vec, &aggregate, clear);
@@ -1372,6 +1494,16 @@ void vec_log(VecEnv* vec, Dict* out, int clear) {
             acc[j] /= n;
         }
         puf_log(&aggregate, &env_out);
+        for (int id = 0; id < 4; id++) {
+            if (!town_seen[id]) {
+                continue;
+            }
+            float mean = 0.0f;
+            if (town_n[id] > 0.0f) {
+                mean = town_score[id] / town_n[id];
+            }
+            dict_set(&env_out, drive_score_town_key(id), mean);
+        }
     }
     dict_set(&env_out, "n", n);
     for (int i = 0; i < env_out.size; i++) {
@@ -1457,6 +1589,266 @@ __global__ void puf_stamp(unsigned long long* dst) {
     *dst = t;
 }
 
+// (obs - mu) / sig. BC stores sig < 1e-6 as 1; keep that floor here too.
+__global__ void anchor_norm(precision_t* dst, const precision_t* obs,
+        const precision_t* mu, const precision_t* sig, int nt, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nt * n) {
+        return;
+    }
+    int col = idx % n;
+    float s = to_float(sig[col]);
+    if (s < 1e-6f) {
+        s = 1.0f;
+    }
+    float v = (to_float(obs[idx]) - to_float(mu[col])) / s;
+    dst[idx] = from_float(v);
+}
+
+__global__ void anchor_bias_lrelu(precision_t* x, const precision_t* b,
+        int nt, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nt * n) {
+        return;
+    }
+    float v = to_float(x[idx]) + to_float(b[idx % n]);
+    if (v < 0.0f) {
+        v *= 0.01f;
+    }
+    x[idx] = from_float(v);
+}
+
+// GEMM writes a packed (nt, A) head. Place it at the action offset.
+__global__ void anchor_pack(precision_t* logits, const precision_t* scratch,
+        const precision_t* bias, int nt, int A, int A_total, int offset) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nt * A) {
+        return;
+    }
+    int row = idx / A;
+    int col = idx % A;
+    float v = to_float(scratch[idx]) + to_float(bias[col]);
+    logits[row * A_total + offset + col] = from_float(v);
+}
+
+static void anchor_gemm(precision_t* x, int nt, int k,
+        precision_t* w, int n, precision_t* y, cudaStream_t stream,
+        cublasHandle_t handle) {
+    Prec a = {.data = x, .shape = {nt, k}};
+    Prec b = {.data = w, .shape = {k, n}};
+    Prec c = {.data = y, .shape = {nt, n}};
+    puf_mm_nn(&a, &b, &c, stream, 1.0f, 0.0f, handle);
+}
+
+// obs is flat (nt, in_dim), same order as the squeezed train minibatch.
+static void anchor_forward(Anchor* a, precision_t* obs, int nt,
+        cudaStream_t stream, cublasHandle_t handle) {
+    assert(nt > 0 && nt <= a->max_nt);
+    anchor_norm<<<grid_size(nt * a->in_dim), BLOCK_SIZE, 0, stream>>>(
+        a->norm, obs, a->mu, a->sig, nt, a->in_dim);
+    precision_t* src = a->norm;
+    int src_n = a->in_dim;
+    for (int i = 0; i < a->n_layers; i++) {
+        AnchorLayer* layer = &a->layer[i];
+        precision_t* dst = a->hid[i & 1];
+        anchor_gemm(src, nt, src_n, layer->W, layer->out, dst,
+            stream, handle);
+        int n = layer->out;
+        anchor_bias_lrelu<<<grid_size(nt * n), BLOCK_SIZE, 0, stream>>>(
+            dst, layer->b, nt, n);
+        src = dst;
+        src_n = n;
+    }
+    int offset = 0;
+    for (int h = 0; h < NUM_ATNS; h++) {
+        int A = a->heads[h];
+        anchor_gemm(src, nt, src_n, a->head_w[h], A, a->scratch,
+            stream, handle);
+        anchor_pack<<<grid_size(nt * A), BLOCK_SIZE, 0, stream>>>(
+            a->logits, a->scratch, a->head_b[h],
+            nt, A, a->a_total, offset);
+        offset += A;
+    }
+}
+
+struct AnchorFork {
+    Anchor* anchor;
+    precision_t* obs;
+    int nt;
+};
+
+// Recorded on the train stream just after the encoder GEMM, so minGRU and
+// PPO overlap this MLP. Joined before the distance kernel. Not the dW
+// stream: backward reuses that stream and its events in this same graph.
+static void anchor_fork(void* ctx, cudaStream_t main) {
+    AnchorFork* f = (AnchorFork*)ctx;
+    Anchor* a = f->anchor;
+    cudaEventRecord(a->fork_ev, main);
+    cudaStreamWaitEvent(a->stream, a->fork_ev, 0);
+    anchor_forward(a, f->obs, f->nt, a->stream, a->handle);
+    cudaEventRecord(a->done_ev, a->stream);
+}
+
+static void anchor_join(Anchor* a, cudaStream_t main) {
+    cudaStreamWaitEvent(main, a->done_ev, 0);
+}
+
+static void anchor_open_stream(Anchor* a) {
+    cublas_init_one(&a->handle, &a->workspace);
+    assert(cudaStreamCreateWithFlags(
+        &a->stream, cudaStreamNonBlocking) == cudaSuccess);
+    cublasSetStream(a->handle, a->stream);
+    assert(cudaEventCreateWithFlags(
+        &a->fork_ev, cudaEventDisableTiming) == cudaSuccess);
+    assert(cudaEventCreateWithFlags(
+        &a->done_ev, cudaEventDisableTiming) == cudaSuccess);
+}
+
+// Last horizon index is left 0 by puff_advantage. Skip it so the
+// histogram is not a spike at zero. Bin 0 and the last bin are overflow.
+// Moments are stored twice: [0, 3) is the log window, [3, 6) is the snapshot.
+__global__ void adv_stats(const precision_t* adv, int n, int horizon,
+        double* mom, unsigned long long* count, unsigned int* hist) {
+    __shared__ double red[3][BLOCK_SIZE];
+    __shared__ int rn[BLOCK_SIZE];
+    __shared__ unsigned int local[ADV_BINS];
+    int tid = threadIdx.x;
+    if (tid < ADV_BINS) {
+        local[tid] = 0;
+    }
+    __syncthreads();
+
+    double ls = 0;
+    double la = 0;
+    double lq = 0;
+    int ln = 0;
+    int i = blockIdx.x * BLOCK_SIZE + tid;
+    int live = i < n && (horizon <= 1 || (i % horizon) != horizon - 1);
+    if (live) {
+        float a = to_float(adv[i]);
+        int bin = ADV_BINS - 1;
+        ls = a;
+        la = fabsf(a);
+        lq = (double)a * (double)a;
+        ln = 1;
+        if (a < ADV_LO) {
+            bin = 0;
+        } else if (a < ADV_HI) {
+            float u = (a - ADV_LO) / (ADV_HI - ADV_LO);
+            bin = 1 + (int)(u * (float)(ADV_BINS - 2));
+            if (bin > ADV_BINS - 2) {
+                bin = ADV_BINS - 2;
+            }
+        }
+        atomicAdd(local + bin, 1u);
+    }
+    red[0][tid] = ls;
+    red[1][tid] = la;
+    red[2][tid] = lq;
+    rn[tid] = ln;
+    __syncthreads();
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            red[0][tid] += red[0][tid + stride];
+            red[1][tid] += red[1][tid + stride];
+            red[2][tid] += red[2][tid + stride];
+            rn[tid] += rn[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0 && rn[0]) {
+        atomicAdd(mom + 0, red[0][0]);
+        atomicAdd(mom + 1, red[1][0]);
+        atomicAdd(mom + 2, red[2][0]);
+        atomicAdd(mom + 3, red[0][0]);
+        atomicAdd(mom + 4, red[1][0]);
+        atomicAdd(mom + 5, red[2][0]);
+        atomicAdd(count + 0, (unsigned long long)rn[0]);
+        atomicAdd(count + 1, (unsigned long long)rn[0]);
+    }
+    __syncthreads();
+    if (tid < ADV_BINS && local[tid]) {
+        atomicAdd(hist + tid, local[tid]);
+    }
+}
+
+static void adv_reduce(double sum, double sum_abs, double sum_sq,
+        unsigned long long n, double* mean_abs, double* var) {
+    *mean_abs = 0;
+    *var = 0;
+    if (!n) {
+        return;
+    }
+    double mean = sum / (double)n;
+    *mean_abs = sum_abs / (double)n;
+    *var = sum_sq / (double)n - mean * mean;
+    if (*var < 0) {
+        *var = 0;
+    }
+}
+
+// Copy the snapshot window to the host and clear it. The log window stays.
+static void adv_window_take(double* mom, unsigned long long* count,
+        unsigned int* hist, double out_mom[3], unsigned long long* out_n,
+        unsigned int* out_bins) {
+    cudaMemcpy(out_mom, mom, 3 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_n, count, sizeof(*out_n), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_bins, hist, ADV_BINS * sizeof(unsigned int),
+        cudaMemcpyDeviceToHost);
+    cudaMemset(mom, 0, 3 * sizeof(double));
+    cudaMemset(count, 0, sizeof(*out_n));
+    cudaMemset(hist, 0, ADV_BINS * sizeof(unsigned int));
+}
+
+static void adv_json_line(PuffeRL* p, long steps, const char* group,
+        double mean_abs, double var, const unsigned int* bins) {
+    FILE* fp;
+    if (!p->adv_path[0]) {
+        return;
+    }
+    fp = p->adv_fp;
+    if (!fp) {
+        fp = fopen(p->adv_path, "a");
+        if (!fp) {
+            fprintf(stderr, "advantage log open failed %s\n", p->adv_path);
+            p->adv_path[0] = 0;
+            return;
+        }
+        p->adv_fp = fp;
+    }
+    fprintf(fp,
+        "{\"steps\":%ld,\"group\":\"%s\",\"mean_abs\":%.6g,\"var\":%.6g,"
+        "\"bins\":[",
+        steps, group, mean_abs, var);
+    for (int i = 0; i < ADV_BINS; i++) {
+        fprintf(fp, "%s%u", i ? "," : "", bins[i]);
+    }
+    fprintf(fp, "]}\n");
+    fflush(fp);
+}
+
+// Histogram window. The log window (mom[0..2], count[0]) stays put.
+static void adv_snap(PuffeRL* p) {
+    double mom[3];
+    unsigned long long cnt = 0;
+    unsigned int bins[ADV_BINS];
+    long steps;
+    if (!p->adv_snaps || p->adv_snap_n >= p->adv_snap_cap) {
+        return;
+    }
+    adv_window_take(p->adv_mom + 3, p->adv_count + 1, p->adv_hist,
+        mom, &cnt, bins);
+    if (!cnt) {
+        return;
+    }
+    steps = p->global_step * p->hypers.world_size;
+    AdvSnap* s = &p->adv_snaps[p->adv_snap_n++];
+    adv_reduce(mom[0], mom[1], mom[2], cnt, &s->mean_abs, &s->var);
+    s->step = (double)steps;
+    memcpy(s->bin, bins, sizeof(bins));
+    adv_json_line(p, steps, "all", s->mean_abs, s->var, bins);
+}
+
 static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         cudaStream_t stream) {
     Hypers* hypers = &pufferl->hypers;
@@ -1524,11 +1916,20 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         if (dw_train->continuous) {
             p_logstd = dw_train->logstd;
         }
+        ArchHook hook = NULL;
+        AnchorFork fork = {};
+        if (pufferl->anchor.on) {
+            assert((int)graph.mb_obs.shape[2] == pufferl->anchor.in_dim);
+            fork.anchor = &pufferl->anchor;
+            fork.obs = graph.mb_obs.data;
+            fork.nt = Nmb * Tmb;
+            hook = anchor_fork;
+        }
         Prec dec = arch_forward_train(&primary->arch, primary->weights,
             pufferl->train_activs, graph.mb_obs, graph.mb_state,
             graph.mb_terminals, dest_off, graph, p_logstd,
             pufferl->act_sizes, pufferl->ppo_bufs.grad_logits.data,
-            pufferl->ppo_bufs.grad_values.data, stream);
+            pufferl->ppo_bufs.grad_values.data, stream, hook, &fork);
         puff_advantage<<<adv_grid, ADV_THREADS, 0, stream>>>(
             graph.mb_gae_v.data, graph.mb_rewards.data,
             graph.mb_terminals.data,
@@ -1536,6 +1937,9 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             graph.mb_advantages.data, graph.mb_gae_v.data,
             hypers->gamma, hypers->gae_lambda,
             hypers->vtrace_rho_clip, hypers->vtrace_c_clip, Nmb, Tmb);
+        adv_stats<<<grid_size(Nmb * Tmb), BLOCK_SIZE, 0, stream>>>(
+            graph.mb_advantages.data, Nmb * Tmb, Tmb,
+            pufferl->adv_mom, pufferl->adv_count, pufferl->adv_hist);
         graph.mb_returns = graph.mb_gae_v;
 
         ppo_loss_fwd_bwd(dec, p_logstd, graph,
@@ -1543,6 +1947,20 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             hypers->clip_coef, hypers->vf_clip_coef, hypers->vf_coef,
             pufferl->ppo_bufs.ent_coef,
             pufferl->ppo_bufs, pufferl->is_continuous, stream);
+
+        // Logit grads are PPO's. Wait for the anchor logits, then add
+        // the frozen term before backward reads those grads.
+        if (pufferl->anchor.on) {
+            int nt = Nmb * Tmb;
+            int A_total = (int)dec.shape[2] - 1;
+            assert(A_total == pufferl->anchor.a_total);
+            anchor_join(&pufferl->anchor, stream);
+            anchor_distance(dec.data, pufferl->anchor.logits,
+                pufferl->ppo_bufs.grad_logits.data, pufferl->act_sizes,
+                pufferl->losses, pufferl->anchor.partials,
+                A_total, nt, pufferl->anchor.dist,
+                pufferl->anchor.coef, stream);
+        }
 
         Float grad_logits = pufferl->ppo_bufs.grad_logits;
         Float grad_logstd = pufferl->is_continuous
@@ -1607,6 +2025,8 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
     profile_begin("train_forward_backward", hypers->profile);
     if (first) {
         double t_cap = wall_clock();
+        int H = pufferl->policies[0].arch.encoder.out_dim;
+        drive_lt_prepare(hypers->minibatch_size, H, train_stream);
         assert(cudaStreamBeginCapture(
             train_stream, cudaStreamCaptureModeThreadLocal)
             == cudaSuccess && "cudaStreamBeginCapture failed");
@@ -1641,6 +2061,9 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
             (float)(h[TE_E] - h[TE_MID]) * 1e-6f;
     }
     pufferl->epoch += 1;
+    if (pufferl->adv_every > 0 && pufferl->epoch % pufferl->adv_every == 0) {
+        adv_snap(pufferl);
+    }
 }
 
 // Load policy weights (flat fp32 checkpoint). Safe between rollouts —
@@ -1777,6 +2200,601 @@ static void master_weights_setup(Float* mw, Prec* param,
     }
 }
 
+#define ANCHOR_ZIP_ENTS 32
+#define ANCHOR_NAME 64
+
+struct AnchorZipEnt {
+    char name[ANCHOR_NAME];
+    long data;
+    int nbytes;
+};
+
+struct AnchorZip {
+    unsigned char* buf;
+    long n;
+    AnchorZipEnt ent[ANCHOR_ZIP_ENTS];
+    int nent;
+};
+
+struct AnchorNpy {
+    const unsigned char* data;
+    int rows;
+    int cols;
+    int n;
+    int fortran;
+    char kind;
+};
+
+static uint16_t anchor_u16(const unsigned char* p) {
+    uint16_t v;
+    memcpy(&v, p, 2);
+    return v;
+}
+
+static uint32_t anchor_u32(const unsigned char* p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+static uint64_t anchor_u64(const unsigned char* p) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+}
+
+static void anchor_zip_open(AnchorZip* z, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        printf("anchor npz %s\n", path);
+        assert(0 && "anchor npz open");
+    }
+    assert(fseek(f, 0, SEEK_END) == 0);
+    long n = ftell(f);
+    assert(n > 0 && n < 256L * 1024 * 1024);
+    rewind(f);
+    z->buf = (unsigned char*)malloc((size_t)n);
+    assert(z->buf);
+    assert(fread(z->buf, 1, (size_t)n, f) == (size_t)n);
+    fclose(f);
+    z->n = n;
+    z->nent = 0;
+    long off = 0;
+    while (off + 30 <= n) {
+        if (anchor_u32(z->buf + off) != 0x04034b50u) {
+            break;
+        }
+        int flags = anchor_u16(z->buf + off + 6);
+        int method = anchor_u16(z->buf + off + 8);
+        uint32_t csize32 = anchor_u32(z->buf + off + 18);
+        uint32_t usize32 = anchor_u32(z->buf + off + 22);
+        int namelen = anchor_u16(z->buf + off + 26);
+        int extralen = anchor_u16(z->buf + off + 28);
+        assert(method == 0 && "anchor npz compressed");
+        assert((flags & 8) == 0 && "anchor npz descriptor");
+        assert(z->nent < ANCHOR_ZIP_ENTS);
+        assert(namelen > 0 && namelen < ANCHOR_NAME);
+        uint64_t csize = csize32;
+        if (csize32 == 0xffffffffu || usize32 == 0xffffffffu) {
+            const unsigned char* extra = z->buf + off + 30 + namelen;
+            int left = extralen;
+            int found = 0;
+            while (left >= 4) {
+                int hid = anchor_u16(extra);
+                int hsz = anchor_u16(extra + 2);
+                assert(4 + hsz <= left);
+                if (hid == 1) {
+                    int q = 0;
+                    if (usize32 == 0xffffffffu) {
+                        q += 8;
+                    }
+                    if (csize32 == 0xffffffffu) {
+                        csize = anchor_u64(extra + 4 + q);
+                    }
+                    found = 1;
+                    break;
+                }
+                extra += 4 + hsz;
+                left -= 4 + hsz;
+            }
+            assert(found && "anchor zip64 extra");
+        }
+        assert(csize < 256ull * 1024 * 1024);
+        AnchorZipEnt* e = &z->ent[z->nent++];
+        memcpy(e->name, z->buf + off + 30, namelen);
+        e->name[namelen] = 0;
+        e->data = off + 30 + namelen + extralen;
+        e->nbytes = (int)csize;
+        assert(e->data + e->nbytes <= n);
+        off = e->data + e->nbytes;
+    }
+    assert(z->nent > 0 && "anchor npz empty");
+}
+
+static int anchor_zip_index(AnchorZip* z, const char* key) {
+    char want[ANCHOR_NAME];
+    snprintf(want, sizeof(want), "%s.npy", key);
+    for (int i = 0; i < z->nent; i++) {
+        if (strcmp(z->ent[i].name, want) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void anchor_npz_missing(AnchorZip* z, const char* key) {
+    printf("anchor npz missing %s (%d entries)\n", key, z->nent);
+    for (int k = 0; k < z->nent; k++) {
+        printf("  %s\n", z->ent[k].name);
+    }
+    assert(0 && "anchor npz key");
+}
+
+static AnchorNpy anchor_npy(const unsigned char* p, int nbytes) {
+    assert(nbytes >= 10);
+    assert(p[0] == 0x93 && memcmp(p + 1, "NUMPY", 5) == 0);
+    int major = p[6];
+    int hlen = 0;
+    int hoff = 10;
+    if (major == 1) {
+        hlen = anchor_u16(p + 8);
+    } else if (major == 2) {
+        hlen = (int)anchor_u32(p + 8);
+        hoff = 12;
+    } else {
+        assert(0 && "anchor npy version");
+    }
+    assert(hlen > 0 && hlen < 1024);
+    assert(hoff + hlen <= nbytes);
+    char hdr[1024];
+    memcpy(hdr, p + hoff, hlen);
+    hdr[hlen] = 0;
+    const char* d = strstr(hdr, "'descr': '<");
+    assert(d && "anchor npy descr");
+    d += 11;
+    assert((d[0] == 'f' || d[0] == 'i') && d[1] == '4');
+    const char* s = strstr(hdr, "'shape': (");
+    assert(s);
+    s += 10;
+    int dims[2] = {0, 0};
+    int nd = 0;
+    while (*s && *s != ')') {
+        while (*s == ' ' || *s == ',') {
+            s++;
+        }
+        if (*s == ')') {
+            break;
+        }
+        char* end = NULL;
+        long v = strtol(s, &end, 10);
+        assert(end != s && nd < 2);
+        dims[nd++] = (int)v;
+        s = end;
+    }
+    AnchorNpy o;
+    memset(&o, 0, sizeof(o));
+    o.kind = d[0];
+    o.fortran = strstr(hdr, "fortran_order': True") != NULL;
+    if (nd == 0) {
+        o.rows = 1;
+    } else if (nd == 1) {
+        o.rows = dims[0];
+    } else {
+        o.rows = dims[0];
+        o.cols = dims[1];
+    }
+    o.n = o.cols ? o.rows * o.cols : o.rows;
+    assert(o.n > 0);
+    o.data = p + hoff + hlen;
+    assert(hoff + hlen + o.n * 4 <= nbytes);
+    return o;
+}
+
+static float* anchor_load_f32(AnchorZip* z, const char* key,
+        int* rows, int* cols) {
+    int i = anchor_zip_index(z, key);
+    if (i < 0) {
+        anchor_npz_missing(z, key);
+    }
+    AnchorNpy np = anchor_npy(z->buf + z->ent[i].data, z->ent[i].nbytes);
+    assert(np.kind == 'f');
+    float* src = (float*)malloc((size_t)np.n * sizeof(float));
+    assert(src);
+    memcpy(src, np.data, (size_t)np.n * sizeof(float));
+    *rows = np.rows;
+    *cols = np.cols;
+    if (!(np.fortran && np.cols)) {
+        return src;
+    }
+    float* dst = (float*)malloc((size_t)np.n * sizeof(float));
+    assert(dst);
+    for (int col = 0; col < np.cols; col++) {
+        for (int row = 0; row < np.rows; row++) {
+            size_t f = (size_t)row + (size_t)col * np.rows;
+            dst[(size_t)row * np.cols + col] = src[f];
+        }
+    }
+    free(src);
+    return dst;
+}
+
+static int anchor_load_i32(AnchorZip* z, const char* key) {
+    int i = anchor_zip_index(z, key);
+    if (i < 0) {
+        anchor_npz_missing(z, key);
+    }
+    AnchorNpy np = anchor_npy(z->buf + z->ent[i].data, z->ent[i].nbytes);
+    assert(np.kind == 'i' && np.n == 1);
+    int v = 0;
+    memcpy(&v, np.data, 4);
+    return v;
+}
+
+static void anchor_h2d_into(precision_t* dst, const float* src, int n,
+        cudaStream_t stream) {
+    float* stage = NULL;
+    assert(cudaMalloc(&stage, (size_t)n * sizeof(float)) == cudaSuccess);
+    cudaMemcpyAsync(stage, src, (size_t)n * sizeof(float),
+        cudaMemcpyHostToDevice, stream);
+    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(dst, stage, n);
+    cudaStreamSynchronize(stream);
+    cudaFree(stage);
+}
+
+static void anchor_h2d(precision_t** dst, const float* src, int n,
+        cudaStream_t stream) {
+    assert(cudaMalloc(dst, (size_t)n * sizeof(precision_t)) == cudaSuccess);
+    anchor_h2d_into(*dst, src, n, stream);
+}
+
+static float anchor_max_abs(const float* x, const float* y, int n) {
+    float m = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(x[i] - y[i]);
+        if (d > m) {
+            m = d;
+        }
+    }
+    return m;
+}
+
+static void anchor_d2h(float* dst, precision_t* src, int n,
+        cudaStream_t stream) {
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        printf("anchor sync %s\n", cudaGetErrorString(err));
+        assert(0 && "anchor sync");
+    }
+    precision_t* tmp = (precision_t*)malloc((size_t)n * sizeof(precision_t));
+    assert(tmp);
+    cudaMemcpy(tmp, src, (size_t)n * sizeof(precision_t),
+        cudaMemcpyDeviceToHost);
+    for (int i = 0; i < n; i++) {
+        dst[i] = to_float(tmp[i]);
+    }
+    free(tmp);
+}
+
+static void anchor_cpu_row(float* dst, const float* obs,
+        float** W, float** b, int* lin, int* lout, int n_layers,
+        float** hw, float** hb, int* heads,
+        const float* mu, const float* sig, int in_dim, int cap) {
+    float* cur = (float*)malloc((size_t)cap * sizeof(float));
+    float* nxt = (float*)malloc((size_t)cap * sizeof(float));
+    assert(cur && nxt);
+    for (int j = 0; j < in_dim; j++) {
+        float s = sig[j];
+        if (s < 1e-6f) {
+            s = 1.0f;
+        }
+        cur[j] = (obs[j] - mu[j]) / s;
+    }
+    int n = in_dim;
+    for (int i = 0; i < n_layers; i++) {
+        int out = lout[i];
+        for (int j = 0; j < out; j++) {
+            float v = b[i][j];
+            for (int k = 0; k < lin[i]; k++) {
+                v += cur[k] * W[i][(size_t)k * out + j];
+            }
+            if (v < 0.0f) {
+                v *= 0.01f;
+            }
+            nxt[j] = v;
+        }
+        float* swap = cur;
+        cur = nxt;
+        nxt = swap;
+        n = out;
+    }
+    int off = 0;
+    for (int h = 0; h < NUM_ATNS; h++) {
+        int A = heads[h];
+        for (int j = 0; j < A; j++) {
+            float v = hb[h][j];
+            for (int k = 0; k < n; k++) {
+                v += cur[k] * hw[h][(size_t)k * A + j];
+            }
+            dst[off + j] = v;
+        }
+        off += A;
+    }
+    free(cur);
+    free(nxt);
+}
+
+static int anchor_dist_id(const char* s) {
+    if (strcmp(s, "kl") == 0) {
+        return ANCHOR_KL;
+    }
+    if (strcmp(s, "reverse_kl") == 0) {
+        return ANCHOR_REVERSE_KL;
+    }
+    if (strcmp(s, "wasserstein") == 0) {
+        return ANCHOR_WASSERSTEIN;
+    }
+    printf("anchor_dist %s\n", s);
+    assert(0 && "anchor_dist");
+    return 0;
+}
+
+// One new observation input. The inserted row is zero, so the old
+// forward is unchanged. mu at that slot is 0 and sig is 1.
+static float* anchor_insert_row(float* W, int rows, int cols, int at) {
+    float* grown = (float*)calloc((size_t)(rows + 1) * (size_t)cols,
+        sizeof(float));
+    assert(grown);
+    assert(at >= 0 && at < rows);
+    memcpy(grown, W, (size_t)at * (size_t)cols * sizeof(float));
+    memcpy(grown + (size_t)(at + 1) * (size_t)cols,
+        W + (size_t)at * (size_t)cols,
+        (size_t)(rows - at) * (size_t)cols * sizeof(float));
+    free(W);
+    return grown;
+}
+
+static float* anchor_insert_stat(float* x, int n, int at, float fill) {
+    float* grown = (float*)malloc((size_t)(n + 1) * sizeof(float));
+    assert(grown);
+    assert(at >= 0 && at < n);
+    memcpy(grown, x, (size_t)at * sizeof(float));
+    grown[at] = fill;
+    memcpy(grown + at + 1, x + at, (size_t)(n - at) * sizeof(float));
+    free(x);
+    return grown;
+}
+
+static void anchor_init(PuffeRL* p, Ini* ini, int* act_sizes,
+        bool is_continuous) {
+    Anchor* a = &p->anchor;
+    const char* dist_s = puf_ini_get_str(ini, "train", "anchor_dist");
+    const char* path = puf_ini_get_str(ini, "train", "anchor");
+    a->dist = anchor_dist_id(dist_s);
+    a->coef = (float)puf_ini_get(ini, "train", "anchor_coef");
+    a->on = 0;
+    // A set path is scored even when anchor_coef is 0.
+    if (path[0] == 0) {
+        return;
+    }
+    assert(!is_continuous && "anchor is discrete only");
+    assert(NUM_ATNS == 2 && "anchor heads are Wa and Ws");
+    size_t stack = 0;
+    cudaDeviceGetLimit(&stack, cudaLimitStackSize);
+    if (stack < 8192) {
+        cudaDeviceSetLimit(cudaLimitStackSize, 8192);
+    }
+    anchor_distance_selfcheck();
+
+    AnchorZip zip;
+    memset(&zip, 0, sizeof(zip));
+    anchor_zip_open(&zip, path);
+
+    float* host_w[ANCHOR_MAX_LAYERS];
+    float* host_b[ANCHOR_MAX_LAYERS];
+    int lin[ANCHOR_MAX_LAYERS];
+    int lout[ANCHOR_MAX_LAYERS];
+    int n_layers = 0;
+    int grew_obs = 0;
+    while (n_layers < ANCHOR_MAX_LAYERS) {
+        char wk[16];
+        char bk[16];
+        snprintf(wk, sizeof(wk), "W%d", n_layers);
+        snprintf(bk, sizeof(bk), "b%d", n_layers);
+        if (anchor_zip_index(&zip, wk) < 0) {
+            break;
+        }
+        int wr = 0;
+        int wc = 0;
+        int br = 0;
+        int bc = 0;
+        host_w[n_layers] = anchor_load_f32(&zip, wk, &wr, &wc);
+        host_b[n_layers] = anchor_load_f32(&zip, bk, &br, &bc);
+        assert(wc > 0 && bc == 0 && br == wc);
+        if (n_layers == 0 && wr + 1 == OBS_SIZE) {
+            int at = EGO_TARGET_SPEED;
+            host_w[n_layers] = anchor_insert_row(host_w[n_layers], wr, wc, at);
+            wr = OBS_SIZE;
+            grew_obs = 1;
+        }
+        if (n_layers == 0) {
+            assert(wr == OBS_SIZE);
+        } else {
+            assert(wr == lout[n_layers - 1]);
+        }
+        lin[n_layers] = wr;
+        lout[n_layers] = wc;
+        n_layers++;
+    }
+    assert(n_layers > 0 && "anchor npz has no hidden layers");
+    if (n_layers == ANCHOR_MAX_LAYERS) {
+        char wk[16];
+        snprintf(wk, sizeof(wk), "W%d", n_layers);
+        assert(anchor_zip_index(&zip, wk) < 0 && "anchor too many layers");
+    }
+
+    int n_accel = anchor_load_i32(&zip, "n_accel");
+    int n_steer = anchor_load_i32(&zip, "n_steer");
+    assert(n_accel == act_sizes[0] && n_steer == act_sizes[1]);
+    int last = lout[n_layers - 1];
+    int ar = 0;
+    int ac = 0;
+    int sr = 0;
+    int sc = 0;
+    int bar = 0;
+    int bac = 0;
+    int bsr = 0;
+    int bsc = 0;
+    float* Wa = anchor_load_f32(&zip, "Wa", &ar, &ac);
+    float* ba = anchor_load_f32(&zip, "ba", &bar, &bac);
+    float* Ws = anchor_load_f32(&zip, "Ws", &sr, &sc);
+    float* bs = anchor_load_f32(&zip, "bs", &bsr, &bsc);
+    assert(ar == last && ac == n_accel && bac == 0 && bar == n_accel);
+    assert(sr == last && sc == n_steer && bsc == 0 && bsr == n_steer);
+    int mr = 0;
+    int mc = 0;
+    int sgr = 0;
+    int sgc = 0;
+    float* mu = anchor_load_f32(&zip, "mu", &mr, &mc);
+    float* sig = anchor_load_f32(&zip, "sig", &sgr, &sgc);
+    if (grew_obs) {
+        int at = EGO_TARGET_SPEED;
+        assert(mr + 1 == OBS_SIZE && sgr + 1 == OBS_SIZE);
+        mu = anchor_insert_stat(mu, mr, at, 0.0f);
+        sig = anchor_insert_stat(sig, sgr, at, 1.0f);
+        mr = OBS_SIZE;
+        sgr = OBS_SIZE;
+        printf("anchor inserted a zero-weight target speed at index %d\n", at);
+    }
+    assert(mr == OBS_SIZE && mc == 0);
+    assert(sgr == OBS_SIZE && sgc == 0);
+
+    int max_w = 0;
+    for (int i = 0; i < n_layers; i++) {
+        if (lout[i] > max_w) {
+            max_w = lout[i];
+        }
+    }
+    int heads[2] = {n_accel, n_steer};
+    int max_head = n_accel > n_steer ? n_accel : n_steer;
+    int a_total = n_accel + n_steer;
+    int max_nt = p->hypers.minibatch_size;
+    assert(max_nt >= 2 && max_w > 0);
+
+    a->n_layers = n_layers;
+    a->in_dim = OBS_SIZE;
+    a->width = max_w;
+    a->heads[0] = n_accel;
+    a->heads[1] = n_steer;
+    a->a_total = a_total;
+    a->max_nt = max_nt;
+
+    cudaStream_t stream = p->train_stream;
+    for (int i = 0; i < n_layers; i++) {
+        anchor_h2d(&a->layer[i].W, host_w[i], lin[i] * lout[i], stream);
+        anchor_h2d(&a->layer[i].b, host_b[i], lout[i], stream);
+        a->layer[i].in = lin[i];
+        a->layer[i].out = lout[i];
+    }
+    anchor_h2d(&a->head_w[0], Wa, last * n_accel, stream);
+    anchor_h2d(&a->head_b[0], ba, n_accel, stream);
+    anchor_h2d(&a->head_w[1], Ws, last * n_steer, stream);
+    anchor_h2d(&a->head_b[1], bs, n_steer, stream);
+    anchor_h2d(&a->mu, mu, OBS_SIZE, stream);
+    anchor_h2d(&a->sig, sig, OBS_SIZE, stream);
+    assert(cudaMalloc(&a->norm,
+        (size_t)max_nt * OBS_SIZE * sizeof(precision_t)) == cudaSuccess);
+    assert(cudaMalloc(&a->hid[0],
+        (size_t)max_nt * max_w * sizeof(precision_t)) == cudaSuccess);
+    assert(cudaMalloc(&a->hid[1],
+        (size_t)max_nt * max_w * sizeof(precision_t)) == cudaSuccess);
+    assert(cudaMalloc(&a->scratch,
+        (size_t)max_nt * max_head * sizeof(precision_t)) == cudaSuccess);
+    assert(cudaMalloc(&a->logits,
+        (size_t)max_nt * a_total * sizeof(precision_t)) == cudaSuccess);
+    int blocks = (max_nt + PPO_THREADS - 1) / PPO_THREADS;
+    assert(cudaMalloc(&a->partials,
+        (size_t)blocks * 2 * sizeof(float)) == cudaSuccess);
+
+    int cap = OBS_SIZE > max_w ? OBS_SIZE : max_w;
+    if (max_head > cap) {
+        cap = max_head;
+    }
+    // obs = mu is an exact 0 after the norm and does not touch W0.
+    // A constant 0.25 does. mu + 0.25*sig is not that constant in bf16:
+    // tiny sigs cancel against mu, so the quarter row uses mu=0, sig=1.
+    float* raw = (float*)malloc((size_t)OBS_SIZE * sizeof(float));
+    float* cpu = (float*)malloc((size_t)a_total * sizeof(float));
+    float* gpu = (float*)malloc((size_t)a_total * sizeof(float));
+    float* zmu = (float*)calloc((size_t)OBS_SIZE, sizeof(float));
+    float* zsig = (float*)malloc((size_t)OBS_SIZE * sizeof(float));
+    assert(raw && cpu && gpu && zmu && zsig);
+    float* hw[2] = {Wa, Ws};
+    float* hb[2] = {ba, bs};
+    for (int j = 0; j < OBS_SIZE; j++) {
+        raw[j] = mu[j];
+    }
+    anchor_cpu_row(cpu, raw, host_w, host_b, lin, lout, n_layers,
+        hw, hb, heads, mu, sig, OBS_SIZE, cap);
+    precision_t* draw = NULL;
+    anchor_h2d(&draw, raw, OBS_SIZE, stream);
+    // Same handle the train graph will capture. First gemm is here, not
+    // inside the capture (cublas lazy init allocates).
+    anchor_open_stream(a);
+    anchor_forward(a, draw, 1, a->stream, a->handle);
+    anchor_d2h(gpu, a->logits, a_total, a->stream);
+    float max0 = anchor_max_abs(gpu, cpu, a_total);
+
+    for (int j = 0; j < OBS_SIZE; j++) {
+        raw[j] = 0.25f;
+        zsig[j] = 1.0f;
+    }
+    anchor_cpu_row(cpu, raw, host_w, host_b, lin, lout, n_layers,
+        hw, hb, heads, zmu, zsig, OBS_SIZE, cap);
+    anchor_h2d_into(a->mu, zmu, OBS_SIZE, stream);
+    anchor_h2d_into(a->sig, zsig, OBS_SIZE, stream);
+    anchor_h2d_into(draw, raw, OBS_SIZE, stream);
+    anchor_forward(a, draw, 1, a->stream, a->handle);
+    anchor_d2h(gpu, a->logits, a_total, a->stream);
+    float max1 = anchor_max_abs(gpu, cpu, a_total);
+    anchor_h2d_into(a->mu, mu, OBS_SIZE, stream);
+    anchor_h2d_into(a->sig, sig, OBS_SIZE, stream);
+    cudaFree(draw);
+
+    // bf16 rounds the stored weights and each layer. The 704x3 anchor
+    // with 257-wide heads differs from this fp32 row by about 0.18 on
+    // the zero input and about 1.2 on the quarter input.
+    float tol0 = USE_BF16 ? 0.5f : 1e-3f;
+    float tol1 = USE_BF16 ? 2.0f : 1e-3f;
+    if (max0 > tol0 || max1 > tol1) {
+        printf("anchor forward max diff zeros %g quarter %g\n", max0, max1);
+        assert(0 && "anchor forward check");
+    }
+    // Train captures this handle at minibatch_size. cublas allocates on
+    // the first call of that shape, which a graph capture is not allowed to do.
+    anchor_forward(a, a->norm, a->max_nt, a->stream, a->handle);
+    assert(cudaStreamSynchronize(a->stream) == cudaSuccess);
+    a->on = 1;
+    printf("anchor %s  %s  coef %g  %d x %d\n",
+        path, dist_s, a->coef, n_layers, max_w);
+
+    for (int i = 0; i < n_layers; i++) {
+        free(host_w[i]);
+        free(host_b[i]);
+    }
+    free(Wa);
+    free(ba);
+    free(Ws);
+    free(bs);
+    free(mu);
+    free(sig);
+    free(raw);
+    free(cpu);
+    free(gpu);
+    free(zmu);
+    free(zsig);
+    free(zip.buf);
+}
+
 PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     Hypers hypers = {
         .horizon = puf_ini_get(ini, "train", "horizon"),
@@ -1820,6 +2838,16 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 
     PuffeRL* pufferl = (PuffeRL*)calloc(1, sizeof(PuffeRL));
     pufferl->hypers = hypers;
+    if (ctx->artifact_owner) {
+        char dir[512];
+        const char* run_id = puf_ini_get_str(ini, "base", "run_id");
+        snprintf(dir, sizeof(dir), "%s/%s",
+            puf_ini_get_str(ini, "base", "log_dir"),
+            puf_ini_get_str(ini, "base", "env_name"));
+        mkdir_p(dir);
+        snprintf(pufferl->adv_path, sizeof(pufferl->adv_path),
+            "%s/%s-advantages.jsonl", dir, run_id);
+    }
     snprintf(pufferl->env_name, sizeof(pufferl->env_name), "%s", PUFFER_ENV_NAME);
 
     cudaSetDevice(hypers.gpu_id);
@@ -1993,6 +3021,12 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemset(pufferl->rng_offset, 0, (num_buffers + 1) * sizeof(long));
     cudaMalloc((void**)&pufferl->act_sizes, num_action_heads * sizeof(int));
     cudaMalloc((void**)&pufferl->losses, NUM_LOSSES * sizeof(float));
+    cudaMalloc((void**)&pufferl->adv_mom, 6 * sizeof(double));
+    cudaMalloc((void**)&pufferl->adv_count, 2 * sizeof(unsigned long long));
+    cudaMalloc((void**)&pufferl->adv_hist, ADV_BINS * sizeof(unsigned int));
+    cudaMemset(pufferl->adv_mom, 0, 6 * sizeof(double));
+    cudaMemset(pufferl->adv_count, 0, 2 * sizeof(unsigned long long));
+    cudaMemset(pufferl->adv_hist, 0, ADV_BINS * sizeof(unsigned int));
 
     muon_init(&pufferl->muon, &primary->params_alloc, hypers.momentum, acts);
 
@@ -2052,6 +3086,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemcpy(pufferl->act_sizes, act_sizes,
         num_action_heads*sizeof(int), cudaMemcpyHostToDevice);
     cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
+    anchor_init(pufferl, ini, act_sizes, is_continuous);
     cudaMemcpy(pufferl->muon.lr, &hypers.lr, sizeof(float), cudaMemcpyHostToDevice);
     cudaMemset(pufferl->muon.mb.data, 0, numel(pufferl->muon.mb.shape) * sizeof(float));
 
@@ -2113,7 +3148,7 @@ static int puf_dashboard_last_cols = 0;
 static int puf_dashboard_frame = 0;
 
 #define PUF_DASH_W 80
-#define PUF_DASH_BASE_ROWS 12
+#define PUF_DASH_BASE_ROWS 13
 #define PUF_DASH_MAX_USER_ROWS 15
 
 // Colors no-op when not a TTY.
@@ -2202,6 +3237,13 @@ static double dash_num(Dict* log, const char* key, double fallback) {
     return it ? it->value : fallback;
 }
 
+// Last finished episode. A log with only env/n leaves these in place,
+// so the score rows stay on the terminal between episode ends.
+#define DASH_ENV_KEEP (2 * PUF_DASH_MAX_USER_ROWS)
+static char dash_env_key[DASH_ENV_KEEP][32];
+static double dash_env_val[DASH_ENV_KEEP];
+static int dash_env_n = 0;
+
 void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
     puf_dashboard_tty = isatty(STDOUT_FILENO);
     int term_rows = 1000, term_cols = PUF_DASH_W;
@@ -2211,6 +3253,21 @@ void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
             if (ws.ws_row > 0) term_rows = ws.ws_row;
             if (ws.ws_col > 0) term_cols = ws.ws_col;
         }
+    }
+
+    int env_n = 0;
+    for (int i = 0; i < log->size && env_n < DASH_ENV_KEEP; i++) {
+        const char* k = log->items[i].key;
+        if (strncmp(k, "env/", 4) != 0 || strcmp(k, "env/n") == 0) {
+            continue;
+        }
+        snprintf(dash_env_key[env_n], sizeof(dash_env_key[env_n]),
+            "%.31s", k + 4);
+        dash_env_val[env_n] = log->items[i].value;
+        env_n++;
+    }
+    if (env_n > 0) {
+        dash_env_n = env_n;
     }
 
     const char* env_name = puf_ini_get_str(ini, "base", "env_name");
@@ -2247,10 +3304,17 @@ void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
     }
     // Tiny terminal: one-line compact summary.
     if (puf_dashboard_tty && (term_cols < PUF_DASH_W || term_rows <= PUF_DASH_BASE_ROWS)) {
+        double score = 0;
+        for (int i = 0; i < dash_env_n; i++) {
+            if (strcmp(dash_env_key[i], "score") == 0) {
+                score = dash_env_val[i];
+                break;
+            }
+        }
         char compact[512];
         snprintf(compact, sizeof(compact),
             "PufferLib 5.0  env=%s  steps=%s  SPS=%s  score=%.3f  epoch=%s  to_go=%s",
-            env_name, steps_s, sps_s, dash_num(log, "env/score", 0), epoch_s, remaining);
+            env_name, steps_s, sps_s, score, epoch_s, remaining);
         printf("%.*s", term_cols > 1 ? term_cols - 1 : term_cols, compact);
         if (term_rows > 1) {
             dash_eol();
@@ -2301,6 +3365,7 @@ void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
         {"Epoch", epoch_s, "Train", NULL, train_time, "old_kl", "loss/old_kl"},
         {"Uptime", uptime, "  Model", "perf/train_model", 0, "kl", "loss/kl"},
         {"To go", remaining, "  Misc", "perf/train_misc", 0, "clipfrac", "loss/clipfrac"},
+        {"", "", "", NULL, 0, "anchor", "loss/anchor"},
     };
     for (int i = 0; i < (int)(sizeof(rows) / sizeof(rows[0])); i++) {
         char bt[64], bp[16], cv[32];
@@ -2335,34 +3400,27 @@ void puf_dashboard_print(Ini* ini, PuffeRL* p, Dict* log, int epoch) {
         if (user_rows > PUF_DASH_MAX_USER_ROWS) user_rows = PUF_DASH_MAX_USER_ROWS;
     }
 
-    char pending_key[128];
-    double pending_val = 0;
-    int pending = 0, n = 0, max_items = 2 * user_rows;
-    for (int i = 0; i < log->size && n < max_items; i++) {
-        const char* key = log->items[i].key;
-        if (strncmp(key, "env/", 4) != 0 || strcmp(key, "env/n") == 0) continue;
-        const char* sk = key + 4;
-        if (!pending) {
-            snprintf(pending_key, sizeof(pending_key), "%s", sk);
-            pending_val = log->items[i].value;
-            pending = 1;
-        } else {
-            char ls[32], rs[32];
-            snprintf(ls, sizeof(ls), "%.3f", pending_val);
-            snprintf(rs, sizeof(rs), "%.3f", log->items[i].value);
-            printf("%s│%s %s%-25.25s%s %s%9.9s%s   %s%-25.25s%s %s%9.9s%s    %s│%s",
-                PUF_W, PUF_R, PUF_A, pending_key, PUF_R, PUF_W, ls, PUF_R,
-                PUF_A, sk, PUF_R, PUF_W, rs, PUF_R, PUF_W, PUF_R);
-            dash_eol();
-            pending = 0;
-        }
-        n++;
+    int shown = dash_env_n;
+    int max_items = 2 * user_rows;
+    if (shown > max_items) {
+        shown = max_items;
     }
-    if (pending) {
+    int pairs = shown / 2;
+    for (int r = 0; r < pairs; r++) {
+        int i = r * 2;
+        char ls[32], rs[32];
+        snprintf(ls, sizeof(ls), "%.3f", dash_env_val[i]);
+        snprintf(rs, sizeof(rs), "%.3f", dash_env_val[i + 1]);
+        printf("%s│%s %s%-25.25s%s %s%9.9s%s   %s%-25.25s%s %s%9.9s%s    %s│%s",
+            PUF_W, PUF_R, PUF_A, dash_env_key[i], PUF_R, PUF_W, ls, PUF_R,
+            PUF_A, dash_env_key[i + 1], PUF_R, PUF_W, rs, PUF_R, PUF_W, PUF_R);
+        dash_eol();
+    }
+    if (shown % 2) {
         char ls[32];
-        snprintf(ls, sizeof(ls), "%.3f", pending_val);
+        snprintf(ls, sizeof(ls), "%.3f", dash_env_val[shown - 1]);
         printf("%s│%s %s%-25.25s%s %s%9.9s%s   %-25.25s %9.9s    %s│%s",
-            PUF_W, PUF_R, PUF_A, pending_key,
+            PUF_W, PUF_R, PUF_A, dash_env_key[shown - 1],
             PUF_R, PUF_W, ls, PUF_R, "", "", PUF_W, PUF_R);
         dash_eol();
     }
@@ -2554,7 +3612,242 @@ typedef struct {
     char key[64];
 } SweepParam;
 
+typedef struct {
+    long stamp;
+    int run;
+    char name[256];
+} SweepHist;
+
 extern char** environ;
+
+static Dict* find_section(Ini* ini, const char* name) {
+    for (int i = 0; i < ini->num_sections; i++) {
+        if (strcmp(ini->sections[i].name, name) == 0) {
+            return &ini->sections[i];
+        }
+    }
+    return NULL;
+}
+
+static int sweep_values_match(DictItem* a, DictItem* b) {
+    double av = 0;
+    double bv = 0;
+    int a_num = a->str && puf_ini_parse_val(a->str, &av);
+    int b_num = b->str && puf_ini_parse_val(b->str, &bv);
+    if (a_num && b_num) {
+        double scale = fabs(av) + fabs(bv) + 1.0;
+        return fabs(av - bv) <= 1e-4 * scale;
+    }
+    if (!a->str || !b->str) {
+        return 0;
+    }
+    return strcmp(a->str, b->str) == 0;
+}
+
+static int sweep_param_index(SweepParam* params, int n_params,
+        const char* section, const char* key) {
+    for (int i = 0; i < n_params; i++) {
+        if (strcmp(params[i].section, section) == 0
+                && strcmp(params[i].key, key) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Same driving task. Swept values are samples, so they are not compared.
+static int sweep_task_matches(Ini* cur, Ini* hist,
+        SweepParam* params, int n_params) {
+    const char* sections[] = {"env", "policy", "train", "vec"};
+    for (int s = 0; s < 4; s++) {
+        Dict* left = find_section(cur, sections[s]);
+        Dict* right = find_section(hist, sections[s]);
+        if (!left || !right) {
+            return 0;
+        }
+        for (int i = 0; i < left->size; i++) {
+            DictItem* item = &left->items[i];
+            if (sweep_param_index(params, n_params, sections[s], item->key) >= 0) {
+                continue;
+            }
+            DictItem* other = dict_find(right, item->key);
+            if (!other || !sweep_values_match(item, other)) {
+                return 0;
+            }
+        }
+    }
+    Dict* left = find_section(cur, "sweep");
+    Dict* right = find_section(hist, "sweep");
+    if (!left || !right) {
+        return 0;
+    }
+    const char* keys[] = {"metric", "goal"};
+    for (int i = 0; i < 2; i++) {
+        DictItem* a = dict_find(left, keys[i]);
+        DictItem* b = dict_find(right, keys[i]);
+        if (!a || !b || !sweep_values_match(a, b)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int parse_sweep_log_name(const char* name, long* stamp, int* run) {
+    if (strncmp(name, "sweep_", 6) != 0) {
+        return 0;
+    }
+    const char* us = strrchr(name, '_');
+    const char* dot = strrchr(name, '.');
+    if (!us || !dot || strcmp(dot, ".ini") != 0 || us <= name + 6) {
+        return 0;
+    }
+    for (const char* p = name + 6; p < us; p++) {
+        if (*p < '0' || *p > '9') {
+            return 0;
+        }
+    }
+    for (const char* p = us + 1; p < dot; p++) {
+        if (*p < '0' || *p > '9') {
+            return 0;
+        }
+    }
+    *stamp = strtol(name + 6, NULL, 10);
+    *run = atoi(us + 1);
+    return 1;
+}
+
+static int sweep_hist_cmp(const void* a, const void* b) {
+    const SweepHist* ha = (const SweepHist*)a;
+    const SweepHist* hb = (const SweepHist*)b;
+    if (ha->stamp < hb->stamp) {
+        return -1;
+    }
+    if (ha->stamp > hb->stamp) {
+        return 1;
+    }
+    return ha->run - hb->run;
+}
+
+static int metric_last(DictItem* item, double* out) {
+    if (item->len > 0) {
+        *out = item->values[item->len - 1];
+        return 1;
+    }
+    if (item->str && puf_ini_parse_val(item->str, out)) {
+        return 1;
+    }
+    return 0;
+}
+
+// Finished sweep_*.ini logs seed Protein so a restart keeps the search.
+// A log counts when the task matches and every swept value is in range.
+// The next run index is past every sweep log already in the directory.
+static int seed_sweep_history(Ini* ini, ProteinSweep* protein,
+        SweepSpace* space, SweepParam* params, int n_params) {
+    char log_dir[2048];
+    snprintf(log_dir, sizeof(log_dir), "%s/%s",
+        puf_ini_get_str(ini, "base", "log_dir"),
+        puf_ini_get_str(ini, "base", "env_name"));
+    DIR* dp = opendir(log_dir);
+    if (!dp) {
+        return 0;
+    }
+    int cap = 0;
+    int n = 0;
+    SweepHist* logs = NULL;
+    struct dirent* ent = NULL;
+    while ((ent = readdir(dp))) {
+        long stamp = 0;
+        int run = 0;
+        if (!parse_sweep_log_name(ent->d_name, &stamp, &run)) {
+            continue;
+        }
+        if (n == cap) {
+            cap = cap ? cap * 2 : 16;
+            logs = (SweepHist*)realloc(logs, cap * sizeof(SweepHist));
+            assert(logs && "sweep history alloc failed");
+        }
+        logs[n].stamp = stamp;
+        logs[n].run = run;
+        snprintf(logs[n].name, sizeof(logs[n].name), "%s", ent->d_name);
+        n++;
+    }
+    closedir(dp);
+    if (n == 0) {
+        free(logs);
+        return 0;
+    }
+    qsort(logs, n, sizeof(SweepHist), sweep_hist_cmp);
+
+    const char* metric = puf_ini_get_str(ini, "sweep", "metric");
+    char metric_key[128];
+    snprintf(metric_key, sizeof(metric_key), "%s%s",
+        strchr(metric, '/') ? "" : "env/", metric);
+    float* sample = (float*)calloc(n_params, sizeof(float));
+    int loaded = 0;
+    int next_run = n;
+    for (int i = 0; i < n; i++) {
+        if (logs[i].run + 1 > next_run) {
+            next_run = logs[i].run + 1;
+        }
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", log_dir, logs[i].name);
+        Ini hist = {0};
+        puf_ini_load_file(&hist, path);
+        if (!sweep_task_matches(ini, &hist, params, n_params)) {
+            puf_ini_free(&hist);
+            continue;
+        }
+        Dict* metrics = find_section(&hist, "metrics");
+        DictItem* score_item = metrics ? dict_find(metrics, metric_key) : NULL;
+        DictItem* cost_item = metrics ? dict_find(metrics, "uptime") : NULL;
+        double score = 0;
+        double cost = 0;
+        if (!score_item || !cost_item
+                || !metric_last(score_item, &score)
+                || !metric_last(cost_item, &cost)
+                || !isfinite(score) || !isfinite(cost)) {
+            puf_ini_free(&hist);
+            continue;
+        }
+        int in_range = 1;
+        for (int p = 0; p < n_params; p++) {
+            Dict* section = find_section(&hist, params[p].section);
+            DictItem* item = section ? dict_find(section, params[p].key) : NULL;
+            double raw = 0;
+            if (!item || !item->str || !puf_ini_parse_val(item->str, &raw)) {
+                in_range = 0;
+                break;
+            }
+            Space* sp = &space->spaces[p];
+            float tol = 1e-4f * (fabsf(sp->min) + fabsf(sp->max) + 1.0f);
+            if (raw < sp->min - tol || raw > sp->max + tol) {
+                in_range = 0;
+                break;
+            }
+            float val = fmaxf(sp->min, fminf(sp->max, (float)raw));
+            float norm = space_normalize(sp, val);
+            if (!isfinite(norm) || norm < -1.0f || norm > 1.0f) {
+                in_range = 0;
+                break;
+            }
+            sample[p] = norm;
+        }
+        if (!in_range) {
+            puf_ini_free(&hist);
+            continue;
+        }
+        protein_sweep_observe(protein, sample, (float)score, (float)cost, 0);
+        loaded++;
+        puf_ini_free(&hist);
+    }
+    printf("sweep history %s loaded=%d kept=%d next_run=%d\n",
+        log_dir, loaded, protein->succ_n, next_run);
+    fflush(stdout);
+    free(sample);
+    free(logs);
+    return next_run;
+}
 
 typedef struct {
     int run;
@@ -2565,9 +3858,19 @@ typedef struct {
     pid_t pid;
     float* sample;
     TrainResult result;
+    char run_id[128];
 } SweepJob;
 
-void run_sweep(Ini* ini, const char* exe_path) {
+void run_sweep(Ini* ini, const char* exe_path, int argc, char** argv) {
+    // The child loads this file before the flattened overrides. Without it,
+    // drive falls back to carla_long.ini and puf_ini_put exits on WOMD keys.
+    const char* config_arg = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strncmp(argv[i], "--config=", 9) == 0) {
+            config_arg = argv[i];
+            break;
+        }
+    }
     // Build SweepSpace + param map from [sweep.<section>.<key>] sections.
     const char* goal = puf_ini_get_str(ini, "sweep", "goal");
     assert((strcmp(goal, "maximize") == 0 || strcmp(goal, "minimize") == 0)
@@ -2645,6 +3948,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
     int use_logit = strcmp(metric_dist, "logit") == 0;
     float max_cost = puf_ini_get(ini, "sweep", "max_suggestion_cost");
     float early_stop_quantile = puf_ini_get(ini, "sweep", "early_stop_quantile");
+    int use_history = puf_ini_get(ini, "sweep", "use_history");
     assert(max_runs >= 1 && "sweep.max_runs must be >= 1");
     assert(downsample >= 1 && downsample <= TRAIN_RESULT_MAX_POINTS
         && "sweep.downsample must be in [1, TRAIN_RESULT_MAX_POINTS]");
@@ -2694,6 +3998,9 @@ void run_sweep(Ini* ini, const char* exe_path) {
     int next_run_id = 0;
     int completed = 0;
     int active = 0;
+    if (use_history) {
+        next_run_id = seed_sweep_history(ini, protein, space, params, n_params);
+    }
     // Free-list: slot i owns GPUs [i*train_gpus, (i+1)*train_gpus). Refill as
     // soon as any trial exits (waitpid -1), so finished GPUs are never idle
     // while more runs remain.
@@ -2742,6 +4049,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
             char run_id[128];
             snprintf(run_id, sizeof(run_id), "sweep_%ld_%04d",
                 (long)(1000.0 * wall_clock()), job.run);
+            snprintf(job.run_id, sizeof(job.run_id), "%s", run_id);
             puf_ini_put(ini, "base.run_id", run_id);
 
             // Spawn train: result pipe + full ini as section.key=value argv.
@@ -2758,10 +4066,13 @@ void run_sweep(Ini* ini, const char* exe_path) {
             for (int s = 0; s < ini->num_sections; s++) {
                 nkeys += ini->sections[s].size;
             }
-            char** argv = (char**)calloc(nkeys + 3, sizeof(char*));
+            char** argv = (char**)calloc(nkeys + 4, sizeof(char*));
             argv[0] = (char*)exe_path;
             argv[1] = (char*)"train";
             int argc = 2;
+            if (config_arg) {
+                argv[argc++] = (char*)config_arg;
+            }
             char full_key[PUF_DICT_MAX_KEY * 2];
             char val[128];
             for (int s = 0; s < ini->num_sections; s++) {
@@ -2791,7 +4102,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
             assert(posix_spawnp(&job.pid, exe_path, &actions, NULL, argv, environ) == 0
                 && "posix_spawn train failed");
             posix_spawn_file_actions_destroy(&actions);
-            for (int a = 2; a < argc; a++) {
+            for (int a = config_arg ? 3 : 2; a < argc; a++) {
                 free(argv[a]);
             }
             free(argv);
@@ -2837,6 +4148,20 @@ void run_sweep(Ini* ini, const char* exe_path) {
         printf("sweep run=%d score=%.4f cost=%.2f steps=%.0f random=%d gp_obs=%d pareto=%d\n",
             job->run, job->result.score, job->result.cost, job->result.steps,
             job->random, job->gp_obs, job->pareto);
+        fflush(stdout);
+        Dict* sweep_dict = find_section(ini, "sweep");
+        DictItem* post = sweep_dict ? dict_find(sweep_dict, "post") : NULL;
+        if (post && post->str && post->str[0]) {
+            char cmd[4096];
+            snprintf(cmd, sizeof(cmd), "%s %s/%s/%s.ini", post->str,
+                puf_ini_get_str(ini, "base", "log_dir"),
+                puf_ini_get_str(ini, "base", "env_name"), job->run_id);
+            int post_rc = system(cmd);
+            if (post_rc != 0) {
+                fprintf(stderr, "sweep post run=%d status=%d\n",
+                    job->run, post_rc);
+            }
+        }
         completed++;
     }
 }
@@ -2848,6 +4173,9 @@ static void sweep_metric_key(Ini* ini, char* buf, size_t n) {
 }
 
 // board!=NULL: merge env/* into train last_log (uptime + util/* stay frozen).
+static const char* eval_record_path;
+static int eval_record_frames;
+
 static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
         int render, long eval_episodes, Dict* board, int epoch) {
     int match = mode == EVAL_MATCH;
@@ -2863,6 +4191,9 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
     while (true) {
         if (render) {
             puf_render(p->vec->envs);
+            if (puf_record_enabled() && puf_record_done()) {
+                return result;
+            }
             if (WindowShouldClose()) {
                 return result;
             }
@@ -2982,6 +4313,11 @@ EvalResult run_eval(Ini* ini, TrainContext* ctx, int mode, int verbose,
         int render) {
     long n = puf_ini_get(ini, "base", "eval_episodes");
     assert((render || n > 0) && "eval requires positive base.eval_episodes");
+    if (eval_record_path && eval_record_path[0]) {
+        int frames = eval_record_frames > 0 ? eval_record_frames : 91;
+        puf_record_request(eval_record_path, frames, 10);
+        render = 1;
+    }
     PuffeRL* p = eval_make(ini, ctx, mode, render);
     EvalResult r = eval_loop(ini, p, mode, verbose, render, n, NULL, 0);
     if (!render) {
@@ -2996,6 +4332,65 @@ EvalResult run_eval(Ini* ini, TrainContext* ctx, int mode, int verbose,
     }
     close_pufferl(p);
     return r;
+}
+
+// entropy, kl, and the other loss/* stats stay off the ini.
+// policy, value, and anchor are kept. importance is not a loss/ key.
+static int puf_log_metric(const char* key) {
+    if (strncmp(key, "loss/", 5) != 0) {
+        return 1;
+    }
+    if (strcmp(key, "loss/policy") == 0) {
+        return 1;
+    }
+    if (strcmp(key, "loss/value") == 0) {
+        return 1;
+    }
+    if (strcmp(key, "loss/anchor") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// Config plus the binned train curve. last_log is included for this write
+// and then removed so the final metrics append records it once.
+// Written before the trainer is closed: a later abort still leaves the curve.
+static void write_run_log(Ini* ini, const char* log_path, PufLogHistory* hist,
+        Dict* last_log, const char* target_key, int points) {
+    assert(hist->size == 0 || dict_find(last_log, target_key));
+    FILE* fp = fopen(log_path, "w");
+    assert(fp && "failed to open log for writing");
+    fprintf(fp, "# PufferLib log v1\n");
+    puf_ini_write(fp, ini);
+    fprintf(fp, "\n[metrics]\n");
+
+    int pushed = 0;
+    if (last_log->size > 0) {
+        puf_log_history_add(hist, last_log);
+        pushed = 1;
+    }
+    if (hist->size > 0) {
+        double* out = (double*)calloc((size_t)points, sizeof(double));
+        Dict* key_src = &hist->items[hist->size - 1];
+        for (int k = 0; k < key_src->size; k++) {
+            const char* key = key_src->items[k].key;
+            if (!puf_log_metric(key)) {
+                continue;
+            }
+            log_history_bin_mean(hist, key, points, out);
+            fprintf(fp, "%s = ", key);
+            for (int i = 0; i < points; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "", out[i]);
+            }
+            fputc('\n', fp);
+        }
+        free(out);
+    }
+    if (pushed) {
+        dict_clear(&hist->items[hist->size - 1]);
+        hist->size--;
+    }
+    fclose(fp);
 }
 
 // CPU player records a split BEV / agent view from this checkpoint.
@@ -3101,6 +4496,12 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    char warm_buf[4096];
+    const char* warm = puf_checkpoint_path_key(ini, "load_model_path",
+        warm_buf, sizeof(warm_buf));
+    if (warm) {
+        pufferl_load_policy(pufferl, 0, warm);
+    }
     int record_every = (int)puf_ini_get(ini, "base", "record_rollout_every");
     int checkpoints_saved = 0;
     Selfplay selfplay = {0};
@@ -3135,6 +4536,15 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     long local_timesteps = total_timesteps / ctx->world_size;
     long train_epochs = local_timesteps / batch_size;
     long checkpoint_interval = puf_ini_get(ini, "base", "checkpoint_interval");
+    // About 64 advantage histograms across the run, at least one rollout apart.
+    pufferl->adv_snap_cap = 65;
+    pufferl->adv_every = (int)((train_epochs + 63) / 64);
+    if (pufferl->adv_every < 1) {
+        pufferl->adv_every = 1;
+    }
+    pufferl->adv_snaps = (AdvSnap*)calloc(
+        pufferl->adv_snap_cap, sizeof(AdvSnap));
+    pufferl->adv_snap_n = 0;
     char target_key[128];
     sweep_metric_key(ini, target_key, sizeof(target_key));
     Dict last_log = {0};
@@ -3242,6 +4652,19 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         }
         cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
 
+        double mom[3];
+        unsigned long long adv_n = 0;
+        double adv_abs = 0;
+        double adv_var = 0;
+        cudaMemcpy(mom, pufferl->adv_mom, sizeof(mom), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&adv_n, pufferl->adv_count, sizeof(adv_n),
+            cudaMemcpyDeviceToHost);
+        cudaMemset(pufferl->adv_mom, 0, sizeof(mom));
+        cudaMemset(pufferl->adv_count, 0, sizeof(adv_n));
+        adv_reduce(mom[0], mom[1], mom[2], adv_n, &adv_abs, &adv_var);
+        dict_set(&new_log, "adv/mean_abs", adv_abs);
+        dict_set(&new_log, "adv/var", adv_var);
+
         log_util(pufferl, &new_log);
 
         float train_total = 0;
@@ -3282,6 +4705,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         }
         dict_clear(&new_log);
     }
+    adv_snap(pufferl);
 
     // TrainResult curve: bin-mean over log_history (same as artifact metrics).
     DictItem* target = dict_find(&last_log, target_key);
@@ -3321,42 +4745,21 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     int bot_ladder = use_selfplay && bot_games > 0 && final_checkpoint[0];
     int pool_eval = !bot_ladder && use_selfplay && max_opp > 0
         && pool_games > 0 && final_checkpoint[0];
-    long eval_episodes = puf_ini_get(ini, "base", "eval_episodes");
-    int eval_epoch = (int)pufferl->epoch;
-    char eval_ckpt[4096] = {0};
     if (final_checkpoint[0]) {
-        snprintf(eval_ckpt, sizeof(eval_ckpt), "%s", final_checkpoint);
+        puf_ini_put(ini, "base.load_model_path", final_checkpoint);
     }
-    // Close every rank before rank-0 eval. Eval on the live DP trainer leaves
-    // child vec workers in BUF_RUNNING/BUF_WAITING while rank 0 waitpid()s
-    // (and previously poisoned rank-0 CUDA graphs if children exited early).
-    close_pufferl(pufferl);
-    if (ctx->artifact_owner && !bot_ladder && !pool_eval && eval_episodes > 0
-            && eval_ckpt[0]) {
-        puf_ini_put(ini, "base.load_model_path", eval_ckpt);
-        TrainContext eval_ctx = {
-            .rank = 0,
-            .world_size = 1,
-            .gpu_id = ctx->gpu_id,
-            .artifact_owner = 1,
-            .nccl_id = NULL,
-        };
-        PuffeRL* ep = eval_make(ini, &eval_ctx, EVAL_SCORE, 0);
-        EvalResult r = eval_loop(ini, ep, EVAL_SCORE, 1, 0, eval_episodes,
-            &last_log, eval_epoch);
-        result.score = result.scores[result.points - 1] = r.score;
-        close_pufferl(ep);
-    }
-
+    // Write the curve before close. A missing map used to abort after the
+    // checkpoint was saved and before this log existed.
     char log_path[4096];
     snprintf(log_path, sizeof(log_path), "%s/%s.ini", log_dir, run_id);
     if (ctx->artifact_owner) {
-        FILE* fp = fopen(log_path, "w");
-        assert(fp && "failed to open log for writing");
-        fprintf(fp, "# PufferLib log v1\n");
-        puf_ini_write(fp, ini);
-        fclose(fp);
+        write_run_log(ini, log_path, &log_history, &last_log, target_key, points);
     }
+    // Close every rank before a bot-ladder eval. Eval on the live DP trainer
+    // leaves child vec workers in BUF_RUNNING/BUF_WAITING while rank 0
+    // waitpid()s (and previously poisoned rank-0 CUDA graphs if children
+    // exited early).
+    close_pufferl(pufferl);
 
     // Final Protein point (points=1): bot ladder > pool match > train curve.
     if (bot_ladder && ctx->artifact_owner) {
@@ -3455,9 +4858,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             Dict* key_src = &log_history.items[log_history.size - 1];
             for (int k = 0; k < key_src->size; k++) {
                 const char* key = key_src->items[k].key;
-                if (strncmp(key, "loss/", 5) == 0) {
-                    continue;
-                }
                 log_history_bin_mean(&log_history, key, metric_points, out);
                 fprintf(fp, "%s = ", key);
                 for (int i = 0; i < metric_points; i++) {
@@ -3466,6 +4866,33 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
                 fputc('\n', fp);
             }
             free(out);
+        }
+        if (pufferl->adv_snap_n > 0) {
+            int nsnap = pufferl->adv_snap_n;
+            fprintf(fp, "\n[advantage]\n");
+            fprintf(fp, "lo = %g\nhi = %g\nbins = %d\n",
+                ADV_LO, ADV_HI, ADV_BINS);
+            fprintf(fp, "step = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "", pufferl->adv_snaps[i].step);
+            }
+            fprintf(fp, "\nmean_abs = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "",
+                    pufferl->adv_snaps[i].mean_abs);
+            }
+            fprintf(fp, "\nvar = ");
+            for (int i = 0; i < nsnap; i++) {
+                fprintf(fp, "%s%.17g", i ? "," : "", pufferl->adv_snaps[i].var);
+            }
+            for (int b = 0; b < ADV_BINS; b++) {
+                fprintf(fp, "\nbin_%d = ", b);
+                for (int i = 0; i < nsnap; i++) {
+                    fprintf(fp, "%s%u", i ? "," : "",
+                        pufferl->adv_snaps[i].bin[b]);
+                }
+            }
+            fputc('\n', fp);
         }
         fclose(fp);
     }
@@ -3528,9 +4955,9 @@ TrainResult launch_train(Ini* ini) {
                 .nccl_id = &nccl_id,
             };
             run_train(ini, &child);
-            // Rank 0 may still be in post-train eval. Stay alive until it
-            // closes the pipe; exiting earlier aborts NCCL and poisons rank 0
-            // CUDA graphs (cudaGraphLaunch fails in pufferl_forward).
+            // Stay alive until rank 0 closes the pipe. Exiting earlier aborts
+            // NCCL and poisons rank 0 CUDA graphs (cudaGraphLaunch fails in
+            // pufferl_forward).
             char b;
             ssize_t n = read(nccl_pipe[0], &b, 1);
             assert(n >= 0);
@@ -3612,6 +5039,14 @@ int main(int argc, char** argv) {
             headless = 1;
             continue;
         }
+        if (strcmp(argv[i], "--record") == 0 && i + 1 < argc) {
+            eval_record_path = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--record-frames") == 0 && i + 1 < argc) {
+            eval_record_frames = atoi(argv[++i]);
+            continue;
+        }
         ini_argv[ini_argc++] = argv[i];
     }
     Ini ini = {0};
@@ -3625,7 +5060,7 @@ int main(int argc, char** argv) {
     if (strcmp(mode, "train") == 0) {
         launch_train(&ini);
     } else if (strcmp(mode, "sweep") == 0) {
-        run_sweep(&ini, argv[0]);
+        run_sweep(&ini, argv[0], ini_argc, ini_argv);
     } else if (strcmp(mode, "eval") == 0) {
         run_eval(&ini, &ctx, EVAL_SCORE, 1, render);
     } else if (strcmp(mode, "match") == 0) {

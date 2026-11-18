@@ -7,6 +7,9 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 const char* __asan_default_options(void) { return "detect_leaks=0"; }
 
@@ -289,12 +292,24 @@ Linear* make_linear(Weights* weights, int batch_size, int input_dim, int output_
 }
 
 void linear(Linear* layer, float* input) {
-    for (int b = 0; b < layer->batch_size; b++) {
-        for (int o = 0; o < layer->output_dim; o++) {
+    int B = layer->batch_size;
+    int Id = layer->input_dim;
+    int O = layer->output_dim;
+    // One car is a small matmul. A fleet of 8 or more covers the fork.
+    int parallel = B >= 8;
+#ifdef _OPENMP
+#pragma omp parallel for if (parallel) schedule(static)
+#endif
+    for (int b = 0; b < B; b++) {
+        const float* in = input + b * Id;
+        float* out = layer->output + b * O;
+        for (int o = 0; o < O; o++) {
+            const float* w = layer->weights + (size_t)o * Id;
             float sum = 0.0f;
-            for (int i = 0; i < layer->input_dim; i++)
-                sum += input[b*layer->input_dim + i] * layer->weights[o*layer->input_dim + i];
-            layer->output[b*layer->output_dim + o] = sum;
+            for (int i = 0; i < Id; i++) {
+                sum += in[i] * w[i];
+            }
+            out[o] = sum;
         }
     }
 }
@@ -483,6 +498,9 @@ void mingru(MinGRU* layer, float* input) {
         float* state_l = layer->state + l * B * H;
         linear(layer->proj[l], x);
         float* combined = layer->proj[l]->output;
+#ifdef _OPENMP
+#pragma omp parallel for if (B >= 8) schedule(static)
+#endif
         for (int b = 0; b < B; b++) {
             float* cb = combined + b * 3 * H;
             float* sb = state_l + b * H;
@@ -534,6 +552,11 @@ void mingru_zero_term(MinGRU* layer, const float* terminals) {
 //   decoder weight ((atn_sum+1) x hidden_dim, last output is value)
 //   decoder logstd (1 x num_actions) IF continuous
 //   mingru weights[0..num_layers-1] (3*hidden_dim x hidden_dim each)
+// Drive replaces the linear encoder. Its parameter order is the tower
+// list in ocean/drive/drive_encoder.cu.
+#ifdef PUFFER_DRIVE
+typedef struct DriveEnc DriveEnc;
+#endif
 typedef struct PufferNet {
     int num_agents;
     float* obs;
@@ -544,7 +567,350 @@ typedef struct PufferNet {
     int is_continuous;
     int num_actions;
     Multidiscrete* multidiscrete;
+#ifdef PUFFER_DRIVE
+    DriveEnc* drive;
+#endif
 } PufferNet;
+
+#ifdef PUFFER_DRIVE
+#include "constants.h"
+
+#define DRIVE_ROAD_CONT (ROAD_FEATURES - 1)
+#define DRIVE_ROAD_CLASSES (DRIVEWAY - ROAD_LANE + 1)
+#define DRIVE_ROAD_IN (DRIVE_ROAD_CONT + DRIVE_ROAD_CLASSES)
+
+#define DRIVE_ATTN_Q 4
+#define DRIVE_ATTN_HEADS 4
+
+struct DriveEnc {
+    int hidden;
+    int batch;
+    float* ego_w1; float* ego_b1; float* ego_g; float* ego_be;
+    float* ego_w2; float* ego_b2;
+    float* part_w1; float* part_b1; float* part_g; float* part_be;
+    float* part_w2; float* part_b2;
+    float* road_w1; float* road_b1; float* road_g; float* road_be;
+    float* road_w2; float* road_b2;
+    float* q_lat; float* wq; float* bq; float* wk; float* bk;
+    float* wv; float* bv; float* wo; float* bo;
+    float* attn_g; float* attn_be; float* fc_w; float* fc_b;
+    float* qproj;
+    float* scratch;
+};
+
+static int drive_align8(int n) {
+    return (n + 7) & ~7;
+}
+
+static int drive_tower_nfloats(int n, int H, int feat) {
+    n = drive_align8(n + H * feat);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H * H);
+    n = drive_align8(n + H);
+    return n;
+}
+
+static int drive_encoder_nfloats(int H) {
+    int n = 0;
+    int Q = DRIVE_ATTN_Q;
+    n = drive_tower_nfloats(n, H, EGO_FEATURES);
+    n = drive_tower_nfloats(n, H, PARTNER_FEATURES);
+    n = drive_tower_nfloats(n, H, DRIVE_ROAD_IN);
+    n = drive_align8(n + Q * H);
+    n = drive_align8(n + H * H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H * H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H * H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H * H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H);
+    n = drive_align8(n + H * Q * H);
+    n = drive_align8(n + H);
+    return n;
+}
+
+static float* drive_take(Weights* w, int n) {
+    return get_weights_aligned(w, n);
+}
+
+static void drive_load_tower(Weights* w, int H, int feat,
+        float** w1, float** b1, float** g, float** be,
+        float** w2, float** b2) {
+    *w1 = drive_take(w, H * feat);
+    *b1 = drive_take(w, H);
+    *g = drive_take(w, H);
+    *be = drive_take(w, H);
+    *w2 = drive_take(w, H * H);
+    *b2 = drive_take(w, H);
+}
+
+static DriveEnc* drive_enc_load(Weights* w, int batch, int H) {
+    DriveEnc* d = calloc(1, sizeof(DriveEnc));
+    d->hidden = H;
+    d->batch = batch;
+    drive_load_tower(w, H, EGO_FEATURES,
+        &d->ego_w1, &d->ego_b1, &d->ego_g, &d->ego_be,
+        &d->ego_w2, &d->ego_b2);
+    drive_load_tower(w, H, PARTNER_FEATURES,
+        &d->part_w1, &d->part_b1, &d->part_g, &d->part_be,
+        &d->part_w2, &d->part_b2);
+    drive_load_tower(w, H, DRIVE_ROAD_IN,
+        &d->road_w1, &d->road_b1, &d->road_g, &d->road_be,
+        &d->road_w2, &d->road_b2);
+    d->q_lat = drive_take(w, DRIVE_ATTN_Q * H);
+    d->wq = drive_take(w, H * H);
+    d->bq = drive_take(w, H);
+    d->wk = drive_take(w, H * H);
+    d->bk = drive_take(w, H);
+    d->wv = drive_take(w, H * H);
+    d->bv = drive_take(w, H);
+    d->wo = drive_take(w, H * H);
+    d->bo = drive_take(w, H);
+    d->attn_g = drive_take(w, H);
+    d->attn_be = drive_take(w, H);
+    d->fc_w = drive_take(w, H * DRIVE_ATTN_Q * H);
+    d->fc_b = drive_take(w, H);
+    d->qproj = calloc((size_t)DRIVE_ATTN_Q * H, sizeof(float));
+    int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
+    int stride = (3 + 2 * S + 2 * DRIVE_ATTN_Q) * H + S;
+    d->scratch = calloc((size_t)batch * (size_t)stride, sizeof(float));
+    return d;
+}
+
+static void drive_token(float* h2, const float* x, int F,
+        const float* w1, const float* b1, const float* g, const float* be,
+        const float* w2, const float* b2, float* h1, float* ln, int H) {
+    for (int o = 0; o < H; o++) {
+        const float* wr = w1 + (size_t)o * F;
+        float sum = b1[o];
+        for (int i = 0; i < F; i++) {
+            sum += x[i] * wr[i];
+        }
+        h1[o] = sum;
+    }
+    float mean = 0.0f;
+    for (int i = 0; i < H; i++) {
+        mean += h1[i];
+    }
+    mean /= (float)H;
+    float var = 0.0f;
+    for (int i = 0; i < H; i++) {
+        float d = h1[i] - mean;
+        var += d * d;
+    }
+    var /= (float)H;
+    float inv = 1.0f / sqrtf(var + 1.0e-5f);
+    for (int i = 0; i < H; i++) {
+        ln[i] = (h1[i] - mean) * inv * g[i] + be[i];
+    }
+    for (int o = 0; o < H; o++) {
+        const float* wr = w2 + (size_t)o * H;
+        float sum = b2[o];
+        for (int i = 0; i < H; i++) {
+            sum += ln[i] * wr[i];
+        }
+        h2[o] = sum;
+    }
+}
+
+static void drive_project(float* y, const float* x, const float* w,
+        const float* b, int K, int N) {
+    for (int n = 0; n < N; n++) {
+        const float* wr = w + (size_t)n * K;
+        float sum = b[n];
+        for (int k = 0; k < K; k++) {
+            sum += x[k] * wr[k];
+        }
+        y[n] = sum;
+    }
+}
+
+static void drive_ln_vec(float* y, const float* x, const float* g,
+        const float* be, int H) {
+    float mean = 0.0f;
+    int i;
+    for (i = 0; i < H; i++) {
+        mean += x[i];
+    }
+    mean /= (float)H;
+    float var = 0.0f;
+    for (i = 0; i < H; i++) {
+        float d = x[i] - mean;
+        var += d * d;
+    }
+    var /= (float)H;
+    float inv = 1.0f / sqrtf(var + 1.0e-5f);
+    for (i = 0; i < H; i++) {
+        y[i] = (x[i] - mean) * inv * g[i] + be[i];
+    }
+}
+
+// One token into K[s], V[s]. Padding is a real key, same as the CUDA path.
+static void drive_kv_token(DriveEnc* d, float* K, float* V, int s,
+        const float* x, int F, const float* w1, const float* b1,
+        const float* g, const float* be, const float* w2, const float* b2,
+        float* h1, float* ln, float* h2) {
+    int H = d->hidden;
+    drive_token(h2, x, F, w1, b1, g, be, w2, b2, h1, ln, H);
+    drive_project(K + (size_t)s * H, h2, d->wk, d->bk, H, H);
+    drive_project(V + (size_t)s * H, h2, d->wv, d->bv, H, H);
+}
+
+static void drive_kv_slots(DriveEnc* d, float* K, float* V, int* s,
+        const float* row, int off, int slots, int raw, int one_hot,
+        const float* w1, const float* b1, const float* g, const float* be,
+        const float* w2, const float* b2, float* h1, float* ln, float* h2) {
+    int n;
+    for (n = 0; n < slots; n++) {
+        const float* rawf = row + off + n * raw;
+        float feat[16];
+        const float* x = rawf;
+        int F = raw;
+        if (one_hot) {
+            int cls;
+            int k;
+            for (k = 0; k < DRIVE_ROAD_CONT; k++) {
+                feat[k] = rawf[k];
+            }
+            cls = (int)rawf[DRIVE_ROAD_CONT];
+            if (cls < 0) {
+                cls = 0;
+            }
+            if (cls >= DRIVE_ROAD_CLASSES) {
+                cls = DRIVE_ROAD_CLASSES - 1;
+            }
+            for (k = 0; k < DRIVE_ROAD_CLASSES; k++) {
+                feat[DRIVE_ROAD_CONT + k] = (k == cls) ? 1.0f : 0.0f;
+            }
+            x = feat;
+            F = DRIVE_ROAD_IN;
+        }
+        drive_kv_token(d, K, V, *s, x, F, w1, b1, g, be, w2, b2, h1, ln, h2);
+        *s += 1;
+    }
+}
+
+// One car. y is the encoder output (H). sc is that car's scratch row.
+// qproj is already filled. Does not touch another car's state.
+static void drive_encode_row(DriveEnc* d, const float* row, float* y, float* sc) {
+    int H = d->hidden;
+    int Q = DRIVE_ATTN_Q;
+    int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
+    int part_off = EGO_FEATURES;
+    int road_off = EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS;
+    int head_dim = H / DRIVE_ATTN_HEADS;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    float* h1 = sc;
+    float* ln = sc + H;
+    float* h2 = sc + 2 * H;
+    float* K = sc + 3 * H;
+    float* V = K + (size_t)S * H;
+    float* ctx = V + (size_t)S * H;
+    float* pre = ctx + (size_t)Q * H;
+    float* scores = pre + (size_t)Q * H;
+    int s = 0;
+    int h;
+    int head;
+    drive_kv_slots(d, K, V, &s, row, 0, 1, EGO_FEATURES, 0,
+        d->ego_w1, d->ego_b1, d->ego_g, d->ego_be,
+        d->ego_w2, d->ego_b2, h1, ln, h2);
+    drive_kv_slots(d, K, V, &s, row, road_off,
+        MAX_ROAD_SEGMENT_OBSERVATIONS, ROAD_FEATURES, 1,
+        d->road_w1, d->road_b1, d->road_g, d->road_be,
+        d->road_w2, d->road_b2, h1, ln, h2);
+    drive_kv_slots(d, K, V, &s, row, part_off, MAX_AGENTS,
+        PARTNER_FEATURES, 0,
+        d->part_w1, d->part_b1, d->part_g, d->part_be,
+        d->part_w2, d->part_b2, h1, ln, h2);
+    for (h = 0; h < Q * H; h++) {
+        ctx[h] = 0.0f;
+    }
+    for (head = 0; head < DRIVE_ATTN_HEADS; head++) {
+        int h0 = head * head_dim;
+        for (int q = 0; q < Q; q++) {
+            float m;
+            float sum = 0.0f;
+            int t;
+            int i;
+            for (t = 0; t < S; t++) {
+                float dot = 0.0f;
+                for (i = 0; i < head_dim; i++) {
+                    dot += d->qproj[q * H + h0 + i] * K[t * H + h0 + i];
+                }
+                scores[t] = dot * scale;
+            }
+            m = scores[0];
+            for (t = 1; t < S; t++) {
+                if (scores[t] > m) {
+                    m = scores[t];
+                }
+            }
+            for (t = 0; t < S; t++) {
+                scores[t] = expf(scores[t] - m);
+                sum += scores[t];
+            }
+            for (t = 0; t < S; t++) {
+                scores[t] /= sum;
+            }
+            for (i = 0; i < head_dim; i++) {
+                float acc = 0.0f;
+                for (t = 0; t < S; t++) {
+                    acc += scores[t] * V[t * H + h0 + i];
+                }
+                ctx[q * H + h0 + i] = acc;
+            }
+        }
+    }
+    for (int q = 0; q < Q; q++) {
+        drive_project(pre + (size_t)q * H, ctx + (size_t)q * H,
+            d->wo, d->bo, H, H);
+        for (h = 0; h < H; h++) {
+            pre[q * H + h] += d->q_lat[q * H + h];
+        }
+        drive_ln_vec(ctx + (size_t)q * H, pre + (size_t)q * H,
+            d->attn_g, d->attn_be, H);
+    }
+    drive_project(y, ctx, d->fc_w, d->fc_b, Q * H, H);
+    for (h = 0; h < H; h++) {
+        y[h] = tanhf(y[h]);
+    }
+}
+
+static void drive_encode(PufferNet* net, float* obs) {
+    DriveEnc* d = net->drive;
+    int B = d->batch;
+    int H = d->hidden;
+    int Q = DRIVE_ATTN_Q;
+    int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
+    int stride = (3 + 2 * S + 2 * Q) * H + S;
+    int q;
+    for (q = 0; q < Q; q++) {
+        drive_project(d->qproj + (size_t)q * H, d->q_lat + (size_t)q * H,
+            d->wq, d->bq, H, H);
+    }
+#ifdef _OPENMP
+#pragma omp parallel for if (B >= 8) schedule(static)
+#endif
+    for (int b = 0; b < B; b++) {
+        drive_encode_row(d, obs + (size_t)b * OBS_SIZE,
+            net->encoder->output + (size_t)b * H,
+            d->scratch + (size_t)b * stride);
+    }
+}
+#endif
+
+static void puf_encode(PufferNet* net, float* obs) {
+#ifdef PUFFER_DRIVE
+    drive_encode(net, obs);
+#else
+    linear(net->encoder, obs);
+#endif
+}
 
 PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
         int hidden_dim, int num_layers, int logit_sizes[], int num_actions) {
@@ -560,7 +926,19 @@ PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
     net->is_continuous = is_continuous;
     net->num_actions = num_actions;
 
+#ifdef PUFFER_DRIVE
+    assert(input_dim == OBS_SIZE);
+    assert(hidden_dim % 8 == 0);
+    net->encoder = calloc(1, sizeof(Linear)
+        + (size_t)num_agents * hidden_dim * sizeof(float));
+    net->encoder->output = (float*)(net->encoder + 1);
+    net->encoder->batch_size = num_agents;
+    net->encoder->input_dim = input_dim;
+    net->encoder->output_dim = hidden_dim;
+    net->drive = drive_enc_load(weights, num_agents, hidden_dim);
+#else
     net->encoder = make_linear(weights, num_agents, input_dim, hidden_dim);
+#endif
     net->decoder = make_linear(weights, num_agents, hidden_dim, atn_sum + 1);
     if (net->is_continuous) {
         net->log_std = get_weights_aligned(weights, num_actions);
@@ -584,7 +962,7 @@ void _gaussian_mean(float* input, float* output, int batch_size, int num_actions
 void forward_puffernet(PufferNet* net, float* observations, float* actions,
         const unsigned char* mask, const float* terminals) {
     mingru_zero_term(net->mingru, terminals);
-    linear(net->encoder, observations);
+    puf_encode(net, observations);
     mingru(net->mingru, net->encoder->output);
     linear(net->decoder, net->mingru->output);
     if (net->is_continuous) {
@@ -594,8 +972,98 @@ void forward_puffernet(PufferNet* net, float* observations, float* actions,
     }
 }
 
+#ifdef PUFFER_DRIVE
+// Critic head for one car. Reads the MinGRU state and does not write it,
+// so the action forward still consumes this observation once.
+static float puffernet_value(PufferNet* net, const float* obs, int agent) {
+    DriveEnc* d = net->drive;
+    MinGRU* g = net->mingru;
+    int H = d->hidden;
+    int Q = DRIVE_ATTN_Q;
+    int S = 1 + MAX_ROAD_SEGMENT_OBSERVATIONS + MAX_AGENTS;
+    int stride = (3 + 2 * S + 2 * Q) * H + S;
+    static float* scratch = NULL;
+    static int scratch_n = 0;
+    static float* hid = NULL;
+    static float* nxt = NULL;
+    static float* combined = NULL;
+    static int hid_n = 0;
+    int q;
+    int l;
+    assert(agent >= 0 && agent < d->batch);
+    assert(H == g->hidden_size);
+    if (scratch_n < stride) {
+        scratch = (float*)realloc(scratch, (size_t)stride * sizeof(float));
+        assert(scratch);
+        scratch_n = stride;
+    }
+    if (hid_n < 3 * H) {
+        hid = (float*)realloc(hid, (size_t)H * sizeof(float));
+        nxt = (float*)realloc(nxt, (size_t)H * sizeof(float));
+        combined = (float*)realloc(combined, (size_t)3 * H * sizeof(float));
+        assert(hid && nxt && combined);
+        hid_n = 3 * H;
+    }
+    for (q = 0; q < Q; q++) {
+        drive_project(d->qproj + (size_t)q * H, d->q_lat + (size_t)q * H,
+            d->wq, d->bq, H, H);
+    }
+    drive_encode_row(d, obs, hid, scratch);
+    for (l = 0; l < g->num_layers; l++) {
+        Linear* proj = g->proj[l];
+        int Id = proj->input_dim;
+        int O = proj->output_dim;
+        const float* sb = g->state + ((size_t)l * g->batch_size + agent) * H;
+        int o;
+        int h;
+        assert(Id == H && O == 3 * H);
+        for (o = 0; o < O; o++) {
+            const float* w = proj->weights + (size_t)o * Id;
+            float sum = 0.0f;
+            int i;
+            for (i = 0; i < Id; i++) {
+                sum += hid[i] * w[i];
+            }
+            combined[o] = sum;
+        }
+        for (h = 0; h < H; h++) {
+            float hidden = combined[h];
+            float gate = combined[H + h];
+            float hw = combined[2 * H + h];
+            float s = sb[h];
+            float gate_s = _sigmoid(gate);
+            float h_tilde = (hidden >= 0.0f) ? hidden + 0.5f : _sigmoid(hidden);
+            float mingru_out = s + gate_s * (h_tilde - s);
+            float hw_s = _sigmoid(hw);
+            nxt[h] = hw_s * mingru_out + (1.0f - hw_s) * hid[h];
+        }
+        memcpy(hid, nxt, (size_t)H * sizeof(float));
+    }
+    {
+        Linear* dec = net->decoder;
+        int Id = dec->input_dim;
+        int row = dec->output_dim - 1;
+        const float* w = dec->weights + (size_t)row * Id;
+        float sum = 0.0f;
+        int i;
+        assert(row >= 0 && Id == H);
+        for (i = 0; i < Id; i++) {
+            sum += hid[i] * w[i];
+        }
+        return sum;
+    }
+}
+#endif
+
 void free_puffernet(PufferNet* net) {
     free(net->obs);
+#ifdef PUFFER_DRIVE
+    if (net->drive) {
+        free(net->drive->scratch);
+        free(net->drive->qproj);
+        free(net->drive);
+    }
+#endif
     free(net->encoder);
     free(net->decoder);
     free_mingru(net->mingru);
@@ -610,6 +1078,16 @@ void free_puffernet(PufferNet* net) {
 #endif
 
 #include ENV_HEADER
+
+#ifdef PUFFER_DRIVE
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+#include "cJSON.c"
+#include "offline.h"
+#pragma clang diagnostic pop
+#include "anchor_interactive.h"
+#include "eval.h"
+#endif
 
 #if !defined(PUF_NMMO3_NET) && !defined(PUF_ASTEROIDS_NET) && !defined(PUF_MINIMAL_NET) && !defined(PUF_CRAFTAX_NET)
 static int puf_align8(int n) {
@@ -627,7 +1105,12 @@ static int puffernet_weight_count(int input_dim, int hidden, int layers,
         }
     }
     int n = 0;
+#ifdef PUFFER_DRIVE
+    assert(input_dim == OBS_SIZE);
+    n = drive_encoder_nfloats(hidden);
+#else
     n = puf_align8(n + hidden * input_dim);
+#endif
     n = puf_align8(n + (atn_sum + 1) * hidden);
     if (continuous) {
         n = puf_align8(n + num_actions);
@@ -640,8 +1123,8 @@ static int puffernet_weight_count(int input_dim, int hidden, int layers,
 
 #ifdef MAX_AGENTS
 // An old checkpoint has 7 ego features and 63 partners (973 inputs).
-// The current net adds one open ego slot and one partner slot.
-// Both inserts are zero, so that policy's actions stay put.
+// Extra ego features and the extra partner slot are zero, so that
+// policy's actions stay put.
 static Weights* puf_widen_partner_ckpt(Weights* weights, int hidden,
         int layers, const int act_sizes[], int num_actions,
         int file_floats) {
@@ -695,9 +1178,62 @@ static Weights* puf_widen_partner_ckpt(Weights* weights, int hidden,
         (size_t)tail * sizeof(float));
     free(weights);
     fprintf(stderr,
-        "loaded checkpoint trained with %d partners and no max-speed "
-        "feature; both new inputs have zero weight\n",
-        legacy_partners);
+        "loaded a %d-input checkpoint; added ego and partner inputs are zero\n",
+        legacy_in);
+    return grown;
+}
+
+// The previous ego block has no target speed. That input is one column
+// at the end of the ego features, and its weight is zero.
+static Weights* puf_widen_target_ckpt(Weights* weights, int hidden,
+        int layers, const int act_sizes[], int num_actions,
+        int file_floats) {
+    int old_ego = EGO_TARGET_SPEED;
+    int old_in = old_ego
+        + PARTNER_FEATURES * MAX_AGENTS
+        + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    if (OBS_SIZE != old_in + 1) {
+        return weights;
+    }
+    int old_need = puffernet_weight_count(old_in, hidden, layers,
+        act_sizes, num_actions);
+    if (file_floats != old_need) {
+        return weights;
+    }
+    int old_enc = puf_align8(hidden * old_in);
+    int new_enc = puf_align8(hidden * OBS_SIZE);
+    int tail = file_floats - old_enc;
+    if (tail < 0) {
+        return weights;
+    }
+    int new_floats = new_enc + tail;
+    int need = puffernet_weight_count(OBS_SIZE, hidden, layers,
+        act_sizes, num_actions);
+    if (new_floats != need) {
+        return weights;
+    }
+
+    Weights* grown = calloc(1, sizeof(Weights)
+        + (size_t)(new_floats + 7) * sizeof(float));
+    if (!grown) {
+        perror("calloc");
+        exit(1);
+    }
+    grown->data = (float*)(grown + 1);
+    grown->size = new_floats + 7;
+    for (int o = 0; o < hidden; o++) {
+        float* src = weights->data + (size_t)o * (size_t)old_in;
+        float* dst = grown->data + (size_t)o * (size_t)OBS_SIZE;
+        memcpy(dst, src, (size_t)old_ego * sizeof(float));
+        memcpy(dst + old_ego + 1, src + old_ego,
+            (size_t)(old_in - old_ego) * sizeof(float));
+    }
+    memcpy(grown->data + new_enc, weights->data + old_enc,
+        (size_t)tail * sizeof(float));
+    free(weights);
+    fprintf(stderr,
+        "loaded a %d-input checkpoint; target-speed input has zero weight\n",
+        old_in);
     return grown;
 }
 #endif
@@ -759,6 +1295,96 @@ static const char* puf_model_path(const char* env_name, const char* cli_path,
 #endif
 }
 
+#ifdef PUFFER_DRIVE
+// Value of the observation the sim panel is about to draw.
+static void drive_note_value(PufferNet* net, Drive* env) {
+    int n = env->active_agent_count;
+    int slot = env->selected_agent_idx;
+    float* obs;
+    if (!net || n <= 0) {
+        env->predicted_ready = 0;
+        return;
+    }
+    if (slot < 0 || slot >= n) {
+        slot = 0;
+    }
+    obs = env->agents[slot].observations;
+    if (!obs) {
+        env->predicted_ready = 0;
+        return;
+    }
+    env->predicted_value = puffernet_value(net, obs, slot);
+    env->predicted_ready = 1;
+}
+
+static obs_t* vis_obs;
+static float* vis_act;
+static float* vis_rew;
+static float* vis_term;
+static unsigned char* vis_mask;
+static int vis_mask_n;
+
+static void vis_rebind(Drive* env) {
+    int n = env->num_agents;
+    int i;
+    for (i = 0; i < n; i++) {
+        env->agents[i].observations = vis_obs + (size_t)i * OBS_SIZE;
+        env->agents[i].actions = vis_act + (size_t)i * NUM_ATNS;
+        env->agents[i].rewards = vis_rew + i;
+        env->agents[i].terminals = vis_term + i;
+        env->agents[i].action_mask = vis_mask + (size_t)i * vis_mask_n;
+        env->agents[i].policy = 0;
+    }
+}
+
+// Logged datasets with more than one map. New scene loads the next file.
+static void vis_next_map(Drive* env) {
+    DictItem* item = dict_find(env->cfg, "num_maps");
+    int nmaps = 1;
+    int id;
+    Client* client;
+    int follow;
+    int paused;
+    float span;
+    if (item && item->value > 1.0) {
+        nmaps = (int)item->value;
+    }
+    if (nmaps < 2) {
+        return;
+    }
+    id = env->map_id + 1;
+    if (id >= nmaps) {
+        id = 0;
+    }
+    dict_set(env->cfg, "map_id", (double)id);
+    client = env->client;
+    follow = env->sim_follow;
+    paused = env->sim_paused;
+    puf_close(env);
+    free(env->map_name);
+    env->map_name = NULL;
+    env->client = client;
+    puf_init(env, env->cfg);
+    env->client = client;
+    env->sim_follow = follow;
+    env->sim_paused = paused;
+    env->sim_scene = vis_next_map;
+    vis_rebind(env);
+    puf_reset(env);
+    sim_frame_camera(env);
+    if (IsWindowReady()) {
+        SetWindowTitle(TextFormat("Pufferflow  map %d", env->map_id));
+    }
+    span = 0.0f;
+    if (env->map_corners) {
+        span = env->map_corners[2] - env->map_corners[0];
+    }
+    printf("map %d  horizon %d  span %.0f m  %s\n",
+        env->map_id, env->episode_length, span, env->map_name);
+    fflush(stdout);
+}
+#endif
+
 int main(int argc, char** argv) {
     const char* env_name = PUFFER_ENV_NAME;
     int argi = 1;
@@ -778,10 +1404,48 @@ int main(int argc, char** argv) {
     const char* record_path = NULL;
     const char* cli_path = NULL;
     int cli_latest = 0;
+    const char* anchor_path = NULL;
+    int do_eval = 0;
+    int saw_data_dir = 0;
+    int saw_map_id = 0;
+    int saw_episode = 0;
 
     char* ini_argv[argc > 0 ? argc : 1];
     int ini_argc = 0;
     for (int i = argi; i < argc; i++) {
+        if (strstr(argv[i], "data_dir") != NULL) {
+            saw_data_dir = 1;
+        }
+        if (strstr(argv[i], "map_id") != NULL) {
+            saw_map_id = 1;
+        }
+        if (strstr(argv[i], "episode_length") != NULL) {
+            saw_episode = 1;
+        }
+        if (strcmp(argv[i], "--anchor") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--anchor needs a checkpoint path\n");
+                return 1;
+            }
+            anchor_path = argv[++i];
+            continue;
+        }
+        if (strncmp(argv[i], "--anchor=", 9) == 0) {
+            anchor_path = argv[i] + 9;
+            continue;
+        }
+        if (strcmp(argv[i], "--eval") == 0) {
+            do_eval = 1;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                cli_path = argv[++i];
+            }
+            continue;
+        }
+        if (strncmp(argv[i], "--eval=", 7) == 0) {
+            do_eval = 1;
+            cli_path = argv[i] + 7;
+            continue;
+        }
         if (strcmp(argv[i], "--headless") == 0) {
             headless = 1;
             continue;
@@ -808,7 +1472,39 @@ int main(int argc, char** argv) {
         }
         ini_argv[ini_argc++] = argv[i];
     }
+#ifndef PUFFER_DRIVE
+    if (anchor_path) {
+        fprintf(stderr, "--anchor is the drive player\n");
+        return 1;
+    }
+    if (do_eval) {
+        fprintf(stderr, "--eval is the drive player\n");
+        return 1;
+    }
+#else
+    // The anchor demo loads the BC anchor and the regularized Town01
+    // policy together. A positional .bin replaces that policy.
+    if (do_eval && anchor_path) {
+        fprintf(stderr, "--eval cannot be combined with --anchor\n");
+        return 1;
+    }
+    if (anchor_path && !cli_path && !cli_latest) {
+        cli_path = "checkpoints/drive/town01_bc1000/0000000578813952.bin";
+    }
+#endif
     puf_ini_load_env(&ini, env_name, ini_argc, ini_argv);
+#ifdef PUFFER_DRIVE
+    if (do_eval) {
+        puf_ini_load_file(&ini, "config/benchmark.ini");
+    }
+#endif
+#ifdef PUFFER_DRIVE
+    EvalPick pick = {0};
+    if (do_eval && !cli_path && !cli_latest) {
+        eval_save_best(&ini, &pick);
+        cli_path = pick.path;
+    }
+#endif
     if (record) {
         char default_path[256];
         snprintf(default_path, sizeof(default_path), "logs/%s.mp4", env_name);
@@ -850,6 +1546,11 @@ int main(int argc, char** argv) {
             act_sizes, num_actions, file_floats);
         file_floats = weights->size - 7;
     }
+    if (weights && file_floats + 7 < need) {
+        weights = puf_widen_target_ckpt(weights, hidden_size, num_layers,
+            act_sizes, num_actions, file_floats);
+        file_floats = weights->size - 7;
+    }
 #endif
 #endif
     // A missing file or the wrong network used to abort, or play action 0
@@ -857,6 +1558,37 @@ int main(int argc, char** argv) {
     int opened = weights != NULL;
     int raw_floats = file_floats;
     int fits = !weights || (need - file_floats <= 7 && file_floats <= need);
+#if !defined(PUF_NMMO3_NET) && !defined(PUF_ASTEROIDS_NET) \
+        && !defined(PUF_MINIMAL_NET) && !defined(PUF_CRAFTAX_NET)
+    // A sweep trial's width and depth are not in config/drive.ini.
+    // One power-of-two width and layer count matches the file.
+    if (do_eval && weights && !fits) {
+        int match_h = 0;
+        int match_l = 0;
+        int hits = 0;
+        for (int h = 64; h <= 512; h *= 2) {
+            for (int layers = 1; layers <= 4; layers++) {
+                int alt = puffernet_weight_count(OBS_SIZE, h, layers,
+                    act_sizes, num_actions);
+                if (file_floats <= alt && alt - file_floats <= 7) {
+                    match_h = h;
+                    match_l = layers;
+                    hits++;
+                }
+            }
+        }
+        if (hits == 1) {
+            hidden_size = match_h;
+            num_layers = match_l;
+            need = puffernet_weight_count(OBS_SIZE, hidden_size,
+                num_layers, act_sizes, num_actions);
+            fits = 1;
+            fprintf(stderr,
+                "eval weights match hidden %d layers %d\n",
+                hidden_size, num_layers);
+        }
+    }
+#endif
     if (weights && !fits) {
         free(weights);
         weights = NULL;
@@ -882,9 +1614,94 @@ int main(int argc, char** argv) {
     frameskip = 1;
 #endif
 
+#ifdef PUFFER_DRIVE
+    if (do_eval) {
+        if (!have_net) {
+            fprintf(stderr, "eval checkpoint did not load (%s)\n",
+                path ? path : "-");
+            return 1;
+        }
+        if (!pick.path[0]) {
+            snprintf(pick.path, sizeof(pick.path), "%s", path);
+        }
+        eval_run(&ini, env_sec, weights, hidden_size, num_layers,
+            act_sizes, num_actions, &pick);
+        free(weights);
+        puf_ini_free(&ini);
+        return 0;
+    }
+    if (anchor_path) {
+        if (!saw_data_dir) {
+            dict_set_str(env_sec, "data_dir", "data/womd");
+        }
+        if (!saw_episode) {
+            dict_set(env_sec, "episode_length", 100000);
+        }
+        if (headless || record) {
+            fprintf(stderr, "--anchor opens a window\n");
+            return 1;
+        }
+        Env env = {0};
+        env.checkpoint_ok = 1;
+        env.checkpoint_error[0] = 0;
+        env.sim_follow = 1;
+        env.sim_lock_actions = 1;
+        env.sim_user_size = 1;
+        int start = 0;
+        if (saw_map_id) {
+            start = ademo_scene_index((int)dict_get(env_sec, "map_id"));
+        }
+        PufferNet* policy = NULL;
+        if (have_net) {
+            policy = make_puffernet(weights, 1, OBS_SIZE,
+                hidden_size, num_layers, act_sizes, num_actions);
+            printf("policy %s  hidden %d  layers %d\n",
+                path, hidden_size, num_layers);
+            fflush(stdout);
+        } else if (path) {
+            if (!opened) {
+                fprintf(stderr, "policy did not load (%s: file not found)\n",
+                    path);
+            } else {
+                fprintf(stderr,
+                    "policy did not load (%s: %d floats, network wants %d)\n",
+                    path, raw_floats, need);
+            }
+        }
+        ademo_open(anchor_path);
+        ademo_link(policy);
+        ademo_boot(&env, env_sec, start);
+        env.hud_extra = ademo_hud;
+        env.ui_hot = ademo_hot;
+        env.sim_reset = ademo_on_reset;
+        env.sim_scene = ademo_on_scene;
+        ademo_run(&env);
+        ademo_close();
+        if (policy) {
+            free_puffernet(policy);
+        }
+        free(weights);
+        ademo_shutdown();
+        puf_close(&env);
+        free(env.map_name);
+        env.map_name = NULL;
+        puf_ini_free(&ini);
+        return 0;
+    }
+#endif
     Env env = {0};
     puf_init(&env, env_sec);
 #ifdef PUF_HAS_SIM_CONTROL
+#ifdef PUFFER_DRIVE
+    if (anchor_path) {
+        env.checkpoint_ok = 1;
+        env.checkpoint_error[0] = 0;
+        env.sim_follow = 1;
+        env.sim_lock_actions = 1;
+        env.sim_user_size = 1;
+    } else
+#endif
+    {
     env.checkpoint_ok = have_net;
     if (!have_net) {
         if (!path) {
@@ -900,6 +1717,7 @@ int main(int argc, char** argv) {
                 path, raw_floats, need);
         }
         sim_checkpoint_rejected(&env);
+    }
     }
 #endif
 
@@ -930,6 +1748,35 @@ int main(int argc, char** argv) {
         env.agents[i].policy = 0;
     }
     puf_reset(&env);
+#ifdef PUFFER_DRIVE
+    if (!anchor_path && env.log_spawn) {
+        DictItem* maps = dict_find(env.cfg, "num_maps");
+        int nmaps = maps ? (int)maps->value : 1;
+        float span = 0.0f;
+        vis_obs = observations;
+        vis_act = actions;
+        vis_rew = rewards;
+        vis_term = terminals;
+        vis_mask = masks;
+        vis_mask_n = act_n;
+        if (env.map_corners) {
+            float span_x = env.map_corners[2] - env.map_corners[0];
+            float span_y = env.map_corners[3] - env.map_corners[1];
+            span = span_x > span_y ? span_x : span_y;
+        }
+        if (span > 700.0f) {
+            env.sim_follow = 1;
+        }
+        if (nmaps > 1) {
+            env.sim_scene = vis_next_map;
+        }
+        printf("map %d  horizon %d  span %.0f m  %s\n",
+            env.map_id, env.episode_length, span, env.map_name);
+        fflush(stdout);
+    }
+#endif
+
+
 
 #ifdef PUF_NMMO3_NET
     MMONet* net = NULL;
@@ -998,6 +1845,9 @@ int main(int argc, char** argv) {
     }
 #endif
     if (!headless && !recording) {
+#ifdef PUFFER_DRIVE
+        drive_note_value(net, &env);
+#endif
         puf_render(&env);
     }
     // Web: Raylib 5.5 WindowShouldClose() always emscripten_sleep(16).
@@ -1092,6 +1942,11 @@ int main(int argc, char** argv) {
             }
         }
         if (!headless || recording) {
+#ifdef PUFFER_DRIVE
+            if (!recording) {
+                drive_note_value(net, &env);
+            }
+#endif
             puf_render(&env);
             if (recording && puf_record_done()) {
                 break;

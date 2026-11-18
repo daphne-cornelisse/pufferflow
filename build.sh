@@ -204,7 +204,7 @@ else
     echo "Error: environment '$ENV' not found" && exit 1
 fi
 
-# src/ocean.cu is the custom-net hook. Drive has none; the flag is still set.
+# src/ocean.cu is the custom-net hook. Drive installs its entity encoder.
 # tr, not ${ENV^^}: macOS /bin/bash is 3.2 and rejects that substitution.
 ENV_UPPER=$(printf '%s' "$ENV" | tr '[:lower:]' '[:upper:]')
 EXTRA_CFLAGS+=(-DPUFFER_${ENV_UPPER})
@@ -279,6 +279,10 @@ if [ "$STANDALONE" = "1" ]; then
     exit 0
 fi
 if [ "$MODE" = "cpu" ]; then
+    # Density eval places 512 cars. The trainer binary keeps 256.
+    if [ "$ENV" = "drive" ]; then
+        EXTRA_CFLAGS+=(-DDRIVE_AGENT_MAX=512)
+    fi
     STANDALONE_SOURCE="src/puffercpu.c"
     STANDALONE_DEFINES=()
     case "$ENV" in
@@ -304,7 +308,7 @@ if [ "$MODE" = "cpu" ]; then
         "${LINK_ARCHIVES[@]}"
         "${EXTRA_LDFLAGS[@]}"
         "${STANDALONE_LDFLAGS[@]}"
-        -lm -lpthread "${OMP_FLAGS[@]}"
+        -lm -lpthread -ldl "${OMP_FLAGS[@]}"
         -DPLATFORM_DESKTOP
         "${STANDALONE_DEFINES[@]}"
         "${EXTRA_CFLAGS[@]}"
@@ -524,7 +528,7 @@ if [ "$MODE" = "native" ]; then
         "${LINK_ARCHIVES[@]}" \
         -L$CUDA_HOME/lib64 $NCCL_LFLAG \
         "${EXTRA_LDFLAGS[@]}" \
-        -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand \
+        -lcudart -lnccl -lnvidia-ml -lcublas -lcublasLt -lcusolver -lcurand \
         -lm -Xlinker=-lpthread $OMP_LIB "${STANDALONE_LDFLAGS[@]}" \
         -o "$TRAIN_BIN"
     echo "Built: ./$TRAIN_BIN"
@@ -547,7 +551,7 @@ elif [ "$MODE" = "profile" ]; then
         tests/profile_kernels.cu \
         "$RAYLIB_A" \
         -L$CUDA_HOME/lib64 \
-        -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand \
+        -lnccl -lnvidia-ml -lcublas -lcublasLt -lcusolver -lcurand \
         -lGL -lm -Xlinker=-lpthread $OMP_LIB \
         -o "$PROFILE_BIN"
     echo "Built: ./$PROFILE_BIN"

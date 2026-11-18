@@ -160,8 +160,9 @@ dmypy.json
 # weights, the 256x4 trial 29 weights (about 1M parameters), the
 # 512x3 trial 37 weights (2,872,320 parameters), the 256x5 run 89
 # weights (1,239,552 parameters), the 256x3 run 229 weights
-# (846,336 parameters), and the Town01 run 173 weights (512x3,
-# 2,872,320 parameters).
+# (846,336 parameters), the Town01 run 173 weights (512x3,
+# 2,872,320 parameters), and the 1000-map Waymo BC anchor
+# (704x3, 257 bins, joint accuracy 0.797).
 checkpoints/*
 !checkpoints/bottleneck.bin
 !checkpoints/bottleneck_1m.bin
@@ -169,6 +170,7 @@ checkpoints/*
 !checkpoints/bottleneck_1p2m.bin
 !checkpoints/bottleneck_2m.bin
 !checkpoints/town01.bin
+!checkpoints/bc_womd_1000.npz
 experiments/
 wandb/
 .neptune/
@@ -187,12 +189,22 @@ ocean/impulse_wars/include/
 ocean/antibody/generated/
 
 # Data. The bottleneck map is tracked so tests can load it.
+# The four mixed CARLA maps are the drive sweep: Town01, Town02,
+# Town06, Town10HD.
 data/*
 !data/bottleneck/
 data/bottleneck/*
 !data/bottleneck/binaries/
 data/bottleneck/binaries/*
 !data/bottleneck/binaries/map_000.bin
+!data/mixed/
+data/mixed/*
+!data/mixed/binaries/
+data/mixed/binaries/*
+!data/mixed/binaries/map_000.bin
+!data/mixed/binaries/map_001.bin
+!data/mixed/binaries/map_002.bin
+!data/mixed/binaries/map_003.bin
 resources/drive/data/*
 resources/drive/binaries/*
 resources/boxoban/levels/
@@ -215,4 +227,5 @@ resources/trailer/shots/*.mp4
 .refactor-snapshots/
 
 vendor/fast-nle/
-analysis/ 
+analysis/
+analysis/offline/

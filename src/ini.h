@@ -57,7 +57,8 @@ static inline void dict_reserve(Dict* dict, int cap) {
 }
 
 static inline DictItem* dict_insert(Dict* dict, const char* key) {
-    if (strlen(key) >= PUF_DICT_MAX_KEY) {
+    size_t n = strlen(key);
+    if (n >= PUF_DICT_MAX_KEY) {
         fprintf(stderr, "dict key too long: %s\n", key);
         exit(1);
     }
@@ -67,7 +68,7 @@ static inline DictItem* dict_insert(Dict* dict, const char* key) {
 
     DictItem* item = &dict->items[dict->size++];
     memset(item, 0, sizeof(*item));
-    snprintf(item->key, sizeof(item->key), "%s", key);
+    memcpy(item->key, key, n + 1);
     return item;
 }
 
@@ -505,9 +506,27 @@ static inline void puf_ini_load_env(Ini* ini, const char* env_name,
         int argc, char** argv) {
     puf_ini_load_file(ini, "config/default.ini");
 
-    if (strcmp(env_name, "default") != 0) {
+    const char* cfg_path = NULL;
+    int kept_n = 0;
+    char* kept[argc > 0 ? (size_t)argc : 1];
+    for (int i = 0; i < argc; i++) {
+        if (strncmp(argv[i], "--config=", 9) == 0) {
+            cfg_path = argv[i] + 9;
+            continue;
+        }
+        kept[kept_n++] = argv[i];
+    }
+    if (cfg_path) {
+        puf_ini_load_file(ini, cfg_path);
+    } else if (strcmp(env_name, "default") != 0) {
         char path[1024];
         snprintf(path, sizeof(path), "config/%s.ini", env_name);
+        FILE* fp = fopen(path, "r");
+        if (!fp && strcmp(env_name, "drive") == 0) {
+            snprintf(path, sizeof(path), "config/carla_long.ini");
+        } else if (fp) {
+            fclose(fp);
+        }
         puf_ini_load_file(ini, path);
     }
 
@@ -523,8 +542,8 @@ static inline void puf_ini_load_env(Ini* ini, const char* env_name,
         }
     }
 #endif
-    for (int i = 0; i < argc; i++) {
-        puf_ini_apply_arg(ini, "base", argv[i], i);
+    for (int i = 0; i < kept_n; i++) {
+        puf_ini_apply_arg(ini, "base", kept[i], i);
     }
 }
 
