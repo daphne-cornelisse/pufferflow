@@ -23,9 +23,9 @@ N_CARS = 5
 CONT = (-50.0, 50.0, 0, -float(np.pi), float(np.pi), 0)
 OUT = drv.ROOT / "analysis" / "offline" / "dynamics_rollouts.png"
 GRID_JSON = drv.ROOT / "analysis" / "offline" / "action_grid.json"
-ROAD_LANE = 4
-ROAD_LINE = 5
-ROAD_EDGE = 6
+ROAD_LANE = 5
+ROAD_LINE = 6
+ROAD_EDGE = 7
 
 
 def _specs():

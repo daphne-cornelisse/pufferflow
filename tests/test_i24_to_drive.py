@@ -27,7 +27,8 @@ def read_log_binary(path):
         return values
 
     nobj, nroads, obj_type, traj = take("iiii")
-    if not (2 <= traj <= CONVERTER.MAX_TRAJECTORY_STATES) or not (1 <= obj_type <= 3) or nroads < 1:
+    agent_types = {1, 2, 3, 4}
+    if not (2 <= traj <= CONVERTER.MAX_TRAJECTORY_STATES) or obj_type not in agent_types or nroads < 1:
         raise AssertionError((nobj, nroads, obj_type, traj))
     objects = []
     for index in range(nobj):
@@ -170,16 +171,32 @@ class I24ConversionTest(unittest.TestCase):
             obj = CONVERTER.normalize_object(raw, self.road_grid)
             self.assertEqual(obj["type"], "vehicle")
             self.assertEqual(obj["source_class"], name)
+        long = self.raw_object(1, 6.0)
+        long["class"] = "semi"
+        long["l"] = 80.0
+        truck = CONVERTER.normalize_object(long, self.road_grid)
+        self.assertEqual(truck["type"], "truck")
+        self.assertGreaterEqual(truck["length_m"], 7.5)
+        long["class"] = "sedan"
+        self.assertEqual(
+            CONVERTER.normalize_object(long, self.road_grid)["type"], "truck"
+        )
+        cycle = self.raw_object(1, 6.0)
+        cycle["class"] = "cyclist"
+        cycle["l"] = 80.0
+        self.assertEqual(
+            CONVERTER.normalize_object(cycle, self.road_grid)["type"], "cyclist"
+        )
         raw = self.raw_object(1, 6.0)
         raw["class"] = "motorcycle"
         with self.assertRaises(ValueError):
             CONVERTER.normalize_object(raw, self.road_grid)
-        self.assertEqual(CONVERTER.drive_road_type(CONVERTER.LANE_FREEWAY), 4)
+        self.assertEqual(CONVERTER.drive_road_type(CONVERTER.LANE_FREEWAY), 5)
         self.assertEqual(
-            CONVERTER.drive_road_type(CONVERTER.ROAD_LINE_BROKEN_SINGLE_WHITE), 5
+            CONVERTER.drive_road_type(CONVERTER.ROAD_LINE_BROKEN_SINGLE_WHITE), 6
         )
-        self.assertEqual(CONVERTER.drive_road_type(CONVERTER.ROAD_EDGE_BOUNDARY), 6)
-        self.assertEqual(CONVERTER.drive_road_type(CONVERTER.ROAD_EDGE_MEDIAN), 6)
+        self.assertEqual(CONVERTER.drive_road_type(CONVERTER.ROAD_EDGE_BOUNDARY), 7)
+        self.assertEqual(CONVERTER.drive_road_type(CONVERTER.ROAD_EDGE_MEDIAN), 7)
 
     def test_normalizes_native_samples_to_10_hz_in_meters(self):
         obj = CONVERTER.normalize_object(self.raw_object(4, 6.0), self.road_grid)
@@ -237,8 +254,8 @@ class I24ConversionTest(unittest.TestCase):
             self.assertEqual(len(objects), 2)
             self.assertEqual(len(objects[0]["x"]), 101)
             self.assertEqual(len(roads), 2)
-            self.assertEqual(roads[0]["type"], 4)
-            self.assertEqual(roads[1]["type"], 6)
+            self.assertEqual(roads[0]["type"], 5)
+            self.assertEqual(roads[1]["type"], 7)
             self.assertAlmostEqual(objects[0]["x"][0], 0.0)
             self.assertEqual(objects[0]["valid"][0], 1)
             self.assertGreater(objects[0]["vx"][10], 0.0)
@@ -324,6 +341,101 @@ class I24ConversionTest(unittest.TestCase):
         self.assertIn(11, {item["id"] for item in cleanup["removed_wrong_way"]})
         self.assertIn(15, {item["id"] for item in cleanup["removed_deep_overlap"]})
         self.assertFalse(cleanup["focal_kept_despite_wrong_way"])
+
+    def test_stationary_track_is_removed_and_not_chosen_as_sdc(self):
+        moving = CONVERTER.normalize_object(self.raw_object(4, 6.0, seconds=4.0), self.road_grid)
+        parked = self.raw_object(7, 18.0, seconds=20.0)
+        parked["x_position"] = [100.0] * len(parked["x_position"])
+        parked = CONVERTER.normalize_object(parked, self.road_grid)
+        jitter = self.raw_object(8, 30.0, seconds=8.0)
+        jitter["x_position"] = [200.0 + (index % 2) * 0.5 for index in range(len(jitter["x_position"]))]
+        jitter = CONVERTER.normalize_object(jitter, self.road_grid)
+        scene = {"scene": 1, "objects": [parked, jitter, moving], "map": self.road_grid}
+        self.assertEqual(CONVERTER.choose_sdc(scene)["id"], 4)
+        scenario = CONVERTER.build_track_scenario(scene, sdc_id=4, max_objects=8)
+        self.assertEqual({obj["id"] for obj in scenario["objects"]}, {4})
+        cleanup = scenario["metadata"]["track_cleanup"]
+        self.assertEqual(
+            {item["id"] for item in cleanup["removed_stationary"]}, {7, 8}
+        )
+        self.assertFalse(cleanup["focal_kept_despite_stationary"])
+        for item in cleanup["removed_stationary"]:
+            self.assertLessEqual(item["travel_m"], CONVERTER.STATIONARY_MAX_METERS)
+        outside = {
+            "id": 2,
+            "start_tick": 100,
+            "position_m": [[0.0, 0.0], [50.0, 0.0]],
+            "velocity_mps": [[0.0, 0.0], [0.0, 0.0]],
+            "heading_rad": [0.0, 0.0],
+        }
+        removed, focal = CONVERTER._stationary_ids([outside], 0, 10, sdc_id=9)
+        self.assertEqual(removed, [])
+        self.assertFalse(focal)
+
+    def test_position_repair_fixes_spikes_and_keeps_a_stop(self):
+        clean = [[float(index), 1.0] for index in range(40)]
+        repaired, report = CONVERTER._repair_track_positions(clean)
+        self.assertEqual(repaired, clean)
+        self.assertEqual(report["smoothed_frames"], 0)
+        self.assertEqual(report["copied_huge_frames"], 0)
+        self.assertIsNone(report["dropped"])
+
+        spiked = [[float(index), 0.0] for index in range(40)]
+        spiked[20] = [20.0, 0.8]
+        repaired, report = CONVERTER._repair_track_positions(spiked)
+        self.assertAlmostEqual(repaired[20][0], 20.0)
+        self.assertAlmostEqual(repaired[20][1], 0.0)
+        self.assertGreaterEqual(report["smoothed_frames"], 1)
+        self.assertEqual(report["copied_huge_frames"], 0)
+        self.assertIsNone(report["dropped"])
+
+        huge = [[float(index), 0.0] for index in range(40)]
+        huge[20] = [20.0, 2.0]
+        repaired, report = CONVERTER._repair_track_positions(huge)
+        self.assertAlmostEqual(repaired[20][0], 20.0)
+        self.assertAlmostEqual(repaired[20][1], 0.0)
+        self.assertGreaterEqual(report["copied_huge_frames"], 1)
+        self.assertIsNone(report["dropped"])
+
+        reversal = [[float(index), 0.0] for index in range(80)]
+        for index, x_pos in zip(range(41, 48), (39.0, 38.0, 37.2, 36.8, 38.5, 42.0, 46.0)):
+            reversal[index][0] = x_pos
+        repaired, report = CONVERTER._repair_track_positions(reversal)
+        self.assertIsNone(report["dropped"])
+        self.assertEqual(len(repaired), len(reversal))
+        for index, point in enumerate(repaired):
+            self.assertAlmostEqual(point[0], float(index), delta=0.05)
+            self.assertAlmostEqual(point[1], 0.0, delta=0.05)
+
+        turned = [[float(index), 0.0] for index in range(40)]
+        x_pos = 39.0
+        for _ in range(40):
+            x_pos -= 1.0
+            turned.append([x_pos, 0.0])
+        repaired, report = CONVERTER._repair_track_positions(turned)
+        if report["dropped"]:
+            self.assertIn(report["dropped"], ("unfixable_reversal", "too_strange"))
+        else:
+            self.assertGreater(
+                report["dropped_prefix_frames"] + report["dropped_suffix_frames"], 10
+            )
+            self.assertLess(len(repaired), len(turned))
+            net = repaired[-1][0] - repaired[0][0]
+            wrong = 0.0
+            for index in range(len(repaired) - 1):
+                step = repaired[index + 1][0] - repaired[index][0]
+                if step * net < 0.0:
+                    wrong += abs(step)
+            self.assertLess(wrong, 1.0)
+
+        stopped = CONVERTER.normalize_object(self.raw_object_with_noisy_stop(), self.road_grid)
+        self.assertIsNone(stopped["position_repair"]["dropped"])
+        self.assertEqual(len(stopped["position_m"]), 61)
+        self.assertAlmostEqual(
+            stopped["position_m"][30][0], 20.0 * CONVERTER.FEET_TO_METERS, delta=0.05
+        )
+        self.assertEqual(stopped["position_repair"]["dropped_prefix_frames"], 0)
+        self.assertEqual(stopped["position_repair"]["smoothed_frames"], 0)
 
     def test_native_length_keeps_a_late_neighbor_in_the_log_binary(self):
         sdc = CONVERTER.normalize_object(

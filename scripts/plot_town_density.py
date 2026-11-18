@@ -58,9 +58,9 @@ CELL_M = 0.25
 GOAL_MIN = 5.0
 GOAL_MAX = 50.0
 EPISODE_LENGTH = 300
-ROAD_LANE = 4
-ROAD_LINE = 5
-ROAD_EDGE = 6
+ROAD_LANE = 5
+ROAD_LINE = 6
+ROAD_EDGE = 7
 # Body-frame corners, same order as ocean/drive/constants.h offsets[].
 CORNERS = np.array([[-1.0, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]])
 

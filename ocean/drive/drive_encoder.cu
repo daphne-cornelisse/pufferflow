@@ -5,8 +5,10 @@
 // Each ego, partner, and road token goes through its own
 // Linear -> LayerNorm -> GELU -> Linear. The GELU is what makes the
 // second linear a layer: without it the two maps are one affine map.
-// The last road feature is a class in 0..6 and becomes a
-// 7-way one-hot; the first 6 features stay continuous.
+// The last road feature is type minus ROAD_LANE, a class in 0..6,
+// and becomes a 7-way one-hot. Lane is 0. A truck is type TRUCK,
+// below ROAD_LANE, and stays a partner token. The first 6 features
+// stay continuous.
 //
 // Those tokens are not pooled. Four learned queries cross-attend to the
 // full sequence ego | road | partner, including zero padding, with no

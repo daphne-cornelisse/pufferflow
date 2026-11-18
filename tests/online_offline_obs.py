@@ -180,7 +180,9 @@ def test_log_shift(lib):
     scenario = drv.create_scenario(lib, DATA, MAP_ID, JSONS[MAP_ID])
     try:
         raw = json.loads(JSONS[MAP_ID].read_text())
-        vehicles = [o for o in raw["objects"] if o.get("type") == "vehicle"]
+        vehicles = [
+            o for o in raw["objects"] if o.get("type") in ("vehicle", "truck")
+        ]
         mx, my = drv.mean_xy(lib, scenario)
         pos = vehicles[0]["position"][0]
         expect_x = np.float32(pos["x"]) - np.float32(mx)

@@ -10,13 +10,14 @@
 #define VEHICLE 1
 #define PEDESTRIAN 2
 #define CYCLIST 3
-#define ROAD_LANE 4
-#define ROAD_LINE 5
-#define ROAD_EDGE 6
-#define STOP_SIGN 7
-#define CROSSWALK 8
-#define SPEED_BUMP 9
-#define DRIVEWAY 10
+#define TRUCK 4
+#define ROAD_LANE 5
+#define ROAD_LINE 6
+#define ROAD_EDGE 7
+#define STOP_SIGN 8
+#define CROSSWALK 9
+#define SPEED_BUMP 10
+#define DRIVEWAY 11
 
 #define INVALID_POSITION -10000.0f
 
@@ -79,8 +80,14 @@
 #define ACT_SIZES {257, 257}
 #define NUM_ATNS 2
 
-// Observation normalization
-#define MAX_SPEED 100.0f
+// Observation normalization. Partner speed divides by MAX_SPEED.
+// Ego speed uses OBS_SPEED_SCALE, which is 1/MAX_SPEED.
+#define MAX_SPEED 80.0f
+// Integrator speed clamp, shared by cars and trucks. 45 m/s is above
+// the I24 99th percentile (39.6 m/s vehicles, 36.8 m/s trucks). A 9 s
+// open-loop rollout matches an uncapped speed at this value. It does
+// not rescale observations.
+#define DYN_SPEED_MAX 45.0f
 #define MAX_VEH_LEN 30.0f
 #define MAX_VEH_WIDTH 15.0f
 #define MAX_VEH_HEIGHT 10.0f
@@ -88,7 +95,7 @@
 #define MAX_ROAD_SEGMENT_LENGTH 100.0f
 
 #define OBS_GOAL_SCALE 0.005f
-#define OBS_SPEED_SCALE 0.01f
+#define OBS_SPEED_SCALE (1.0f / MAX_SPEED)
 #define OBS_POSITION_SCALE 0.02f
 #define OBS_ACCEL_SCALE 0.05f
 #define OBS_YAW_SCALE 0.5f
@@ -109,15 +116,16 @@
 #define SPAWN_SPEED_MAX_MPS (50.0f * 1609.344f / 3600.0f)
 
 // Odd counts, so the center bin is 0. move_dynamics steps this table.
+// Bounds cover the signed 1st and 99th percentiles of the I24 bicycle
+// inverse for vehicles and trucks. See data/i24/assets/i24_action_space.png.
 #define NUM_ACCEL_BINS 257
 #define NUM_STEER_BINS 257
-#define ACCEL_MIN -8.0f
-#define ACCEL_MAX 8.0f
-// Front-wheel angle. tan(δ) = wheelbase / rear-axle radius, and the
-// wheelbase is 0.6 of the body length, so atan(0.6) keeps that radius
-// at least one body length.
-#define STEER_MAX 0.5404195f
-#define STEER_MIN -0.5404195f
+#define ACCEL_MIN -16.0f
+#define ACCEL_MAX 16.0f
+// Front-wheel angle. 0.70 rad matches the delta-local steer envelope.
+// The 99th percentile of I24 steering at 1 m/s and above is inside it.
+#define STEER_MAX 0.70f
+#define STEER_MIN -0.70f
 #define ACCEL_COAST_BIN ((NUM_ACCEL_BINS - 1) / 2)
 #define STEER_COAST_BIN ((NUM_STEER_BINS - 1) / 2)
 

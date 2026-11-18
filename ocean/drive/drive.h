@@ -148,11 +148,11 @@ static void bicycle_integrate(float* x, float* y, float* heading,
     float dth;
     float dx_b;
     float dy_b;
-    if (v > MAX_SPEED) {
-        v = MAX_SPEED;
+    if (v > DYN_SPEED_MAX) {
+        v = DYN_SPEED_MAX;
     }
-    if (v < -MAX_SPEED) {
-        v = -MAX_SPEED;
+    if (v < -DYN_SPEED_MAX) {
+        v = -DYN_SPEED_MAX;
     }
     if (steering > STEER_MAX) {
         steering = STEER_MAX;
@@ -388,7 +388,7 @@ static int drive_control_mode(const char* name) {
 }
 
 static int control_type_ok(int mode, int type) {
-    if (type == VEHICLE) {
+    if (type == VEHICLE || type == TRUCK) {
         return 1;
     }
     if (mode == CONTROL_VEHICLES) {
@@ -455,7 +455,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     assert(fread(head, sizeof(int), 4, file) == 4);
     int log_map = head[3] >= 2 && head[3] <= DRIVE_LOG_MAX
         && head[0] >= 0 && head[0] <= 512
-        && head[1] > 0 && head[2] >= VEHICLE && head[2] <= 3;
+        && head[1] > 0 && head[2] >= VEHICLE && head[2] <= TRUCK;
     if (!log_map) {
         assert(fseek(file, 0, SEEK_SET) == 0);
         assert(fread(&env->num_roads, sizeof(int), 1, file) == 1);
@@ -565,7 +565,8 @@ Entity* load_map_binary(const char* filename, Drive* env) {
         assert(fread(&mark, sizeof(int), 1, file) == 1);
         assert(fread(&road_type, sizeof(int), 1, file) == 1);
         assert(fread(&road_size, sizeof(int), 1, file) == 1);
-        int moving = type == VEHICLE || type == PEDESTRIAN || type == CYCLIST;
+        int moving = type == VEHICLE || type == TRUCK
+            || type == PEDESTRIAN || type == CYCLIST;
         if (moving && valid) {
             assert(nc < 512);
             float dx = gx - x;
@@ -1481,7 +1482,7 @@ void compute_observations(Drive* env) {
         }
         memset(obs, 0, OBS_SIZE * sizeof(float));
         Entity* ego = &env->entities[i];
-        if (ego->type != VEHICLE) {
+        if (ego->type != VEHICLE && ego->type != TRUCK) {
             continue;
         }
         if (ego->x == INVALID_POSITION || ego->y == INVALID_POSITION) {
@@ -1996,12 +1997,13 @@ static void seat_logged(Entity* e, LogSpawn* s, int scored) {
     e->vy = s->vy;
     float length = s->length * COLLISION_BOX_SCALE;
     float width = s->width * COLLISION_BOX_SCALE;
-    if (s->type == VEHICLE && length < 1.0f) {
+    if ((s->type == VEHICLE || s->type == TRUCK) && length < 1.0f) {
         length = CAR_LENGTH * COLLISION_BOX_SCALE;
     }
-    if (s->type == VEHICLE && width < 0.5f) {
+    if ((s->type == VEHICLE || s->type == TRUCK) && width < 0.5f) {
         width = CAR_WIDTH * COLLISION_BOX_SCALE;
     }
+    e->type = s->type;
     e->length = length;
     e->width = width;
     e->valid = 1;

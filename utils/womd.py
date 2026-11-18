@@ -24,6 +24,7 @@ Step 2: Process to map binaries
 """
 
 import json
+import struct
 import sys
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
@@ -33,7 +34,14 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from utils.common import (  # noqa: E402
+    DRIVE_LOG_MAX,
     ROAD_EDGE_MEDIAN,
+    CYCLIST,
+    PEDESTRIAN,
+    TRUCK,
+    TRUCK_MIN_LENGTH_M,
+    VEHICLE,
+    classify_partner,
     write_log_binary,
     write_road_map,
     write_sdc_index,
@@ -116,11 +124,22 @@ def _process_single_map(args):
     try:
         with open(map_path, "r") as f:
             scenario = json.load(f)
-        roads = [prepare_road(road) for road in scenario.get("roads", [])]
+        source_roads = scenario.get("roads") or []
+        roads = [prepare_road(road) for road in source_roads]
         objects = scenario.get("objects") or []
+        changed = False
+        for obj in objects:
+            new_type = classify_partner(obj.get("type", ""), float(obj.get("length", 0.0)))
+            if obj.get("type") != new_type:
+                changed = True
+            obj["type"] = new_type
         if objects:
             scenario["roads"] = roads
             write_log_binary(scenario, binary_path)
+            if changed:
+                scenario["roads"] = source_roads
+                with open(map_path, "w") as f:
+                    json.dump(scenario, f)
             meta = scenario.get("metadata") or {}
             sdc = int(meta.get("sdc_track_index", 0))
             return (i, map_path.name, True, None, sdc)
@@ -128,6 +147,51 @@ def _process_single_map(args):
         return (i, map_path.name, True, None, None)
     except Exception as e:
         return (i, map_path.name, False, str(e), None)
+
+
+def retag_saved_logs(data_dir: Path) -> int:
+    """Set truck on saved JSON and log binaries. Roads stay as they are.
+
+    A vehicle whose length is at least TRUCK_MIN_LENGTH_M becomes truck.
+    Returns the number of objects retagged.
+    """
+    data_dir = Path(data_dir)
+    changed = 0
+    for path in sorted((data_dir / "json").glob("*.json")):
+        scenario = json.loads(path.read_text())
+        touched = False
+        for obj in scenario.get("objects") or []:
+            new_type = classify_partner(obj.get("type", ""), float(obj.get("length", 0.0)))
+            if obj.get("type") != new_type:
+                obj["type"] = new_type
+                touched = True
+                changed += 1
+        if touched:
+            path.write_text(json.dumps(scenario))
+    binary_dir = data_dir / "binaries"
+    for path in sorted(binary_dir.glob("map_*.bin")):
+        data = bytearray(path.read_bytes())
+        if len(data) < 16:
+            continue
+        nobj, nroads, typ, traj = struct.unpack_from("<iiii", data, 0)
+        agent = typ in (VEHICLE, PEDESTRIAN, CYCLIST, TRUCK)
+        if not (2 <= traj <= DRIVE_LOG_MAX and 1 <= nobj <= 512 and nroads > 0 and agent):
+            continue
+        offset = 8
+        patched = False
+        for _ in range(nobj):
+            obj_type, obj_traj = struct.unpack_from("<ii", data, offset)
+            if obj_traj != traj:
+                raise ValueError(f"{path.name} mixed trajectory lengths")
+            width_at = offset + 8 + (7 * traj * 4) + (traj * 4)
+            _width, length = struct.unpack_from("<ff", data, width_at)
+            if obj_type == VEHICLE and length >= TRUCK_MIN_LENGTH_M:
+                struct.pack_into("<i", data, offset, TRUCK)
+                patched = True
+            offset = width_at + 6 * 4 + 4
+        if patched:
+            path.write_bytes(data)
+    return changed
 
 
 def process_all_maps(

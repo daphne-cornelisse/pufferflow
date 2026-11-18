@@ -1220,7 +1220,7 @@ static void draw_goal_markers(Drive* env) {
     rlDisableDepthTest();
     for (int i = 0; i < env->active_agent_count; i++) {
         Entity* e = &env->entities[i];
-        if (e->type != VEHICLE || e->valid == 0) {
+        if ((e->type != VEHICLE && e->type != TRUCK) || e->valid == 0) {
             continue;
         }
         if (e->goal_position_x == INVALID_POSITION
@@ -1317,7 +1317,8 @@ static void draw_world(Drive* env, Client* client) {
 
     for (int i = 0; i < env->num_entities; i++) {
         // Draw vehicles
-        if (i < env->active_agent_count && env->entities[i].type == VEHICLE) {
+        if (i < env->active_agent_count
+                && (env->entities[i].type == VEHICLE || env->entities[i].type == TRUCK)) {
             int agent_index = i;
             if (env->entities[i].x == INVALID_POSITION
                 || env->entities[i].y == INVALID_POSITION) {

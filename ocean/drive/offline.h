@@ -28,6 +28,7 @@ typedef struct OfflineAgent {
     int steer_bin[OFFLINE_TRAJ];
     float width;
     float length;
+    int type;
     float goal_x;
     float goal_y;
     float ret;
@@ -373,7 +374,8 @@ static void offline_parse(Offline* env, const char* json_path) {
     for (int i = 0; i < nobj; i++) {
         cJSON* obj = cJSON_GetArrayItem(objects, i);
         cJSON* type = cJSON_GetObjectItemCaseSensitive(obj, "type");
-        if (type && cJSON_IsString(type) && strcmp(type->valuestring, "vehicle") == 0) {
+        if (type && cJSON_IsString(type) && (strcmp(type->valuestring, "vehicle") == 0
+                || strcmp(type->valuestring, "truck") == 0)) {
             nveh++;
         }
     }
@@ -391,7 +393,9 @@ static void offline_parse(Offline* env, const char* json_path) {
     for (int i = 0; i < nobj; i++) {
         cJSON* obj = cJSON_GetArrayItem(objects, i);
         cJSON* type = cJSON_GetObjectItemCaseSensitive(obj, "type");
-        if (!type || !cJSON_IsString(type) || strcmp(type->valuestring, "vehicle") != 0) {
+        if (!type || !cJSON_IsString(type)
+                || (strcmp(type->valuestring, "vehicle") != 0
+                    && strcmp(type->valuestring, "truck") != 0)) {
             continue;
         }
         int is_sdc = i == sdc_track;
@@ -423,6 +427,7 @@ static void offline_parse(Offline* env, const char* json_path) {
         }
         a->width = (float)offline_jnum(obj, "width");
         a->length = (float)offline_jnum(obj, "length");
+        a->type = strcmp(type->valuestring, "truck") == 0 ? TRUCK : VEHICLE;
         if (a->length < 0.5f) {
             a->length = 4.5f;
         }
@@ -478,7 +483,7 @@ static void offline_parse(Offline* env, const char* json_path) {
 }
 
 static void offline_write_agent(Entity* e, OfflineAgent* a, int frame) {
-    e->type = VEHICLE;
+    e->type = a->type == TRUCK ? TRUCK : VEHICLE;
     e->width = a->width;
     e->length = a->length;
     e->height = CAR_HEIGHT;

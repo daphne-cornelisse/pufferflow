@@ -32,6 +32,8 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+from utils.common import ROAD_LANE
+
 # Matches ocean/drive/constants.h and compute_observations.
 EGO_FEATURES = 9
 PARTNER_FEATURES = 7
@@ -45,10 +47,10 @@ OBS_SIZE = (
 )
 MAX_VEH_LEN = 30.0
 MAX_VEH_WIDTH = 15.0
-MAX_SPEED = 100.0
+MAX_SPEED = 80.0
 MAX_ROAD_SEGMENT_LENGTH = 100.0
 OBS_GOAL_SCALE = 0.005
-OBS_SPEED_SCALE = 0.01
+OBS_SPEED_SCALE = 1.0 / MAX_SPEED
 OBS_POSITION_SCALE = 0.02
 OBS_ACCEL_SCALE = 0.05
 OBS_YAW_SCALE = 0.5
@@ -157,7 +159,7 @@ def draw_bev(ax, agents, offsets, types, xs, ys, ego):
     for r in range(len(types)):
         a = int(offsets[r])
         b = int(offsets[r + 1])
-        kind = int(types[r]) - 4
+        kind = int(types[r]) - ROAD_LANE
         ax.plot(xs[a:b], ys[a:b], color=ROAD_COLOR.get(kind, "#777777"),
             linewidth=1.0, solid_capstyle="round")
     for i, agent in enumerate(agents):
@@ -278,7 +280,7 @@ def pick_scene(data_dir: Path, seed: int):
         frames = clip_frames(states)
         vehicles = []
         for i, obj in enumerate(objects):
-            if obj.get("type") != "vehicle":
+            if obj.get("type") not in ("vehicle", "truck"):
                 continue
             valid = obj.get("valid") or []
             if len(valid) < states:

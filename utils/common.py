@@ -40,17 +40,22 @@ DRIVE_LOG_MAX = 90 * SAMPLE_HZ + 1
 # Export cap. DRIVE_AGENT_MAX is 256. load_map_binary accepts 512.
 MAX_OBJECTS = 256
 
-# ocean/drive/constants.h entity types.
+# ocean/drive/constants.h entity types. Partners are 1..4. Roads follow,
+# so a type below ROAD_LANE is a body and a truck is not a lane.
 VEHICLE = 1
 PEDESTRIAN = 2
 CYCLIST = 3
-ROAD_LANE = 4
-ROAD_LINE = 5
-ROAD_EDGE = 6
-STOP_SIGN_CLASS = 7
-CROSSWALK_CLASS = 8
-SPEED_BUMP_CLASS = 9
-DRIVEWAY_CLASS = 10
+TRUCK = 4
+# Exported length. A vehicle-like body at least this long is a truck,
+# including a tractor-trailer. Pedestrians and cyclists stay themselves.
+TRUCK_MIN_LENGTH_M = 7.5
+ROAD_LANE = 5
+ROAD_LINE = 6
+ROAD_EDGE = 7
+STOP_SIGN_CLASS = 8
+CROSSWALK_CLASS = 9
+SPEED_BUMP_CLASS = 10
+DRIVEWAY_CLASS = 11
 
 # Source roadgraph ids, stored as roads[].map_element_id before
 # drive_road_type. The numbers follow the Waymo Open Motion catalog:
@@ -80,6 +85,20 @@ OBJECT_TYPES = {
     VEHICLE: "vehicle",
     PEDESTRIAN: "pedestrian",
     CYCLIST: "cyclist",
+    TRUCK: "truck",
+}
+# Source labels that become vehicle or truck, chosen by length.
+VEHICLE_LABELS = {
+    "",
+    "vehicle",
+    "sedan",
+    "midsize",
+    "pickup",
+    "van",
+    "cs",
+    "truck",
+    "semi",
+    "trailer",
 }
 # roads[].type strings in the scenario JSON.
 ROAD_TYPES = (
@@ -112,6 +131,23 @@ def drive_road_type(map_element_id: int) -> int:
     return map_element_id
 
 
+def classify_partner(source_type: str, length_m: float) -> str:
+    """Partner class shared by Waymo and I24.
+
+    Pedestrians and cyclists stay those classes. Any other vehicle-like
+    body of TRUCK_MIN_LENGTH_M or longer is a truck. A shorter one is a
+    vehicle. Object 0 may be either a vehicle or a truck.
+    """
+    name = str(source_type or "").strip().lower()
+    if name in (OBJECT_TYPES[PEDESTRIAN], OBJECT_TYPES[CYCLIST]):
+        return name
+    if name not in VEHICLE_LABELS:
+        raise ValueError(f"Unknown partner class {source_type!r}")
+    if float(length_m) >= TRUCK_MIN_LENGTH_M:
+        return OBJECT_TYPES[TRUCK]
+    return OBJECT_TYPES[VEHICLE]
+
+
 def object_type_code(type_name: str) -> int:
     """Object name to the integer stored in a PufferDrive log."""
     for code, name in OBJECT_TYPES.items():
@@ -138,8 +174,11 @@ def validate_scenario(scenario: dict[str, Any], max_objects: int = MAX_OBJECTS) 
     for object_index, obj in enumerate(scenario["objects"]):
         if obj.get("type") not in OBJECT_TYPES.values():
             raise ValueError(f"Object {object_index} is not a PufferDrive object type")
-        if object_index == 0 and obj.get("type") != OBJECT_TYPES[VEHICLE]:
-            raise ValueError("The self-driving car must be a vehicle")
+        if object_index == 0 and obj.get("type") not in (
+            OBJECT_TYPES[VEHICLE],
+            OBJECT_TYPES[TRUCK],
+        ):
+            raise ValueError("The self-driving car must be a vehicle or a truck")
         for field in ("position", "velocity", "heading", "valid"):
             if len(obj.get(field, [])) != expected_states:
                 raise ValueError(

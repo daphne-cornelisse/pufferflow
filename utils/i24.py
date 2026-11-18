@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import statistics
 import sys
 from collections import Counter
 from pathlib import Path
@@ -36,17 +37,14 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from utils.common import (  # noqa: E402
-    CYCLIST,
     DRIVE_LOG_MAX,
     LANE_FREEWAY,
     MAX_OBJECTS,
-    OBJECT_TYPES,
-    PEDESTRIAN,
     ROAD_EDGE_BOUNDARY,
     ROAD_EDGE_MEDIAN,
     ROAD_LINE_BROKEN_SINGLE_WHITE,
     SAMPLE_HZ,
-    VEHICLE,
+    classify_partner,
     drive_road_type,
     validate_scenario,
     write_log_binary,
@@ -81,13 +79,35 @@ WRONG_WAY_MIN_METERS = 10.0
 # many timesteps, drops the smaller track. Pairs are collected first.
 DEEP_OVERLAP_FRACTION = 0.5
 DEEP_OVERLAP_MIN_STEPS = 5
+# A log that never leaves a 1 m box is not a moving vehicle. The next
+# smallest track in the raw scenes travels 6 m, so this does not drop
+# a car that only appears for a short moving glimpse.
+STATIONARY_MAX_METERS = 1.0
+# A 10 Hz step this far from the surrounding motion is a bad sample.
+# 0.25 m in one frame is 2.5 m/s, above the accel these logs actually
+# show. 1.25 m is a single-frame jump large enough to copy the
+# previous point before the chord replacement.
+SPIKE_STEP_M = 0.25
+HUGE_SPIKE_STEP_M = 1.25
+SPIKE_MEDIAN_RADIUS = 25
+SPIKE_MERGE_GAP = 5
+SPIKE_MAX_BURST = 30
+# The far end of a burst has to land near the median continuation.
+# 4 m keeps a 2 s stop (about 6 m of missed travel) and still covers a
+# there-and-back of a few meters. A longer excursion is not invented.
+SPIKE_CLOSE_M = 4.0
+REVERSAL_STEP_M = 0.05
+REVERSAL_MIN_M = 0.5
+STRANGE_STEP_M = 2.0
+MIN_REMAINING_STATES = 2 * SAMPLE_HZ + 1
+REPAIR_PASSES = 2
 MAJOR_QUALITY_FLAGS = {
     "speed_above_60_mps",
     "more_than_200m_outside_calibrated_x_range",
     "outside_calibrated_y_range",
 }
 
-# I24-3D body styles. PufferDrive stores every one of these as a vehicle.
+# I24-3D body styles. Length then picks vehicle or truck, same as Waymo.
 # Scene 3 labels one car-sized track (14.8 x 6.0 ft) as "cs".
 I24_VEHICLE_CLASSES = {
     "sedan",
@@ -100,13 +120,11 @@ I24_VEHICLE_CLASSES = {
 }
 
 
-def drive_object_type(source_class: str) -> str:
-    """Map an I24 label onto a PufferDrive object category."""
+def drive_object_type(source_class: str, length_m: float) -> str:
+    """Map an I24 label and exported length onto a partner class."""
     name = source_class.strip().lower()
-    if name in I24_VEHICLE_CLASSES or name in ("", "vehicle"):
-        return OBJECT_TYPES[VEHICLE]
-    if name in (OBJECT_TYPES[PEDESTRIAN], OBJECT_TYPES[CYCLIST]):
-        return name
+    if name in I24_VEHICLE_CLASSES or name in ("", "vehicle", "pedestrian", "cyclist"):
+        return classify_partner(name, length_m)
     raise ValueError(f"I24 class {source_class!r} is not a PufferDrive object type")
 
 
@@ -306,10 +324,402 @@ def _heading_estimation_metadata(stabilize_headings: bool) -> dict[str, Any]:
     }
 
 
+def _empty_position_repair() -> dict[str, Any]:
+    return {
+        "smoothed_frames": 0,
+        "copied_huge_frames": 0,
+        "dropped_prefix_frames": 0,
+        "dropped_suffix_frames": 0,
+        "interpolated_bursts": 0,
+        "reversal_frames": 0,
+        "reversal": "none",
+        "dropped": None,
+    }
+
+
+def _marked_runs(marks: list[bool], merge_gap: int) -> list[tuple[int, int]]:
+    """Inclusive runs of marked steps. A gap of `merge_gap` steps is one run."""
+    runs: list[tuple[int, int]] = []
+    index = 0
+    count = len(marks)
+    while index < count:
+        if not marks[index]:
+            index += 1
+            continue
+        end = index
+        while True:
+            cursor = end
+            while cursor < count and marks[cursor]:
+                cursor += 1
+            gap = cursor
+            while gap < count and not marks[gap] and gap - cursor <= merge_gap:
+                gap += 1
+            if gap < count and marks[gap] and gap > cursor:
+                end = gap
+                continue
+            end = cursor - 1
+            break
+        runs.append((index, end))
+        index = end + 1
+    return runs
+
+
+def _step_vectors(positions: list[list[float]]) -> list[tuple[float, float]]:
+    return [
+        (positions[index + 1][0] - positions[index][0], positions[index + 1][1] - positions[index][1])
+        for index in range(len(positions) - 1)
+    ]
+
+
+def _local_step_medians(
+    steps: list[tuple[float, float]],
+) -> list[Optional[tuple[float, float]]]:
+    """Median of the other steps in a ±2.5 s window. None when fewer than 5 exist."""
+    medians: list[Optional[tuple[float, float]]] = []
+    for index in range(len(steps)):
+        begin = max(0, index - SPIKE_MEDIAN_RADIUS)
+        end = min(len(steps), index + SPIKE_MEDIAN_RADIUS + 1)
+        sample = [steps[other] for other in range(begin, end) if other != index]
+        if len(sample) < 5:
+            medians.append(None)
+            continue
+        medians.append((
+            statistics.median(step[0] for step in sample),
+            statistics.median(step[1] for step in sample),
+        ))
+    return medians
+
+
+def _chord_pass(positions: list[list[float]]) -> tuple[list[list[float]], int, int, int]:
+    """Put an interior sample back on the chord of its original neighbors.
+
+    A huge miss is copied from the previous sample first. The chord
+    replacement overwrites that copy, so the following step is not a
+    zero-length catch-up. A huge last sample has no following anchor:
+    it is replaced by the previous sample and the duplicate is dropped.
+    """
+    count = len(positions)
+    copied = 0
+    smoothed = 0
+    dropped_suffix = 0
+    usable = positions
+    if count >= 3:
+        previous = (
+            positions[-2][0] - positions[-3][0],
+            positions[-2][1] - positions[-3][1],
+        )
+        last = (
+            positions[-1][0] - positions[-2][0],
+            positions[-1][1] - positions[-2][1],
+        )
+        if math.hypot(last[0] - previous[0], last[1] - previous[1]) >= HUGE_SPIKE_STEP_M:
+            usable = positions[:-1]
+            copied += 1
+            dropped_suffix = 1
+    repaired = [point[:] for point in usable]
+    for index in range(1, len(usable) - 1):
+        mid_x = 0.5 * (usable[index - 1][0] + usable[index + 1][0])
+        mid_y = 0.5 * (usable[index - 1][1] + usable[index + 1][1])
+        deviation = math.hypot(usable[index][0] - mid_x, usable[index][1] - mid_y)
+        if deviation >= HUGE_SPIKE_STEP_M:
+            repaired[index] = usable[index - 1][:]
+            copied += 1
+            repaired[index] = [mid_x, mid_y]
+            smoothed += 1
+        elif deviation >= SPIKE_STEP_M:
+            repaired[index] = [mid_x, mid_y]
+            smoothed += 1
+    return repaired, copied, smoothed, dropped_suffix
+
+
+def _burst_pass(
+    positions: list[list[float]],
+) -> tuple[list[list[float]], int, int, int]:
+    """Interpolate a short run that returns to the surrounding motion.
+
+    The right anchor is two samples past the run, so a one-step run
+    still has an interior sample to move. Prefix runs are dropped.
+    Suffix runs are cut. A run that does not close, or is longer than
+    3 s, is left for the reversal pass.
+    """
+    count = len(positions)
+    steps = _step_vectors(positions)
+    medians = _local_step_medians(steps)
+    marks = [
+        median is not None
+        and math.hypot(step[0] - median[0], step[1] - median[1]) >= SPIKE_STEP_M
+        for step, median in zip(steps, medians)
+    ]
+    repaired = [point[:] for point in positions]
+    drop_prefix = 0
+    drop_suffix: Optional[int] = None
+    interpolated = 0
+    for start, end in _marked_runs(marks, SPIKE_MERGE_GAP):
+        if end - start + 1 > SPIKE_MAX_BURST:
+            continue
+        if start == 0:
+            drop_prefix = max(drop_prefix, end + 1)
+            continue
+        if end >= count - 2:
+            drop_suffix = start if drop_suffix is None else min(drop_suffix, start)
+            continue
+        right = end + 2
+        if right >= count or medians[start] is None:
+            continue
+        median = medians[start]
+        intervals = right - start
+        predicted_x = positions[start][0] + median[0] * intervals
+        predicted_y = positions[start][1] + median[1] * intervals
+        closure = math.hypot(
+            predicted_x - positions[right][0], predicted_y - positions[right][1]
+        )
+        if closure > SPIKE_CLOSE_M:
+            continue
+        origin_x, origin_y = positions[start]
+        dest_x, dest_y = positions[right]
+        for step in range(1, intervals):
+            weight = step / intervals
+            repaired[start + step] = [
+                origin_x + (dest_x - origin_x) * weight,
+                origin_y + (dest_y - origin_y) * weight,
+            ]
+        interpolated += 1
+    if drop_prefix:
+        repaired = repaired[drop_prefix:]
+    dropped_suffix = 0
+    if drop_suffix is not None:
+        cut = max(0, drop_suffix - drop_prefix)
+        dropped_suffix = max(0, len(repaired) - (cut + 1))
+        repaired = repaired[: cut + 1]
+    return repaired, drop_prefix, dropped_suffix, interpolated
+
+
+def _interpolate_span(
+    positions: list[list[float]], start_point: int, end_point: int
+) -> int:
+    """Replace samples strictly between two kept anchors. Returns the count."""
+    span = end_point - start_point
+    if span <= 1:
+        return 0
+    origin_x, origin_y = positions[start_point]
+    dest_x, dest_y = positions[end_point]
+    for step in range(1, span):
+        weight = step / span
+        positions[start_point + step] = [
+            origin_x + (dest_x - origin_x) * weight,
+            origin_y + (dest_y - origin_y) * weight,
+        ]
+    return span - 1
+
+
+def _reversal_pass(
+    positions: list[list[float]], repair: dict[str, Any]
+) -> list[list[float]]:
+    """Straighten a midway reversal, or cut a track that does not return.
+
+    The freeway direction is the sign of the median Δx. A run moving
+    against it by 0.5–10 m, and then resuming, is drawn between the
+    last forward sample and the first sample back on that motion,
+    including the snap-back when those steps are still off the median.
+    A reversal above 10 m at either end is cut. A mid-track reversal
+    above 10 m where both directions travel more than 10 m, and the
+    path does not return, removes the track.
+    """
+    steps = _step_vectors(positions)
+    if len(steps) < 5:
+        return positions
+    median_dx = statistics.median(step[0] for step in steps)
+    median_dy = statistics.median(step[1] for step in steps)
+    if abs(median_dx) < REVERSAL_STEP_M:
+        east = sum(max(step[0], 0.0) for step in steps)
+        west = sum(max(-step[0], 0.0) for step in steps)
+        if east > WRONG_WAY_MIN_METERS and west > WRONG_WAY_MIN_METERS:
+            repair["dropped"] = "unfixable_reversal"
+            repair["reversal"] = "dropped"
+        return [] if repair["dropped"] else positions
+
+    sign = 1.0 if median_dx > 0.0 else -1.0
+    opposing_marks = [step[0] * sign < -REVERSAL_STEP_M for step in steps]
+    repaired = [point[:] for point in positions]
+    drop_prefix = 0
+    drop_suffix: Optional[int] = None
+    interpolated = False
+    cut = False
+    consumed_until = -1
+
+    for start, end in _marked_runs(opposing_marks, merge_gap=0):
+        if start <= consumed_until:
+            continue
+        opposing = sum(-steps[index][0] * sign for index in range(start, end + 1))
+        if opposing <= REVERSAL_MIN_M:
+            continue
+        expanded = end
+        while expanded + 1 < len(steps) and expanded + 1 - start < SPIKE_MAX_BURST:
+            nxt = steps[expanded + 1]
+            deviation = math.hypot(nxt[0] - median_dx, nxt[1] - median_dy)
+            if deviation < SPIKE_STEP_M:
+                break
+            expanded += 1
+        right = expanded + 1
+        intervals = right - start
+        closure = math.hypot(
+            positions[start][0] + median_dx * intervals - positions[right][0],
+            positions[start][1] + median_dy * intervals - positions[right][1],
+        )
+        span = expanded - start + 1
+        returns = closure <= SPIKE_CLOSE_M and span <= SPIKE_MAX_BURST
+        has_both_ends = start > 0 and expanded < len(steps) - 1
+        if has_both_ends and (returns or opposing <= WRONG_WAY_MIN_METERS):
+            repair["reversal_frames"] += _interpolate_span(repaired, start, right)
+            interpolated = True
+            consumed_until = expanded
+            continue
+        if has_both_ends and opposing > WRONG_WAY_MIN_METERS:
+            forward = sum(step[0] * sign for step in steps if step[0] * sign > 0.0)
+            if forward > WRONG_WAY_MIN_METERS:
+                repair["dropped"] = "unfixable_reversal"
+                repair["reversal"] = "dropped"
+                return []
+            continue
+        if opposing > WRONG_WAY_MIN_METERS and start == 0:
+            drop_prefix = max(drop_prefix, expanded + 1)
+            cut = True
+        elif opposing > WRONG_WAY_MIN_METERS and expanded >= len(steps) - 1:
+            drop_suffix = start if drop_suffix is None else min(drop_suffix, start)
+            cut = True
+
+    if repair["dropped"]:
+        return []
+    if drop_prefix:
+        repaired = repaired[drop_prefix:]
+        repair["dropped_prefix_frames"] += drop_prefix
+    if drop_suffix is not None:
+        cut_index = max(0, drop_suffix - drop_prefix)
+        repair["dropped_suffix_frames"] += max(0, len(repaired) - (cut_index + 1))
+        repaired = repaired[: cut_index + 1]
+    if (drop_prefix or drop_suffix is not None) and len(repaired) < MIN_REMAINING_STATES:
+        repair["dropped"] = "unfixable_reversal"
+        repair["reversal"] = "dropped"
+        return []
+    if cut:
+        repair["reversal"] = "cut"
+    elif interpolated:
+        repair["reversal"] = "interpolated"
+    return repaired
+
+
+def _strange_backstop(
+    positions: list[list[float]], repair: dict[str, Any]
+) -> list[list[float]]:
+    """Drop or trim a track that still has a multi-meter step glitch."""
+    steps = _step_vectors(positions)
+    medians = _local_step_medians(steps)
+    marks = [
+        median is not None
+        and math.hypot(step[0] - median[0], step[1] - median[1]) >= STRANGE_STEP_M
+        for step, median in zip(steps, medians)
+    ]
+    drop_prefix = 0
+    drop_suffix: Optional[int] = None
+    for start, end in _marked_runs(marks, SPIKE_MERGE_GAP):
+        if start > 0 and end < len(steps) - 1:
+            repair["dropped"] = "too_strange"
+            repair["reversal"] = "dropped"
+            return []
+        if start == 0:
+            drop_prefix = max(drop_prefix, end + 1)
+        if end >= len(steps) - 1:
+            drop_suffix = start if drop_suffix is None else min(drop_suffix, start)
+    repaired = positions
+    if drop_prefix:
+        repaired = repaired[drop_prefix:]
+        repair["dropped_prefix_frames"] += drop_prefix
+    if drop_suffix is not None:
+        cut_index = max(0, drop_suffix - drop_prefix)
+        repair["dropped_suffix_frames"] += max(0, len(repaired) - (cut_index + 1))
+        repaired = repaired[: cut_index + 1]
+    if len(repaired) < 2:
+        repair["dropped"] = "too_strange"
+        repair["reversal"] = "dropped"
+        return []
+    return repaired
+
+
+def _repair_track_positions(
+    positions: list[list[float]],
+) -> tuple[list[list[float]], dict[str, Any]]:
+    """Repair single bad samples and a midway reversal. Drop what remains wild."""
+    repair = _empty_position_repair()
+    repaired = [point[:] for point in positions]
+    if len(repaired) < 2:
+        repair["dropped"] = "shorter_than_two_states"
+        repair["reversal"] = "dropped"
+        return [], repair
+    for _pass in range(REPAIR_PASSES):
+        repaired, copied, smoothed, suffix = _chord_pass(repaired)
+        repair["copied_huge_frames"] += copied
+        repair["smoothed_frames"] += smoothed
+        repair["dropped_suffix_frames"] += suffix
+        repaired, prefix, suffix, bursts = _burst_pass(repaired)
+        repair["dropped_prefix_frames"] += prefix
+        repair["dropped_suffix_frames"] += suffix
+        repair["interpolated_bursts"] += bursts
+        if len(repaired) < 2:
+            repair["dropped"] = "too_strange"
+            repair["reversal"] = "dropped"
+            return [], repair
+    repaired = _reversal_pass(repaired, repair)
+    if repair["dropped"]:
+        return [], repair
+    repaired = _strange_backstop(repaired, repair)
+    if repair["dropped"]:
+        return [], repair
+    return repaired, repair
+
+
+def _position_repair_summary(repairs: list[dict[str, Any]], removed: list[dict[str, Any]]) -> dict[str, Any]:
+    totals = _empty_position_repair()
+    totals.pop("dropped")
+    totals.pop("reversal")
+    changed = 0
+    reversal_interpolated = 0
+    reversal_cut = 0
+    for repair in repairs:
+        for key in totals:
+            totals[key] += int(repair.get(key, 0))
+        if repair.get("reversal") == "interpolated":
+            reversal_interpolated += 1
+        elif repair.get("reversal") == "cut":
+            reversal_cut += 1
+        if any(int(repair.get(key, 0)) > 0 for key in totals) or repair.get("reversal") not in (None, "none"):
+            changed += 1
+    return {
+        "spike_step_m": SPIKE_STEP_M,
+        "huge_spike_step_m": HUGE_SPIKE_STEP_M,
+        "median_radius_frames": SPIKE_MEDIAN_RADIUS,
+        "merge_gap_steps": SPIKE_MERGE_GAP,
+        "max_burst_steps": SPIKE_MAX_BURST,
+        "close_m": SPIKE_CLOSE_M,
+        "reversal_min_m": REVERSAL_MIN_M,
+        "reversal_step_m": REVERSAL_STEP_M,
+        "strange_step_m": STRANGE_STEP_M,
+        "min_remaining_states": MIN_REMAINING_STATES,
+        "passes": REPAIR_PASSES,
+        "tracks_changed": changed,
+        "reversal_interpolated_tracks": reversal_interpolated,
+        "reversal_cut_tracks": reversal_cut,
+        **totals,
+        "removed_tracks": removed,
+    }
+
+
 def normalize_object(
     raw: dict[str, Any], road_grid: dict[str, Any], stabilize_headings: bool = True
 ) -> dict[str, Any]:
-    """Resample one native spline at 10 Hz. Positions are not smoothed."""
+    """Resample one native spline at 10 Hz and repair bad samples.
+
+    Velocity and heading are computed from the repaired positions.
+    """
     timestamps = [float(value) for value in raw["timestamp"]]
     xs = [float(value) for value in raw["x_position"]]
     ys = [float(value) for value in raw["y_position"]]
@@ -339,6 +749,16 @@ def normalize_object(
         x, source_index = _interpolate(timestamps, xs, target, source_index)
         y, source_index = _interpolate(timestamps, ys, target, source_index)
         positions.append([x * FEET_TO_METERS, y * FEET_TO_METERS])
+
+    positions, position_repair = _repair_track_positions(positions)
+    if position_repair["dropped"]:
+        return {
+            "id": int(raw["id"]),
+            "dropped": position_repair["dropped"],
+            "position_repair": position_repair,
+        }
+    first_tick += int(position_repair["dropped_prefix_frames"])
+    last_tick -= int(position_repair["dropped_suffix_frames"])
 
     velocities: list[list[float]] = []
     for index in range(len(positions)):
@@ -400,7 +820,7 @@ def normalize_object(
     normalized = {
         "id": int(raw["id"]),
         "source_class": source_class,
-        "type": drive_object_type(source_class),
+        "type": drive_object_type(source_class, length_m),
         "direction": int(raw.get("direction", 0)),
         "length_m": length_m,
         "width_m": width_m,
@@ -411,6 +831,7 @@ def normalize_object(
         "velocity_mps": velocities,
         "heading_rad": headings,
         "source_sample_count": len(raw["timestamp"]),
+        "position_repair": position_repair,
     }
     if quality_flags:
         normalized["quality_flags"] = quality_flags
@@ -425,10 +846,16 @@ def normalize_scene(
     with splines_path.open() as file:
         raw_objects = json.load(file)
     road_grid = load_road_grid(homography_path)
-    objects = [
-        normalize_object(raw, road_grid, stabilize_headings=stabilize_headings)
-        for raw in raw_objects
-    ]
+    objects = []
+    removed = []
+    repairs = []
+    for raw in raw_objects:
+        obj = normalize_object(raw, road_grid, stabilize_headings=stabilize_headings)
+        if obj.get("dropped"):
+            removed.append({"id": int(obj["id"]), "reason": obj["dropped"]})
+            continue
+        objects.append(obj)
+        repairs.append(obj["position_repair"])
     return {
         "schema": "i24_3d_full_trajectory_v1",
         "scene": scene,
@@ -439,8 +866,10 @@ def normalize_scene(
             "heading": "radians",
         },
         "source": str(splines_path),
+        "source_object_count": len(raw_objects),
         "object_count": len(objects),
         "heading_estimation": _heading_estimation_metadata(stabilize_headings),
+        "position_repair": _position_repair_summary(repairs, removed),
         "map": road_grid,
         "objects": objects,
     }
@@ -450,11 +879,54 @@ def _object_end_tick(obj: dict[str, Any]) -> int:
     return int(obj["start_tick"]) + len(obj["position_m"]) - 1
 
 
+def _position_travel_m(points: list[tuple[float, float]]) -> float:
+    """Diagonal of the axis-aligned box around the samples."""
+    if len(points) < 2:
+        return 0.0
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+
+
+def _track_points(obj: dict[str, Any]) -> list[tuple[float, float]]:
+    return [(float(point[0]), float(point[1])) for point in obj["position_m"]]
+
+
+def _stationary_ids(
+    objects: list[dict[str, Any]],
+    start_tick: int,
+    end_tick: int,
+    sdc_id: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Tracks whose samples in the window stay inside a 1 m box.
+
+    The focal track is reported and kept.
+    """
+    removed = []
+    focal_stationary = False
+    for obj in objects:
+        points = _window_points(obj, start_tick, end_tick)
+        if len(points) < 2:
+            continue
+        travel = _position_travel_m(points)
+        if travel > STATIONARY_MAX_METERS:
+            continue
+        if int(obj["id"]) == int(sdc_id):
+            focal_stationary = True
+            continue
+        removed.append({"id": int(obj["id"]), "travel_m": round(travel, 2)})
+    removed.sort(key=lambda item: item["id"])
+    return removed, focal_stationary
+
+
 def choose_sdc(scene_data: dict[str, Any]) -> dict[str, Any]:
     candidates = [
         obj
         for obj in scene_data["objects"]
-        if len(obj["position_m"]) >= 2
+        if not obj.get("dropped")
+        and "position_m" in obj
+        and len(obj["position_m"]) >= 2
+        and _position_travel_m(_track_points(obj)) > STATIONARY_MAX_METERS
         and "speed_above_60_mps" not in obj.get("quality_flags", [])
         and "outside_calibrated_y_range" not in obj.get("quality_flags", [])
     ]
@@ -792,12 +1264,15 @@ def _cleanup_tracks(
     split_y: float,
     sdc_id: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Drop wrong-way tracks, then the smaller car of each deep overlap."""
+    """Drop wrong-way and stationary tracks, then deep-overlap losers."""
     wrong_way, legal, focal_opposing = _wrong_way_ids(
         scene_objects, start_tick, end_tick, split_y, sdc_id
     )
-    wrong_ids = {item["id"] for item in wrong_way}
-    kept = [obj for obj in scenario_objects if int(obj["id"]) not in wrong_ids]
+    stationary, focal_stationary = _stationary_ids(
+        scene_objects, start_tick, end_tick, sdc_id
+    )
+    drop_ids = {item["id"] for item in wrong_way} | {item["id"] for item in stationary}
+    kept = [obj for obj in scenario_objects if int(obj["id"]) not in drop_ids]
     overlaps, focal_smaller = _deep_overlap_ids(kept)
     overlap_ids = {item["id"] for item in overlaps}
     cleaned = [obj for obj in kept if int(obj["id"]) not in overlap_ids]
@@ -805,13 +1280,16 @@ def _cleanup_tracks(
         "wrong_way_min_m": WRONG_WAY_MIN_METERS,
         "deep_overlap_fraction": DEEP_OVERLAP_FRACTION,
         "deep_overlap_min_steps": DEEP_OVERLAP_MIN_STEPS,
+        "stationary_max_m": STATIONARY_MAX_METERS,
         "legal_direction": {
             "eastbound_lower": "east" if legal["lower"] > 0 else "west",
             "westbound_upper": "east" if legal["upper"] > 0 else "west",
         },
         "focal_opposing_m": round(focal_opposing, 2),
         "focal_kept_despite_wrong_way": focal_opposing > WRONG_WAY_MIN_METERS,
+        "focal_kept_despite_stationary": focal_stationary,
         "removed_wrong_way": wrong_way,
+        "removed_stationary": stationary,
         "removed_deep_overlap": overlaps,
         "focal_smaller_overlaps_kept": focal_smaller,
     }
@@ -829,6 +1307,14 @@ def build_scenario(
     full_range_context: bool = False,
 ) -> dict[str, Any]:
     """One PufferDrive scenario. The self-driving car is object 0."""
+    scene_data = {
+        **scene_data,
+        "objects": [
+            obj
+            for obj in scene_data["objects"]
+            if not obj.get("dropped") and "position_m" in obj
+        ],
+    }
     objects_by_id = {obj["id"]: obj for obj in scene_data["objects"]}
     if sdc_id not in objects_by_id:
         raise ValueError(f"No object {sdc_id} in scene {scene_data['scene']}")
@@ -846,10 +1332,13 @@ def build_scenario(
     wrong_way, _legal, _focal_opposing = _wrong_way_ids(
         scene_data["objects"], start_tick, end_tick, split_y, sdc_id
     )
-    wrong_ids = {item["id"] for item in wrong_way}
+    stationary, _focal_stationary = _stationary_ids(
+        scene_data["objects"], start_tick, end_tick, sdc_id
+    )
+    drop_ids = {item["id"] for item in wrong_way} | {item["id"] for item in stationary}
     candidates = []
     for obj in scene_data["objects"]:
-        if obj["id"] == sdc_id or obj["id"] in wrong_ids:
+        if obj["id"] == sdc_id or obj["id"] in drop_ids:
             continue
         if full_range_context:
             overlap_start = max(start_tick, int(obj["start_tick"]))
@@ -920,9 +1409,9 @@ def build_scenario(
     roads = _translated_roads(
         scene_data["map"]["roads"], origin, (min(all_x) - 50.0, max(all_x) + 50.0)
     )
-    # Roads keep the pre-cleanup extent. Wrong-way ids were already
-    # left out of the nearest-object cut; this pass drops deep overlaps
-    # and any wrong-way track that still got in.
+    # Roads keep the pre-cleanup extent. Wrong-way and stationary ids
+    # were already left out of the nearest-object cut; this pass drops
+    # deep overlaps and any of those tracks that still got in.
     scenario_objects, cleanup = _cleanup_tracks(
         scenario_objects,
         scene_data["objects"],
@@ -950,6 +1439,11 @@ def build_scenario(
             ),
             "coordinate_origin_m": {"x": origin[0], "y": origin[1]},
             "track_cleanup": cleanup,
+            **(
+                {"position_repair": scene_data["position_repair"]}
+                if "position_repair" in scene_data
+                else {}
+            ),
         },
     }
 
@@ -1040,7 +1534,9 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
         scene_data = normalize_scene(
             args.i24_root.resolve(), scene, stabilize_headings=args.stabilize_headings
         )
-        source_object_count += scene_data["object_count"]
+        source_object_count += int(
+            scene_data.get("source_object_count", scene_data["object_count"])
+        )
         scene_flag_counts = Counter(
             flag for obj in scene_data["objects"] for flag in obj.get("quality_flags", [])
         )
@@ -1088,6 +1584,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
                 "excluded_major_quality_sdc_count": scene_excluded,
                 "scenario_count": len(scenarios) - scene_scenarios_before,
                 "quality_flag_counts": dict(sorted(scene_flag_counts.items())),
+                "position_repair": scene_data.get("position_repair", {}),
             }
         )
 
@@ -1124,8 +1621,11 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
             "Goals are each track's last valid logged position.",
             "The road model is the scene's 12-foot calibration grid, extended along the roadway and sampled every 5 m. Road edges are 1.5 ft outward from the lane lines. Boxes are 0.90 of the annotated size.",
             "Action labels are the simulator inverse on these logs, as in arXiv 2606.19370 A.4.",
-            "Heading stabilization never modifies exported positions or velocities.",
+            "Position repair runs on the 10 Hz samples before velocity and heading. A sample at least 0.25 m off the chord of its neighbors is moved onto that chord. A sample at least 1.25 m off is copied from the previous sample first, then moved onto the chord. A run of steps at least 0.25 m off the local median is interpolated when it is at most 30 steps and the far end is within 4 m of the median continuation. A bad prefix is dropped and a bad suffix is cut.",
+            "A reversal of 0.5 m to 10 m that resumes is straightened between the last forward sample and the resumed sample. A reversal above 10 m at either end is cut, and the track is removed when under 2 s remain. A mid-track reversal above 10 m that does not return, with both directions traveling more than 10 m, removes the track. An unfixable track is removed before the focal car is chosen.",
+            "Heading stabilization does not modify positions. Velocity and heading are recomputed from the repaired positions.",
             "A track that travels more than 10 m against its carriageway is removed. The carriageway direction is the majority of tracks on that side of the median.",
+            "A track whose positions stay inside a 1 m box is removed before the nearest-128 cut. The focal track is kept.",
             "When two boxes overlap by more than half the smaller box for more than 5 timesteps, the smaller track is removed. Pairs are marked before any of those tracks are deleted. The focal track is kept.",
         ],
     }

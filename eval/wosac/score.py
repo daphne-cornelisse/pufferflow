@@ -42,7 +42,8 @@ INIT_STEPS = 10
 SIM_STEPS = 81
 ROLLOUTS = 32
 NMAPS = 1000
-ROAD_LANE = 4
+TRUCK = 4
+ROAD_LANE = 5
 INVALID = np.float32(-10000.0)
 VEHICLE = 1
 
@@ -275,7 +276,7 @@ def scene_row(gt, sim, edges, scenario, tracks, cfg, device):
         return None
     length = sim["length"]
     width = sim["width"]
-    is_vehicle = (sim["types"] == VEHICLE)
+    is_vehicle = (sim["types"] == VEHICLE) | (sim["types"] == TRUCK)
 
     sx, sy, sh = sim_x[eval_mask], sim_y[eval_mask], sim_h[eval_mask]
     rx, ry, rh = ref_x[eval_mask], ref_y[eval_mask], ref_h[eval_mask]
