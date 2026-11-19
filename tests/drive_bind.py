@@ -56,6 +56,11 @@ def load():
     fn("pf_reward", ctypes.c_float, [handle, ctypes.c_int])
     fn("pf_timestep", ctypes.c_int, [handle])
     fn("pf_agent", None, [handle, ctypes.c_int, c_float_p])
+    fn("pf_set_pose", None, [
+        handle, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+    ])
+    fn("pf_contact", None, [handle, ctypes.c_int, c_int_p, c_int_p])
+    fn("pf_check_contacts", None, [handle])
     fn("pf_set_agent", None, [handle, ctypes.c_int] + [ctypes.c_float] * 9)
     fn("pf_set_goal", None, [handle, ctypes.c_int, ctypes.c_float, ctypes.c_float])
     fn("pf_mean", None, [handle, c_float_p, c_float_p])

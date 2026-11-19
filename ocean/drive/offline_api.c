@@ -79,6 +79,8 @@ PfHandle* pf_create_scenario(const char* data_dir, int map_id,
     h->kind = PF_SCENARIO;
     offline_parse(&h->off, json_path);
     pf_fill(h, data_dir, map_id, h->off.log_n, 100000, 5.0f, 30.0f);
+    // The labeler places every track, including ones invalid at frame 0.
+    dict_set(&h->cfg, "replay_invalid", 0);
     puf_init(&h->off.drive, &h->cfg);
     pf_bind(h);
     h->off.mean_x = h->off.drive.world_mean_x;
@@ -214,6 +216,43 @@ float pf_reward(PfHandle* h, int i) {
 
 int pf_timestep(PfHandle* h) {
     return h->off.drive.timestep;
+}
+
+// Pose only. Type, size, and goal stay as placed.
+void pf_set_pose(PfHandle* h, int i, float x, float y, float heading) {
+    Entity* e = &h->off.drive.entities[i];
+    assert(i >= 0 && i < h->off.drive.num_agents);
+    h->off.drive.bins_ready = 0;
+    if (x == INVALID_POSITION || y == INVALID_POSITION) {
+        e->x = INVALID_POSITION;
+        e->y = INVALID_POSITION;
+        e->valid = 0;
+        e->collision_state = NO_COLLISION;
+        e->offroad_state = 0;
+        return;
+    }
+    e->x = x;
+    e->y = y;
+    e->heading = heading;
+    e->heading_x = cosf(heading);
+    e->heading_y = sinf(heading);
+    e->valid = 1;
+}
+
+void pf_contact(PfHandle* h, int i, int* collision, int* offroad) {
+    Entity* e = &h->off.drive.entities[i];
+    assert(i >= 0 && i < h->off.drive.num_agents);
+    *collision = e->collision_state;
+    *offroad = e->offroad_state;
+}
+
+void pf_check_contacts(PfHandle* h) {
+    Drive* env = &h->off.drive;
+    env->bins_ready = 0;
+    for (int i = 0; i < env->active_agent_count; i++) {
+        env->entities[i].collision_state = NO_COLLISION;
+        collision_check(env, i);
+    }
 }
 
 void pf_agent(PfHandle* h, int i, float* out) {
