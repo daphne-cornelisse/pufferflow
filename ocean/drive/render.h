@@ -44,7 +44,6 @@ static int sheet_origin_y = 0;
 struct Client {
     float width;
     float height;
-    Texture2D puffers;
     Vector3 camera_target;
     float camera_zoom;
     // Path of the followed car. A new sample clears it.
@@ -186,7 +185,6 @@ Client* make_client(Drive* env) {
     } else {
         rlDisableBackfaceCulling();
     }
-    client->puffers = LoadTexture("resources/shared/puffers_128.png");
     client->cars[0] = LoadModel("resources/drive/Sedan.glb");
     client->cars[1] = LoadModel("resources/drive/Compact.glb");
     for (int i = 0; i < DRIVE_AGENT_MAX; i++) {
@@ -1963,7 +1961,6 @@ void close_client(Client* client) {
     for (int i = 0; i < 2; i++) {
         UnloadModel(client->cars[i]);
     }
-    UnloadTexture(client->puffers);
     if (client->font_ready) {
         UnloadFont(client->font);
     }

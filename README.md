@@ -28,3 +28,28 @@ Drive the Waymo self-driving car against a frozen behavioral-cloning anchor. WAS
 ```
 
 That loads both `checkpoints/bc_womd_1000.npz` and the regularized RL policy `checkpoints/drive/town01_bc1000/0000000578813952.bin` (512×3, KL to the BC anchor, coefficient 0.075). Score 0.681, collision rate 0.906, completion rate 0.707, off-road rate 0.398, anchor loss 5.931. A following `.bin` replaces the policy. The scene is a dense intersection from `data/womd`. `--env.map_id` picks one of the ten curated maps when the id is one of them. `--env.map_id=0` loads CARLA Town01 (`data/mixed/binaries/map_000.bin`). That map has no trajectory, so each car's goal is sampled on the lane ahead of it. The policy uses `policy.hidden_size` and `policy.num_layers` from `config/drive.ini`.
+
+## Stored checkpoints
+
+The four files in `checkpoints/` use these widths and depths. The player stores `num_layers` as an integer.
+
+| File | Hidden | Layers |
+| --- | --- | --- |
+| `checkpoints/rl_i24_coef0.bin` | 128 | 1 |
+| `checkpoints/rl_i24_coef0p068.bin` | 128 | 1 |
+| `checkpoints/bc_i24.npz` | 704 | 3 |
+| `checkpoints/bc_womd_1000.npz` | 704 | 3 |
+
+The `.bin` files are PufferNets. Both I24 policies are the run-28 network: hidden size 128 and 1 layer. `rl_i24_coef0.bin` has anchor coefficient 0. `rl_i24_coef0p068.bin` has anchor coefficient 0.0681012049. Play and score them with those two flags:
+
+```
+./drive --config=config/i24.ini --policy.hidden_size=128 --policy.num_layers=1 checkpoints/rl_i24_coef0p068.bin
+```
+
+```
+python eval/dreal_highway/score.py --hidden 128 --layers 1 \
+  --policy coef0=checkpoints/rl_i24_coef0.bin \
+  --policy coef0p068=checkpoints/rl_i24_coef0p068.bin
+```
+
+The `.npz` files are the behavioral-cloning anchors: a 3-layer MLP, width 704, then two heads of 257 acceleration bins and 257 steering bins. `bc_i24.npz` is the I24 anchor. `bc_womd_1000.npz` is the Waymo anchor. They load by path and do not take `--policy.hidden_size` or `--hidden`.

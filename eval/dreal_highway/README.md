@@ -10,8 +10,10 @@ The script reads the three scenes in `data/i24` and the greedy anchor `checkpoin
 
 A drive checkpoint is an extra controller on that same report. It does not replace the three, and it does not write `dreal_highway.json`.
 
+Both policy bins are hidden size 128 and 1 layer. The anchor `checkpoints/bc_i24.npz` is hidden size 704 and 3 layers.
+
 ```
-python eval/dreal_highway/score.py \
+python eval/dreal_highway/score.py --hidden 128 --layers 1 \
   --policy coef0=checkpoints/rl_i24_coef0.bin \
   --policy coef0p068=checkpoints/rl_i24_coef0p068.bin \
   --out analysis/offline/i24/dreal_rl.json

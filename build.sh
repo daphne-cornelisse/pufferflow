@@ -18,7 +18,6 @@ set -e
 #   ./build.sh breakout --profile    # Kernel profiling binary
 #   ./build.sh constellation         # Sweep dashboard -> ./seethestars
 #   ./build.sh cache_data            # Sweep log cache -> ./cache_data
-#   ./build.sh trailer               # 5.0 trailer -> ./resources/trailer/trailer (also exports diagrams)
 #
 # Env is compiled in. Run: ./puffer train|eval|match|sweep [--section.key=value ...]
 
@@ -157,14 +156,6 @@ elif [ "$ENV" = "cache_data" ]; then
     EXTRA_CFLAGS+=(-DPUFFER_CACHE_DATA)
     STANDALONE=1
     CLANG_WARN+=(-Wno-unused-function)
-elif [ "$ENV" = "trailer" ]; then
-    SRC_DIR="resources/trailer"
-    OUTPUT_NAME="resources/trailer/trailer"
-    SRC_FILE="resources/trailer/puffer5.c"
-    EXTRA_SRC="resources/trailer/architecture.c resources/trailer/stars.c resources/trailer/plot_scale.c resources/trailer/fonts.c"
-    EXTRA_CFLAGS+=(-DARCHITECTURE_LIB -Iresources)
-    STANDALONE=1
-    CLANG_WARN+=(-Wno-unused-function)
 elif [ "$ENV" = "impulse_wars" ]; then
     SRC_DIR="ocean/$ENV"
     if [ "$MODE" = "web" ]; then BOX2D_NAME='box2d-web'
@@ -242,7 +233,7 @@ else
     NVCC_OPT="-O2 --threads 0"
     LINK_OPT="-O2"
 fi
-# Dashboard / cache / trailer: compile SRC_FILE only (not puffercpu / CUDA / obs_t).
+# Dashboard / cache: compile SRC_FILE only (not puffercpu / CUDA / obs_t).
 if [ "$STANDALONE" = "1" ]; then
     if [ "$MODE" = "web" ] || [ "$MODE" = "profile" ]; then
         echo "Error: $ENV is a standalone app, not an env" >&2
@@ -259,23 +250,6 @@ if [ "$STANDALONE" = "1" ]; then
         -DPLATFORM_DESKTOP \
         "${EXTRA_CFLAGS[@]}"
     echo "Built: ./$OUTPUT_NAME"
-    if [ "$ENV" = "trailer" ]; then
-        echo "Compiling architecture..."
-        ${CC:-clang} "${CLANG_OPT[@]}" \
-            -I. "${INCLUDES[@]}" \
-            resources/trailer/architecture.c resources/trailer/fonts.c -o resources/trailer/architecture \
-            "${LINK_ARCHIVES[@]}" \
-            "${EXTRA_LDFLAGS[@]}" \
-            "${STANDALONE_LDFLAGS[@]}" \
-            -lm -lpthread \
-            -DPLATFORM_DESKTOP \
-            -Iresources
-        echo "Built: ./resources/trailer/architecture"
-        echo "Exporting diagrams..."
-        mkdir -p resources/trailer/shots
-        ./resources/trailer/architecture --shot resources/trailer/shots/loop.png
-        ./"$OUTPUT_NAME" --plot resources/trailer/shots/fig_scale.png
-    fi
     exit 0
 fi
 if [ "$MODE" = "cpu" ]; then
@@ -352,9 +326,11 @@ elif [ "$MODE" = "web" ]; then
     fi
     echo "Compiling $ENV for web..."
     PRELOAD=(
-        --preload-file resources/shared@resources/shared
         --preload-file config/default.ini@config/default.ini
     )
+    if [ -d resources/shared ]; then
+        PRELOAD+=(--preload-file resources/shared@resources/shared)
+    fi
     if [ -d "ocean/$ENV/generated" ]; then
         PRELOAD+=(--preload-file "ocean/$ENV/generated@ocean/$ENV/generated")
     fi
@@ -389,7 +365,6 @@ elif [ "$MODE" = "web" ]; then
         -DPUFFERCPU_EVAL_MAIN \
         -DENV_HEADER=\"$ENV_HEADER\" \
         -DPUFFER_ENV_NAME=\"$ENV\" \
-        --preload-file resources/shared@resources/shared \
         "${PRELOAD_ENV[@]}" \
         "${PRELOAD[@]}" \
         "${EXTRA_CFLAGS[@]}"

@@ -1983,7 +1983,10 @@ int main(int argc, char** argv) {
                     all = 0;
                 }
             }
-            if (all) {
+            const char* full_episode = getenv("DRIVE_RECORD_FULL");
+            int until_episode = full_episode && full_episode[0]
+                && full_episode[0] != '0';
+            if (all && !until_episode) {
                 ego_done = 1;
                 printf("record: followed cars reached their goals at step %d\n",
                     env.timestep);

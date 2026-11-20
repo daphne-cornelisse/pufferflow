@@ -1217,14 +1217,12 @@ int main(void) {
     // Initialize Raylib
     SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(2*DEFAULT_PLOT_ARGS.width, DEFAULT_PLOT_ARGS.height + 2*SETTINGS_HEIGHT, "Puffer Constellation");
-    Texture2D puffer = LoadTexture("resources/shared/puffers.png");
 
-    DEFAULT_PLOT_ARGS.font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 32, NULL, 255);
-    DEFAULT_PLOT_ARGS.font_small = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 16, NULL, 255);
-    Font gui_font = LoadFontEx("resources/shared/JetBrainsMono-SemiBold.ttf", 14, NULL, 255);
+    DEFAULT_PLOT_ARGS.font = GetFontDefault();
+    DEFAULT_PLOT_ARGS.font_small = GetFontDefault();
 
     GuiLoadStyle("resources/constellation/puffer.rgs");
-    GuiSetFont(gui_font);
+    GuiSetFont(GetFontDefault());
     ClearBackground(PUFF_BACKGROUND);
     SetTargetFPS(60);
 
@@ -1631,17 +1629,6 @@ int main(void) {
         if (GuiDropdownBox(box_rect, scale_options, &fig_box_idx, fig_box_active)) {
             fig_box_active = !fig_box_active;
         }
-
-        // Puffer
-        float width = GetScreenWidth();
-        DrawTexturePro(
-            puffer,
-            (Rectangle){0, 128, 128, 128},
-            (Rectangle){width - 48, -8, 48, 48},
-            (Vector2){0, 0},
-            0,
-            WHITE
-        );
 
         // Tooltip
         int env_idx = tooltip.env_idx;
