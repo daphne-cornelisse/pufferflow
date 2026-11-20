@@ -173,7 +173,7 @@ elif [ "$ENV" = "impulse_wars" ]; then
     fi
     BOX2D_URL="https://github.com/capnspacehook/box2d/releases/latest/download"
     download "$BOX2D_NAME" "$BOX2D_URL/$BOX2D_NAME.tar.gz"
-    INCLUDES+=(-I./$BOX2D_NAME/include -I./$BOX2D_NAME/src -I./ocean/impulse_wars -I./vendor/collections-c)
+    INCLUDES+=(-I./$BOX2D_NAME/include -I./$BOX2D_NAME/src -I./ocean/impulse_wars)
     LINK_ARCHIVES+=("./$BOX2D_NAME/libbox2d.a")
     # C++ trainer only: game is C (void*/compound literals), not C++17.
     if [ -z "${MODE:-}" ] || [ "$MODE" = "native" ] || [ "$MODE" = "profile" ]; then
