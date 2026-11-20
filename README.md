@@ -90,6 +90,58 @@ surveyed I-24 map. The spiced simulator still requires its normal dependency
 installation before its `save_map_binary` step can turn the scenario JSON into
 `.bin` files.
 
+### I24-3D speed fields
+
+Generate longitudinal speed fields from the ground-truth trajectories with:
+
+```bash
+python ocean/drive/plot_i24_speed_field.py
+```
+
+The script bins the 10 Hz samples on a regular time-position grid, computes a
+sample-weighted mean speed in each cell, and optionally smooths the speed sums
+and sample counts before dividing them. By default it writes direction and
+Scene 3 lane views under `figures/i24_speed_field/`. Use
+`--time-bin-seconds`, `--space-bin-meters`, `--smooth-time-seconds`, and
+`--smooth-space-meters` to control the field resolution and smoothing; set both
+smoothing scales to zero to see only directly observed cells.
+
+Generate net bumper-to-bumper distance-headway distributions and lane-assignment
+diagnostics with:
+
+```bash
+python ocean/drive/plot_i24_headway_distributions.py
+```
+
+Scenes 1 and 3 use the calibrated lane centers and flag vehicle footprints that
+overlap an internal boundary. Because snowy Scene 2 traffic follows visible
+ruts rather than the calibration grid, that scene instead infers curved
+effective-stream centerlines from the smoothed trajectories. Its proposed
+leader must also overlap the follower laterally after both offsets are measured
+relative to the shared centerline. The script writes the six headway
+distributions as both histograms and empirical CDFs, a Scene 2 centerline audit,
+a calibrated-versus-effective Scene 2 comparison, and a JSON analysis under
+`figures/i24_headways/`. The effective-stream smoothing, density-peak,
+confidence, and overlap thresholds are exposed as `--effective-*` options;
+`--cdf-max-gap-meters` controls the CDF display range.
+
+Generate total-roadway throughput visualizations from exact trajectory
+crossings with:
+
+```bash
+python ocean/drive/plot_i24_throughput.py
+```
+
+The script does not assign lanes. Its high-fidelity view interpolates every
+vehicle crossing at virtual cross-sections spaced 25 m apart and reports flow
+in complete 10-second intervals. Its ideal-loop view places perfect detector
+stations at 25%, 50%, and 75% of the calibrated longitudinal range and reports
+complete 30-second interval counts. Outputs under `figures/i24_throughput/`
+include the dense position-time flow field, cumulative station counts,
+ideal-loop interval counts, fine-versus-coarse temporal aggregation, observed
+segment accumulation, and a JSON summary. Gate spacing and both aggregation
+intervals are configurable from the command line.
+
 To replay the recorded human ego and surrounding traffic exactly in the
 PufferDrive window, use logged initialization plus `replay_logged_agents`:
 
