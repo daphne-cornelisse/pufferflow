@@ -706,7 +706,11 @@ static void drive_token(float* h2, const float* x, int F,
     var /= (float)H;
     float inv = 1.0f / sqrtf(var + 1.0e-5f);
     for (int i = 0; i < H; i++) {
-        ln[i] = (h1[i] - mean) * inv * g[i] + be[i];
+        float v = (h1[i] - mean) * inv * g[i] + be[i];
+        // Exact GELU, same as drive_gelu_kernel. The second linear
+        // reads this activation, not the layer-norm output.
+        float cdf = 0.5f * (1.0f + erff(v * 0.7071067811865476f));
+        ln[i] = v * cdf;
     }
     for (int o = 0; o < H; o++) {
         const float* wr = w2 + (size_t)o * H;
@@ -959,6 +963,9 @@ void _gaussian_mean(float* input, float* output, int batch_size, int num_actions
     }
 }
 
+// Recordings show the mode. Rollout sampling stays the default.
+static int puf_forward_hard = 0;
+
 void forward_puffernet(PufferNet* net, float* observations, float* actions,
         const unsigned char* mask, const float* terminals) {
     mingru_zero_term(net->mingru, terminals);
@@ -968,7 +975,8 @@ void forward_puffernet(PufferNet* net, float* observations, float* actions,
     if (net->is_continuous) {
         _gaussian_mean(net->decoder->output, actions, net->num_agents, net->num_actions);
     } else {
-        multidiscrete(net->multidiscrete, net->decoder->output, actions, 0, mask);
+        multidiscrete(net->multidiscrete, net->decoder->output, actions,
+            puf_forward_hard, mask);
     }
 }
 
@@ -1828,6 +1836,9 @@ int main(int argc, char** argv) {
     int hold = 0;
     int steps = 0;
     int recording = puf_record_enabled();
+    if (recording) {
+        puf_forward_hard = 1;
+    }
     if (recording && path && !have_net) {
         fprintf(stderr, "record: checkpoint did not load (%s)\n", path);
         exit(1);
@@ -1848,6 +1859,11 @@ int main(int argc, char** argv) {
 #ifdef PUFFER_DRIVE
         drive_note_value(net, &env);
 #endif
+        puf_render(&env);
+    }
+    // The sheet includes the spawn frame. Later frames are one step each,
+    // and a reset is the episode after this scene, so it is not captured.
+    if (recording) {
         puf_render(&env);
     }
     // Web: Raylib 5.5 WindowShouldClose() always emscripten_sleep(16).
@@ -1890,6 +1906,9 @@ int main(int argc, char** argv) {
             sim_prev = now;
 #endif
         }
+#ifdef PUFFER_DRIVE
+        int prev_step = env.timestep;
+#endif
         for (int t = 0; t < ticks; t++) {
 #ifdef PUF_EVAL_SHOULD_FORWARD
             int eval_fwd = env.tick_frames_left <= 0;
@@ -1941,6 +1960,37 @@ int main(int argc, char** argv) {
                 hold = reset_hold ? 0 : (hold + 1) % frameskip;
             }
         }
+#ifdef PUFFER_DRIVE
+        // A reset is the next episode. Each followed car is removed
+        // when it reaches its goal. Draw the frame where the last
+        // one disappears, then stop.
+        int ego_done = 0;
+        if (recording && env.timestep < prev_step) {
+            break;
+        }
+        if (recording && env.client && env.client->record_n > 0) {
+            int all = 1;
+            for (int k = 0; k < env.client->record_n; k++) {
+                int ego = env.client->record_slot[k];
+                if (ego < 0 || ego >= env.active_agent_count) {
+                    continue;
+                }
+                Entity* car = &env.entities[ego];
+                int gone = car->reached_goal
+                    || car->x == INVALID_POSITION
+                    || car->y == INVALID_POSITION;
+                if (!gone) {
+                    all = 0;
+                }
+            }
+            if (all) {
+                ego_done = 1;
+                printf("record: followed cars reached their goals at step %d\n",
+                    env.timestep);
+                fflush(stdout);
+            }
+        }
+#endif
         if (!headless || recording) {
 #ifdef PUFFER_DRIVE
             if (!recording) {
@@ -1948,7 +1998,7 @@ int main(int argc, char** argv) {
             }
 #endif
             puf_render(&env);
-            if (recording && puf_record_done()) {
+            if (recording && (puf_record_done() || ego_done)) {
                 break;
             }
 #ifndef PLATFORM_WEB

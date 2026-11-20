@@ -12,12 +12,57 @@
 #undef double3
 #include "rlgl.h"
 
+// Top-down crop, matching the highway GIFs: ±40 m on the short side.
+// Recordings sit a little closer, and at a higher resolution.
+#define SIM_CROP 80.0f
+#define SIM_RECORD_ZOOM 0.70f
+#define SIM_TRACE 512
+// One square sheet per recording. DRIVE_RECORD_WHICH picks which car.
+#define SIM_RECORD_AGENTS 5
+#define SIM_RECORD_SIDE 960
+#define SIM_RECORD_MARGIN 44
+// The sheet is drawn at this multiple and scaled down, which is the
+// antialiasing the one-pixel strokes never had.
+#define SIM_RECORD_SS 2
+static RenderTexture2D sheet_hi = {0};
+static int sheet_hi_side = 0;
+
+static void sheet_hi_ensure(int side) {
+    if (sheet_hi.id != 0 && sheet_hi_side == side) {
+        return;
+    }
+    if (sheet_hi.id != 0) {
+        UnloadRenderTexture(sheet_hi);
+    }
+    sheet_hi = LoadRenderTexture(side, side);
+    SetTextureFilter(sheet_hi.texture, TEXTURE_FILTER_BILINEAR);
+    sheet_hi_side = side;
+}
+static int sheet_origin_x = 0;
+static int sheet_origin_y = 0;
+
 struct Client {
     float width;
     float height;
     Texture2D puffers;
     Vector3 camera_target;
     float camera_zoom;
+    // Path of the followed car. A new sample clears it.
+    float trace_x[SIM_TRACE];
+    float trace_y[SIM_TRACE];
+    int trace_n;
+    int trace_i;
+    int trace_agent;
+    int trace_stamp;
+    int trace_ready;
+    // Recording follows this many policy cars, one square each.
+    int record_n;
+    int record_slot[SIM_RECORD_AGENTS];
+    int record_trace_n[SIM_RECORD_AGENTS];
+    int record_trace_i[SIM_RECORD_AGENTS];
+    float record_trace_x[SIM_RECORD_AGENTS][SIM_TRACE];
+    float record_trace_y[SIM_RECORD_AGENTS][SIM_TRACE];
+    unsigned int pick_rng;
     Camera3D camera;
     Model cars[2];
     int car_assignments[DRIVE_AGENT_MAX];
@@ -87,6 +132,11 @@ static void sim_frame_camera(Drive* env) {
 
 Client* make_client(Drive* env) {
     Client* client = (Client*)calloc(1, sizeof(Client));
+    client->trace_agent = -1;
+    client->pick_rng = env->rng ^ 0x9E3779B9u;
+    if (client->pick_rng == 0) {
+        client->pick_rng = 1;
+    }
     client->width = 1280;
     client->height = 704;
     if (env->sim_user_size) {
@@ -94,9 +144,9 @@ Client* make_client(Drive* env) {
     }
     int recording = puf_record_enabled();
     if (recording) {
-        // 1.25x the interactive frame. Both axes stay even for yuv420.
-        client->width = 1600;
-        client->height = 880;
+        // Even axes for yuv420. Three squares across, BC contact width.
+        client->width = SIM_RECORD_SIDE + SIM_RECORD_MARGIN * 2;
+        client->height = client->width;
         puf_record_ensure_display((int)client->width, (int)client->height);
     }
     unsigned int flags = FLAG_MSAA_4X_HINT;
@@ -260,6 +310,24 @@ static const Color AMBER = {230, 186, 64, 255};
 static const Color CRIMSON = {185, 28, 28, 255};
 // Lane markings. Kind 1 in the observation, distinct from center lanes.
 static const Color ROAD_LINE_PT = {126, 110, 176, 255};
+// Highway sheet. Policy cars are dark blue, the followed car is lighter,
+// and every log-replayed car, including ghosts, is grey.
+static const Color POLICY_BLUE = {27, 79, 140, 255};
+static const Color EGO_BLUE = {126, 178, 222, 255};
+static const Color REPLAY_GREY = {176, 176, 176, 255};
+// Matplotlib sheet: black box edges, grey lanes, yellow markings, black edges.
+static const Color BOX_EDGE = {34, 34, 34, 255};
+// A vehicle overlap is red. A road-edge overlap is orange.
+static const Color HIT_RED = {214, 39, 40, 255};
+static const Color HIT_RED_EDGE = {140, 18, 18, 255};
+static const Color OFFROAD_ORANGE = {255, 127, 14, 255};
+static const Color OFFROAD_ORANGE_EDGE = {176, 78, 0, 255};
+static const Color LANE_YELLOW = {230, 195, 92, 255};
+static const Color LANE_GREY = {176, 182, 189, 255};
+static const Color EDGE_GREY = {34, 34, 34, 255};
+// Logged pose of a policy car, drawn under the controlled box.
+static const Color GHOST_GREEN = {176, 222, 190, 255};
+static const Color GHOST_GREEN_EDGE = {118, 176, 140, 255};
 
 static void sim_draw_button(Rectangle r, const char* label, Color fill, Color edge) {
     DrawRectangleRec(r, fill);
@@ -357,33 +425,6 @@ static void sim_obs_arrow(float cx, float cy, float ppm,
     };
     DrawTriangle(tip, left, right, color);
     DrawTriangle(tip, right, left, color);
-}
-
-// Box in the ego frame. (c, s) is the car's heading, forward then left.
-// The fill is drawn with the outline so the car covers road points.
-static void sim_obs_box(float cx, float cy, float ppm,
-        float f, float l, float hl, float hw,
-        float c, float s, float thick, Color color) {
-    float lf = -s;
-    float ll = c;
-    float f0 = f + hl * c + hw * lf;
-    float l0 = l + hl * s + hw * ll;
-    float f1 = f + hl * c - hw * lf;
-    float l1 = l + hl * s - hw * ll;
-    float f2 = f - hl * c - hw * lf;
-    float l2 = l - hl * s - hw * ll;
-    float f3 = f - hl * c + hw * lf;
-    float l3 = l - hl * s + hw * ll;
-    Vector2 p0 = {cx - l0 * ppm, cy - f0 * ppm};
-    Vector2 p1 = {cx - l1 * ppm, cy - f1 * ppm};
-    Vector2 p2 = {cx - l2 * ppm, cy - f2 * ppm};
-    Vector2 p3 = {cx - l3 * ppm, cy - f3 * ppm};
-    DrawTriangle(p0, p1, p2, color);
-    DrawTriangle(p0, p2, p3, color);
-    sim_obs_seg(cx, cy, ppm, f0, l0, f1, l1, thick, color);
-    sim_obs_seg(cx, cy, ppm, f1, l1, f2, l2, thick, color);
-    sim_obs_seg(cx, cy, ppm, f2, l2, f3, l3, thick, color);
-    sim_obs_seg(cx, cy, ppm, f3, l3, f0, l0, thick, color);
 }
 
 // Signed speed within speed_band of the target. A target of 0 never matches.
@@ -741,8 +782,18 @@ void handle_camera_controls(Drive* env) {
         prev_mouse_pos = current_mouse_pos;
     }
 
-    // Handle mouse wheel for zoom
+    // Handle mouse wheel for zoom. Follow keeps an orthographic span.
     float wheel = GetMouseWheelMove();
+    if (wheel != 0 && !sim_ui_hot(env) && env->sim_follow) {
+        client->camera_zoom *= 1.0f - wheel * 0.1f;
+        if (client->camera_zoom < 0.25f) {
+            client->camera_zoom = 0.25f;
+        }
+        if (client->camera_zoom > 6.0f) {
+            client->camera_zoom = 6.0f;
+        }
+        return;
+    }
     if (wheel != 0 && !sim_ui_hot(env)) {
         float zoom_factor = 1.0f - (wheel * 0.1f);
         // Calculate the current direction vector from target to position
@@ -762,32 +813,348 @@ void handle_camera_controls(Drive* env) {
     }
 }
 
-// Keep the current overhead offset and aim it at the selected car.
+static int sim_body_drawn(Drive* env, int slot) {
+    if (!env->entities || slot < 0 || slot >= env->body_count) {
+        return 0;
+    }
+    Entity* agent = &env->entities[slot];
+    if (agent->type != VEHICLE && agent->type != TRUCK) {
+        return 0;
+    }
+    if (agent->valid == 0) {
+        return 0;
+    }
+    if (agent->x == INVALID_POSITION || agent->y == INVALID_POSITION) {
+        return 0;
+    }
+    return 1;
+}
+
+static int sim_agent_live(Drive* env, int slot) {
+    if (slot >= env->active_agent_count) {
+        return 0;
+    }
+    return sim_body_drawn(env, slot);
+}
+
+// The off-road flag stays clear when a car drives past the last road
+// edge. A car more than 30 m from every road point is off the sheet.
+static int sim_near_road(Drive* env, int slot) {
+    Entity* car = &env->entities[slot];
+    float max2 = 30.0f * 30.0f;
+    for (int i = 0; i < env->num_entities; i++) {
+        Entity* road = &env->entities[i];
+        if (road->type < ROAD_LANE || road->type > ROAD_EDGE) {
+            continue;
+        }
+        if (!road->pts_x || !road->pts_y || road->array_size < 1) {
+            continue;
+        }
+        for (int j = 0; j < road->array_size; j += 3) {
+            float dx = road->pts_x[j] - car->x;
+            float dy = road->pts_y[j] - car->y;
+            if (dx * dx + dy * dy <= max2) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Leaving the roadway does not clear valid or the position, so a
+// departed car would stay selected and hide the rest of the fleet.
+static int sim_agent_onroad(Drive* env, int slot) {
+    if (!sim_agent_live(env, slot)) {
+        return 0;
+    }
+    if (env->entities[slot].offroad_state != 0) {
+        return 0;
+    }
+    return sim_near_road(env, slot);
+}
+
+// Policy cars still on the road, then a log car, then a departed
+// policy car. The draw rng is not the simulation rng. A recording
+// passes allow_replay 0 so the sheet never follows a log car.
+static int sim_sample_agent(Drive* env, int allow_replay) {
+    int live = 0;
+    int onroad = 0;
+    int replay = 0;
+    int n = env->active_agent_count;
+    for (int i = 0; i < n; i++) {
+        if (!sim_agent_live(env, i)) {
+            continue;
+        }
+        live++;
+        if (sim_agent_onroad(env, i)) {
+            onroad++;
+        }
+    }
+    for (int i = n; i < env->body_count; i++) {
+        if (sim_body_drawn(env, i) && sim_near_road(env, i)) {
+            replay++;
+        }
+    }
+    int mode = onroad > 0 ? 0 : ((allow_replay && replay > 0) ? 1 : 2);
+    int pool = mode == 0 ? onroad : (mode == 1 ? replay : live);
+    if (pool <= 0) {
+        return 0;
+    }
+    int pick = (int)(rand_r(&env->client->pick_rng) % (unsigned)pool);
+    int begin = mode == 1 ? n : 0;
+    int end = mode == 1 ? env->body_count : n;
+    for (int i = begin; i < end; i++) {
+        if (!sim_body_drawn(env, i)) {
+            continue;
+        }
+        if (mode == 0 && !sim_agent_onroad(env, i)) {
+            continue;
+        }
+        if (mode == 1 && !sim_near_road(env, i)) {
+            continue;
+        }
+        if (pick == 0) {
+            return i;
+        }
+        pick--;
+    }
+    return 0;
+}
+
+static void sim_trace_push(Client* client, float x, float y) {
+    int i = client->trace_i;
+    client->trace_x[i] = x;
+    client->trace_y[i] = y;
+    client->trace_i = (i + 1) % SIM_TRACE;
+    if (client->trace_n < SIM_TRACE) {
+        client->trace_n++;
+    }
+}
+
+static void sim_trace_clear(Client* client, int slot) {
+    client->trace_n = 0;
+    client->trace_i = 0;
+    client->trace_agent = slot;
+}
+
+// On-road policy cars for a recording. DRIVE_RECORD_WHICH picks one.
+static void sim_record_pick(Drive* env) {
+    Client* client = env->client;
+    int pool[DRIVE_AGENT_MAX];
+    int n = 0;
+    int active = env->active_agent_count;
+    if (active > DRIVE_AGENT_MAX) {
+        active = DRIVE_AGENT_MAX;
+    }
+    for (int i = 0; i < active; i++) {
+        if (sim_agent_onroad(env, i)) {
+            pool[n++] = i;
+        }
+    }
+    if (n < SIM_RECORD_AGENTS) {
+        for (int i = 0; i < active; i++) {
+            if (!sim_agent_live(env, i)) {
+                continue;
+            }
+            int seen = 0;
+            for (int j = 0; j < n; j++) {
+                if (pool[j] == i) {
+                    seen = 1;
+                }
+            }
+            if (!seen) {
+                pool[n++] = i;
+            }
+        }
+    }
+    for (int i = n - 1; i > 0; i--) {
+        int j = (int)(rand_r(&client->pick_rng) % (unsigned)(i + 1));
+        int tmp = pool[i];
+        pool[i] = pool[j];
+        pool[j] = tmp;
+    }
+    int take = n < SIM_RECORD_AGENTS ? n : SIM_RECORD_AGENTS;
+    int which = 0;
+    const char* which_env = getenv("DRIVE_RECORD_WHICH");
+    if (which_env && which_env[0]) {
+        which = atoi(which_env);
+    }
+    if (which < 0) {
+        which = 0;
+    }
+    if (which >= take) {
+        which = take - 1;
+    }
+    client->record_n = take > 0 ? 1 : 0;
+    if (take > 0) {
+        client->record_slot[0] = pool[which];
+        client->record_trace_n[0] = 0;
+        client->record_trace_i[0] = 0;
+        env->selected_agent_idx = pool[which];
+        printf("record agent %d\n", pool[which]);
+        fflush(stdout);
+    }
+}
+
+static void sim_record_push(Client* client, int k, float x, float y) {
+    int i = client->record_trace_i[k];
+    client->record_trace_x[k][i] = x;
+    client->record_trace_y[k][i] = y;
+    client->record_trace_i[k] = (i + 1) % SIM_TRACE;
+    if (client->record_trace_n[k] < SIM_TRACE) {
+        client->record_trace_n[k]++;
+    }
+}
+
+static void sim_record_install(Client* client, int k) {
+    client->trace_n = client->record_trace_n[k];
+    client->trace_i = client->record_trace_i[k];
+    client->trace_agent = client->record_slot[k];
+    memcpy(client->trace_x, client->record_trace_x[k], sizeof(client->trace_x));
+    memcpy(client->trace_y, client->record_trace_y[k], sizeof(client->trace_y));
+}
+
+// On a log map, follow a policy car that is still on the road. Once
+// those are gone, follow a log car so the sheet stays on the highway.
+// A recording follows three policy cars until each one arrives.
+// The path starts over when the followed car changes.
+static void sim_choose_ego(Drive* env) {
+    Client* client = env->client;
+    if (!client) {
+        return;
+    }
+    int seen = client->trace_stamp;
+    int ready = client->trace_ready;
+    int reset = ready && env->timestep < seen;
+    if (puf_record_enabled() && env->log_spawn) {
+        if (client->record_n <= 0 || reset) {
+            sim_record_pick(env);
+        }
+        for (int k = 0; k < client->record_n; k++) {
+            int slot = client->record_slot[k];
+            if (!sim_body_drawn(env, slot)) {
+                continue;
+            }
+            int same = client->record_trace_n[k] > 0 && ready
+                && env->timestep == seen;
+            if (same) {
+                continue;
+            }
+            Entity* agent = &env->entities[slot];
+            sim_record_push(client, k, agent->x, agent->y);
+        }
+        client->trace_stamp = env->timestep;
+        client->trace_ready = 1;
+        if (client->record_n > 0) {
+            env->selected_agent_idx = client->record_slot[0];
+        }
+        return;
+    }
+    int slot = env->selected_agent_idx;
+    int n = env->active_agent_count;
+    int onroad_left = sim_agent_onroad(env, slot);
+    int replay_left = 0;
+    if (!onroad_left) {
+        for (int i = 0; i < n; i++) {
+            if (sim_agent_onroad(env, i)) {
+                onroad_left = 1;
+                break;
+            }
+        }
+    }
+    if (!onroad_left) {
+        for (int i = n; i < env->body_count; i++) {
+            if (sim_body_drawn(env, i) && sim_near_road(env, i)) {
+                replay_left = 1;
+                break;
+            }
+        }
+    }
+    int ok = 0;
+    if (onroad_left) {
+        ok = sim_agent_onroad(env, slot);
+    } else if (replay_left) {
+        ok = slot >= n && sim_body_drawn(env, slot) && sim_near_road(env, slot);
+    } else {
+        ok = sim_agent_live(env, slot);
+    }
+    if (env->log_spawn && (client->trace_agent < 0 || reset || !ok)) {
+        int next = sim_sample_agent(env, 1);
+        if (client->trace_agent < 0 || reset || next != slot) {
+            env->selected_agent_idx = next;
+            sim_trace_clear(client, next);
+        }
+        slot = next;
+    }
+    if (slot != client->trace_agent) {
+        sim_trace_clear(client, slot);
+    }
+    client->trace_stamp = env->timestep;
+    client->trace_ready = 1;
+    if (!sim_body_drawn(env, slot)) {
+        return;
+    }
+    Entity* agent = &env->entities[slot];
+    int same = client->trace_n > 0 && ready && env->timestep == seen;
+    if (!same) {
+        sim_trace_push(client, agent->x, agent->y);
+    }
+}
+
+// Orthographic sheet centered on the followed car. fovy is the
+// vertical span. The short side of the window is SIM_CROP meters.
+static Camera3D ego_camera(Drive* env, float aspect) {
+    float x = 0.0f;
+    float y = 0.0f;
+    if (env->map_corners) {
+        x = 0.5f * (env->map_corners[0] + env->map_corners[2]);
+        y = 0.5f * (env->map_corners[1] + env->map_corners[3]);
+    }
+    int slot = env->selected_agent_idx;
+    if (sim_body_drawn(env, slot)) {
+        x = env->entities[slot].x;
+        y = env->entities[slot].y;
+    } else if (puf_record_enabled() && env->client && env->client->trace_n > 0) {
+        // The followed car was just parked at its goal. Hold the sheet
+        // on the last point so that frame shows the removal.
+        int i = env->client->trace_i - 1;
+        if (i < 0) {
+            i = SIM_TRACE - 1;
+        }
+        x = env->client->trace_x[i];
+        y = env->client->trace_y[i];
+    }
+    if (aspect < 0.05f) {
+        aspect = 1.0f;
+    }
+    float zoom = 1.0f;
+    if (env->client && env->client->camera_zoom > 0.0f) {
+        zoom = env->client->camera_zoom;
+    }
+    float span = SIM_CROP * zoom;
+    float fovy = span;
+    if (aspect < 1.0f) {
+        fovy = span / aspect;
+    }
+    Camera3D cam = {0};
+    cam.position = (Vector3){x, y, 400.0f};
+    cam.target = (Vector3){x, y, 0.0f};
+    cam.up = (Vector3){0.0f, -1.0f, 0.0f};
+    cam.fovy = fovy;
+    cam.projection = CAMERA_ORTHOGRAPHIC;
+    return cam;
+}
+
 static void sim_follow_camera(Drive* env) {
     Client* client = env->client;
     if (!env->sim_follow || !client || puf_record_enabled()) {
         return;
     }
-    if (env->active_agent_count <= 0 || !env->entities) {
-        return;
+    float aspect = 1.0f;
+    if (client->height > 1.0f) {
+        aspect = client->width / client->height;
     }
-    int slot = env->selected_agent_idx;
-    if (slot < 0 || slot >= env->active_agent_count) {
-        slot = 0;
-    }
-    Entity* agent = &env->entities[slot];
-    if (agent->x == INVALID_POSITION || agent->y == INVALID_POSITION) {
-        return;
-    }
-    float ox = client->camera.position.x - client->camera.target.x;
-    float oy = client->camera.position.y - client->camera.target.y;
-    float oz = client->camera.position.z - client->camera.target.z;
-    client->camera.target = (Vector3){agent->x, agent->y, 1.0f};
-    client->camera.position = (Vector3){
-        agent->x + ox, agent->y + oy, 1.0f + oz
-    };
-    client->camera.up = (Vector3){0.0f, -1.0f, 0.0f};
-    client->camera.fovy = 45.0f;
+    client->camera = ego_camera(env, aspect);
 }
 
 void draw_agent_obs(Drive* env, int agent_index) {
@@ -879,358 +1246,52 @@ void draw_agent_obs(Drive* env, int agent_index) {
     }
 }
 
-void draw_road_edge(Drive* env, float start_x, float start_y, float end_x, float end_y) {
-    Color CURB_TOP = (Color){168, 173, 178, 255};
-    Color CURB_SIDE = (Color){120, 125, 130, 255};
-    Color CURB_BOTTOM = (Color){90, 95, 100, 255};
-    float curb_height = 0.5f;
-    float curb_width = 0.3f;
-
-    Vector3 direction = {end_x - start_x, end_y - start_y, 0};
-    float length = sqrtf(direction.x * direction.x + direction.y * direction.y);
-    Vector3 nd = {direction.x / length, direction.y / length, 0};
-    Vector3 perp = {-nd.y, nd.x, 0};
-
-    Vector3 b1 = {start_x - perp.x * curb_width / 2, start_y - perp.y * curb_width / 2, 1.0f};
-    Vector3 b2 = {start_x + perp.x * curb_width / 2, start_y + perp.y * curb_width / 2, 1.0f};
-    Vector3 b3 = {end_x + perp.x * curb_width / 2, end_y + perp.y * curb_width / 2, 1.0f};
-    Vector3 b4 = {end_x - perp.x * curb_width / 2, end_y - perp.y * curb_width / 2, 1.0f};
-
-    DrawTriangle3D(b1, b2, b3, CURB_BOTTOM);
-    DrawTriangle3D(b1, b3, b4, CURB_BOTTOM);
-
-    Vector3 t1 = {b1.x, b1.y, b1.z + curb_height};
-    Vector3 t2 = {b2.x, b2.y, b2.z + curb_height};
-    Vector3 t3 = {b3.x, b3.y, b3.z + curb_height};
-    Vector3 t4 = {b4.x, b4.y, b4.z + curb_height};
-    DrawTriangle3D(t1, t3, t2, CURB_TOP);
-    DrawTriangle3D(t1, t4, t3, CURB_TOP);
-
-    DrawTriangle3D(b1, t1, b2, CURB_SIDE); DrawTriangle3D(t1, t2, b2, CURB_SIDE);
-    DrawTriangle3D(b2, t2, b3, CURB_SIDE); DrawTriangle3D(t2, t3, b3, CURB_SIDE);
-    DrawTriangle3D(b3, t3, b4, CURB_SIDE); DrawTriangle3D(t3, t4, b4, CURB_SIDE);
-    DrawTriangle3D(b4, t4, b1, CURB_SIDE); DrawTriangle3D(t4, t1, b1, CURB_SIDE);
-}
-
 static void draw_world(Drive* env, Client* client);
+static void draw_sheet(Drive* env);
+static void draw_sheet_overlay(Drive* env, Camera3D camera, int sw, int sh);
 static void puf_render_hud(Drive* env, Client* client);
 
-static int selected_slot(Drive* env) {
-    int slot = env->selected_agent_idx;
-    if (slot < 0 || slot >= env->active_agent_count) {
-        slot = 0;
-    }
-    return slot;
-}
-
-// Orthographic top-down of the whole map. fovy is the vertical span;
-// widen it when the map is wider than the panel.
-static Camera3D bev_camera(Drive* env, float aspect) {
-    float x0 = -40.0f;
-    float y0 = -40.0f;
-    float x1 = 40.0f;
-    float y1 = 40.0f;
-    if (env->map_corners) {
-        x0 = env->map_corners[0];
-        y0 = env->map_corners[1];
-        x1 = env->map_corners[2];
-        y1 = env->map_corners[3];
-    }
-    float map_w = fabsf(x1 - x0);
-    float map_h = fabsf(y1 - y0);
-    if (map_w < 1.0f) {
-        map_w = 1.0f;
-    }
-    if (map_h < 1.0f) {
-        map_h = 1.0f;
-    }
-    if (aspect < 0.05f) {
-        aspect = 0.05f;
-    }
-    float fovy = map_h;
-    if (map_w / aspect > fovy) {
-        fovy = map_w / aspect;
-    }
-    Camera3D cam = {0};
-    cam.position = (Vector3){0.5f * (x0 + x1), 0.5f * (y0 + y1), 400.0f};
-    cam.target = (Vector3){cam.position.x, cam.position.y, 0.0f};
-    cam.up = (Vector3){0.0f, -1.0f, 0.0f};
-    cam.fovy = fovy * 1.06f;
-    cam.projection = CAMERA_ORTHOGRAPHIC;
-    return cam;
-}
-
-// Chase the selected agent from behind and above. Same pose as the
-// interactive space-bar view.
-static Camera3D pov_camera(Drive* env) {
-    Camera3D cam = {0};
-    cam.up = (Vector3){0.0f, 0.0f, 1.0f};
-    cam.fovy = 60.0f;
-    cam.projection = CAMERA_PERSPECTIVE;
-    cam.position = (Vector3){0.0f, -25.0f, 15.0f};
-    cam.target = (Vector3){0.0f, 40.0f, 1.0f};
-    if (env->active_agent_count <= 0 || !env->entities) {
-        return cam;
-    }
-    Entity* agent = &env->entities[selected_slot(env)];
-    if (agent->x == INVALID_POSITION || agent->y == INVALID_POSITION) {
-        return cam;
-    }
-    float hx = cosf(agent->heading);
-    float hy = sinf(agent->heading);
-    cam.position = (Vector3){
-        agent->x - 25.0f * hx,
-        agent->y - 25.0f * hy,
-        15.0f
-    };
-    cam.target = (Vector3){
-        agent->x + 40.0f * hx,
-        agent->y + 40.0f * hy,
-        1.0f
-    };
-    return cam;
-}
-
-// Top-right of a recorded frame. The selected agent's observation, in
-// that car's frame. Forward is up and left is left. The crop is a fixed
-// 20 m half-width centered on the car, so it does not zoom. Center lanes
-// are muted, lane lines are purple, edges are amber. Boxes are filled
-// after the points so the cars cover them. Speed, target, and destination
-// sit under the crop. The target is green inside the speed band, red outside.
-static float record_scale(Drive* env) {
-    float h = 704.0f;
-    if (env->client && env->client->height > 1.0f) {
-        h = env->client->height;
-    }
-    return h / 704.0f;
-}
-
-static Rectangle record_agent_view(Drive* env) {
-    float ui = record_scale(env);
-    const float box_w = 300.0f * ui;
-    const float box_h = 366.0f * ui;
-    float screen_w = 1600.0f;
-    if (env->client && env->client->width > box_w + 24.0f * ui) {
-        screen_w = env->client->width;
-    }
-    Rectangle rect = {
-        screen_w - 12.0f * ui - box_w, 12.0f * ui, box_w, box_h
-    };
-    DrawRectangleRec(rect, CARD);
-    DrawRectangleLinesEx(rect, ui, LINE);
-
-    int slot = 0;
-    if (env->active_agent_count > 0) {
-        slot = selected_slot(env);
-    }
-    float* obs = NULL;
-    if (env->active_agent_count > 0 && slot < DRIVE_AGENT_MAX) {
-        obs = env->agents[slot].observations;
-    }
-    if (!obs) {
-        sim_sans(env, "no view", rect.x + 10.0f * ui, rect.y + 12.0f * ui,
-            16.0f * ui, MUTED);
-        return rect;
-    }
-
-    char title[64];
-    snprintf(title, sizeof(title), "Observation of agent %d", slot);
-    sim_sans(env, title, rect.x + 10.0f * ui, rect.y + 8.0f * ui,
-        15.0f * ui, INK);
-
-    int road0 = EGO_FEATURES + PARTNER_FEATURES * MAX_AGENTS;
-    const float range = 20.0f;
-    // Title on top. Speed, target, destination, and timestep sit under the crop.
-    const float foot = 80.0f * ui;
-    Rectangle plot = {
-        rect.x + 8.0f * ui, rect.y + 30.0f * ui,
-        rect.width - 16.0f * ui, rect.height - 38.0f * ui - foot
-    };
-    float side = plot.width;
-    if (plot.height < side) {
-        side = plot.height;
-    }
-    float ppm = (side * 0.5f) / range;
-    float cx = plot.x + plot.width * 0.5f;
-    float cy = plot.y + plot.height * 0.5f;
-
-    BeginScissorMode((int)plot.x, (int)plot.y,
-        (int)plot.width, (int)plot.height);
-    for (int pass = 0; pass < 3; pass++) {
-        for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
-            float* road = obs + road0 + k * ROAD_FEATURES;
-            if (road[0] == 0.0f && road[1] == 0.0f && road[2] == 0.0f) {
-                continue;
-            }
-            int kind = (int)(road[6] + 0.5f);
-            if (obs_road_layer(kind) != pass) {
-                continue;
-            }
-            float mid_f = road[0] / OBS_POSITION_SCALE;
-            float mid_l = road[1] / OBS_POSITION_SCALE;
-            DrawCircleV((Vector2){cx - mid_l * ppm, cy - mid_f * ppm},
-                3.4f * ui, obs_road_color(kind, 1));
-        }
-    }
-    for (int j = 0; j < MAX_AGENTS; j++) {
-        float* p = obs + EGO_FEATURES + j * PARTNER_FEATURES;
-        if (p[0] == 0.0f && p[1] == 0.0f
-                && p[2] == 0.0f && p[3] == 0.0f) {
-            continue;
-        }
-        float f = p[0] / OBS_POSITION_SCALE;
-        float l = p[1] / OBS_POSITION_SCALE;
-        float hw = p[2] * MAX_VEH_WIDTH * 0.5f;
-        float hl = p[3] * MAX_VEH_LEN * 0.5f;
-        if (hw < 0.4f) {
-            hw = 0.4f;
-        }
-        if (hl < 0.6f) {
-            hl = 0.6f;
-        }
-        float ang = atan2f(p[5], p[4]);
-        sim_obs_box(cx, cy, ppm, f, l, hl, hw,
-            cosf(ang), sinf(ang), 1.6f * ui, CORAL);
-    }
-    float ego_hw = obs[3] * MAX_VEH_WIDTH * 0.5f;
-    float ego_hl = obs[4] * MAX_VEH_LEN * 0.5f;
-    if (ego_hw < 0.4f) {
-        ego_hw = 0.4f;
-    }
-    if (ego_hl < 0.6f) {
-        ego_hl = 0.6f;
-    }
-    sim_obs_box(cx, cy, ppm, 0.0f, 0.0f, ego_hl, ego_hw,
-        1.0f, 0.0f, 2.0f * ui, STEEL);
-    sim_obs_arrow(cx, cy, ppm, 0.0f, 0.0f, 1.0f, 0.0f,
-        22.0f * ui / ppm, STEEL_INK);
-    EndScissorMode();
-    DrawRectangleLinesEx(plot, ui, LINE);
-
-    float spd = obs[2] / OBS_SPEED_SCALE;
-    int hit = obs[5] > 0.5f;
-    float gf = obs[0] / OBS_GOAL_SCALE;
-    float gl = obs[1] / OBS_GOAL_SCALE;
-    float gd = sqrtf(gf * gf + gl * gl);
-    float tx = rect.x + 10.0f * ui;
-    float ty = plot.y + plot.height + 6.0f * ui;
-    char cap[64];
-    snprintf(cap, sizeof(cap), "v %.1f%s", spd, hit ? "  hit" : "");
-    sim_sans(env, cap, tx, ty, 15.0f * ui, hit ? CRIMSON : INK);
-    float target = obs[EGO_TARGET_SPEED] / OBS_SPEED_SCALE;
-    char target_txt[64];
-    snprintf(target_txt, sizeof(target_txt), "target %.1f", target);
-    Color target_c = obs_speed_in_band(env, slot) ? SAGE_INK : CRIMSON;
-    sim_sans(env, target_txt, tx, ty + 18.0f * ui, 15.0f * ui, target_c);
-    char goal_txt[64];
-    if (gd >= 10.0f) {
-        snprintf(goal_txt, sizeof(goal_txt), "distance to dest. [%.0f m]", gd);
-    } else {
-        snprintf(goal_txt, sizeof(goal_txt), "distance to dest. [%.1f m]", gd);
-    }
-    sim_sans(env, goal_txt, tx, ty + 36.0f * ui, 13.0f * ui, SAGE_INK);
-    char step_txt[32];
-    snprintf(step_txt, sizeof(step_txt), "t %d", env->timestep);
-    sim_sans(env, step_txt, tx, ty + 54.0f * ui, 15.0f * ui, INK);
-    return rect;
-}
-
-// One framebuffer: scene BEV on the left, the selected agent's view on
-// the right. Each panel is its own target so the projection aspect matches
-// the panel instead of the full window. The top-right inset is the
-// observation, drawn after the panels so it sits on the chase view.
+// One square sheet. The clip ends when this car reaches its goal.
 static void record_views(Drive* env) {
     Client* client = env->client;
     int w = (int)client->width;
     int h = (int)client->height;
-    if (w < 2 || h < 2) {
+    if (w < 2 || h < 2 || client->record_n <= 0) {
         return;
     }
-    int left_w = w / 2;
-    int right_w = w - left_w;
-    if (!client->record_views) {
-        client->record_bev = LoadRenderTexture(left_w, h);
-        client->record_pov = LoadRenderTexture(right_w, h);
-        client->record_views = 1;
-    }
-    rlSetClipPlanes(0.05, 8000.0);
-    BeginTextureMode(client->record_bev);
+    int side = SIM_RECORD_SIDE;
+    int saved = env->selected_agent_idx;
+    env->selected_agent_idx = client->record_slot[0];
+    sim_record_install(client, 0);
+    int margin = SIM_RECORD_MARGIN;
+    int tex = side * SIM_RECORD_SS;
+    sheet_hi_ensure(tex);
+    Camera3D sheet = ego_camera(env, 1.0f);
+    sheet.fovy *= SIM_RECORD_ZOOM;
+    BeginTextureMode(sheet_hi);
     ClearBackground(PAPER);
-    BeginMode3D(bev_camera(env, (float)left_w / (float)h));
-    draw_world(env, client);
+    BeginMode3D(sheet);
+    draw_sheet(env);
     EndMode3D();
     EndTextureMode();
-
-    BeginTextureMode(client->record_pov);
-    ClearBackground(PAPER);
-    BeginMode3D(pov_camera(env));
-    draw_world(env, client);
-    EndMode3D();
-    EndTextureMode();
-
     BeginDrawing();
     ClearBackground(PAPER);
-    DrawTexturePro(client->record_bev.texture,
-        (Rectangle){0, 0, (float)left_w, (float)-h},
-        (Rectangle){0, 0, (float)left_w, (float)h},
-        (Vector2){0, 0}, 0.0f, WHITE);
-    DrawTexturePro(client->record_pov.texture,
-        (Rectangle){0, 0, (float)right_w, (float)-h},
-        (Rectangle){(float)left_w, 0, (float)right_w, (float)h},
-        (Vector2){0, 0}, 0.0f, WHITE);
-    float ui = record_scale(env);
-    DrawRectangle(left_w - (int)ui, 0, (int)(2.0f * ui), h, INK);
-    record_agent_view(env);
-    sim_sans(env, "Full simulator state", 16.0f * ui, 14.0f * ui, 20.0f * ui, INK);
+    DrawTexturePro(sheet_hi.texture,
+        (Rectangle){0.0f, 0.0f, (float)tex, -(float)tex},
+        (Rectangle){(float)margin, (float)margin, (float)side, (float)side},
+        (Vector2){0.0f, 0.0f}, 0.0f, WHITE);
+    sheet_origin_x = margin;
+    sheet_origin_y = margin;
+    draw_sheet_overlay(env, sheet, side, side);
+    sheet_origin_x = 0;
+    sheet_origin_y = 0;
+    DrawRectangleLinesEx((Rectangle){
+        (float)margin + 0.5f, (float)margin + 0.5f,
+        (float)side - 1.0f, (float)side - 1.0f
+    }, 1.0f, BOX_EDGE);
+    env->selected_agent_idx = saved;
     EndDrawing();
     puf_record_capture(w, h);
-}
-
-static void draw_goal_disc(float x, float y, float radius) {
-    const int n = 48;
-    const float z = 0.3f;
-    Color fill = SAGE;
-    fill.a = 96;
-    Vector3 c = {x, y, z};
-    float inner = radius - 0.25f;
-    if (inner < 0.0f) {
-        inner = 0.0f;
-    }
-    for (int k = 0; k < n; k++) {
-        float a0 = (float)k * 2.0f * PI / (float)n;
-        float a1 = (float)(k + 1) * 2.0f * PI / (float)n;
-        float c0 = cosf(a0);
-        float s0 = sinf(a0);
-        float c1 = cosf(a1);
-        float s1 = sinf(a1);
-        Vector3 p0 = {x + c0 * radius, y + s0 * radius, z};
-        Vector3 p1 = {x + c1 * radius, y + s1 * radius, z};
-        Vector3 q0 = {x + c0 * inner, y + s0 * inner, z};
-        Vector3 q1 = {x + c1 * inner, y + s1 * inner, z};
-        DrawTriangle3D(c, p0, p1, fill);
-        DrawTriangle3D(q0, p0, p1, SAGE_INK);
-        DrawTriangle3D(q0, p1, q1, SAGE_INK);
-    }
-}
-
-static void draw_goal_markers(Drive* env) {
-    if (IsKeyDown(KEY_LEFT_CONTROL)) {
-        return;
-    }
-    rlDisableDepthTest();
-    for (int i = 0; i < env->active_agent_count; i++) {
-        Entity* e = &env->entities[i];
-        if ((e->type != VEHICLE && e->type != TRUCK) || e->valid == 0) {
-            continue;
-        }
-        if (e->goal_position_x == INVALID_POSITION
-            || e->goal_position_y == INVALID_POSITION) {
-            continue;
-        }
-        draw_goal_disc(e->goal_position_x, e->goal_position_y,
-            MIN_DISTANCE_TO_GOAL);
-    }
-    rlEnableDepthTest();
 }
 
 void puf_render(Drive* env) {
@@ -1245,6 +1306,7 @@ void puf_render(Drive* env) {
             env->client->height = (float)sh;
         }
     }
+    sim_choose_ego(env);
     if (puf_record_enabled()) {
         record_views(env);
         return;
@@ -1255,39 +1317,168 @@ void puf_render(Drive* env) {
     ClearBackground(PAPER);
     handle_camera_controls(env);
     sim_follow_camera(env);
-    BeginMode3D(client->camera);
-    draw_world(env, client);
-    EndMode3D();
+    if (env->sim_follow) {
+        BeginMode3D(client->camera);
+        draw_sheet(env);
+        EndMode3D();
+        draw_sheet_overlay(env, client->camera,
+            (int)client->width, (int)client->height);
+    } else {
+        BeginMode3D(client->camera);
+        draw_world(env, client);
+        EndMode3D();
+    }
     puf_render_hud(env, client);
 }
 
-static void draw_world(Drive* env, Client* client) {
-    if (env->map_corners) {
-        DrawLine3D((Vector3){env->map_corners[0], env->map_corners[1], 0}, (Vector3){env->map_corners[2], env->map_corners[1], 0}, STEEL);
-        DrawLine3D((Vector3){env->map_corners[0], env->map_corners[1], 0}, (Vector3){env->map_corners[0], env->map_corners[3], 0}, STEEL);
-        DrawLine3D((Vector3){env->map_corners[2], env->map_corners[1], 0}, (Vector3){env->map_corners[2], env->map_corners[3], 0}, STEEL);
-        DrawLine3D((Vector3){env->map_corners[0], env->map_corners[3], 0}, (Vector3){env->map_corners[2], env->map_corners[3], 0}, STEEL);
+static Color road_color(int type) {
+    if (type == ROAD_LINE) {
+        return LANE_YELLOW;
     }
+    if (type == ROAD_EDGE) {
+        return EDGE_GREY;
+    }
+    return LANE_GREY;
+}
 
-    for (int i = 0; i < env->num_entities; i++) {
-        if (env->entities[i].type < ROAD_LANE
-            || env->entities[i].type > ROAD_EDGE) {
+static int paint_agent_hit(Drive* env, int i) {
+    if (env->entities[i].collision_state == AGENT_COLLISION) {
+        return 1;
+    }
+    int n = env->active_agent_count;
+    if (n > DRIVE_AGENT_MAX) {
+        n = DRIVE_AGENT_MAX;
+    }
+    for (int j = 0; j < n; j++) {
+        if (j == i) {
             continue;
         }
+        if (env->entities[j].collision_state == AGENT_COLLISION
+                && drive_hit_with[j] == i) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int paint_edge_hit(Drive* env, int i) {
+    Entity* car = &env->entities[i];
+    if (car->offroad_state) {
+        return 1;
+    }
+    return car->collision_state == OFFROAD;
+}
+
+static void car_paint(Drive* env, int i, Color* fill, Color* edge) {
+    if (paint_agent_hit(env, i)) {
+        *fill = HIT_RED;
+        *edge = HIT_RED_EDGE;
+        return;
+    }
+    if (paint_edge_hit(env, i)) {
+        *fill = OFFROAD_ORANGE;
+        *edge = OFFROAD_ORANGE_EDGE;
+        return;
+    }
+    *edge = BOX_EDGE;
+    if (i == env->selected_agent_idx) {
+        *fill = EGO_BLUE;
+        return;
+    }
+    if (i < env->active_agent_count) {
+        *fill = POLICY_BLUE;
+        return;
+    }
+    *fill = REPLAY_GREY;
+}
+
+static void draw_flat_car(float x, float y, float heading,
+        float length, float width, Color fill, Color edge) {
+    float hx = cosf(heading);
+    float hy = sinf(heading);
+    float px = -hy;
+    float py = hx;
+    float hl = length * 0.5f;
+    float hw = width * 0.5f;
+    if (hl < 0.8f) {
+        hl = 0.8f;
+    }
+    if (hw < 0.4f) {
+        hw = 0.4f;
+    }
+    float fx[4] = {hl, hl, -hl, -hl};
+    float fy[4] = {hw, -hw, -hw, hw};
+    Vector3 c[4];
+    for (int k = 0; k < 4; k++) {
+        c[k] = (Vector3){
+            x + fx[k] * hx + fy[k] * px,
+            y + fx[k] * hy + fy[k] * py,
+            0.4f
+        };
+    }
+    DrawTriangle3D(c[0], c[1], c[2], fill);
+    DrawTriangle3D(c[0], c[2], c[3], fill);
+    DrawTriangle3D(c[0], c[2], c[1], fill);
+    DrawTriangle3D(c[0], c[3], c[2], fill);
+    for (int k = 0; k < 4; k++) {
+        DrawLine3D(c[k], c[(k + 1) % 4], edge);
+    }
+}
+
+// Thin stroke under the followed car, about the width of a lane line.
+static void draw_trace_segment(float x0, float y0, float x1, float y1) {
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len < 1.0e-3f) {
+        return;
+    }
+    float half = 0.16f;
+    float px = -dy / len * half;
+    float py = dx / len * half;
+    float z = 0.22f;
+    Vector3 a = {x0 + px, y0 + py, z};
+    Vector3 b = {x0 - px, y0 - py, z};
+    Vector3 c = {x1 - px, y1 - py, z};
+    Vector3 d = {x1 + px, y1 + py, z};
+    DrawTriangle3D(a, b, c, EGO_BLUE);
+    DrawTriangle3D(a, c, d, EGO_BLUE);
+    DrawTriangle3D(a, c, b, EGO_BLUE);
+    DrawTriangle3D(a, d, c, EGO_BLUE);
+}
+
+static void draw_ego_trace(Client* client) {
+    if (!client || client->trace_n < 2) {
+        return;
+    }
+    int start = 0;
+    if (client->trace_n == SIM_TRACE) {
+        start = client->trace_i;
+    }
+    for (int k = 1; k < client->trace_n; k++) {
+        int a = (start + k - 1) % SIM_TRACE;
+        int b = (start + k) % SIM_TRACE;
+        draw_trace_segment(
+            client->trace_x[a], client->trace_y[a],
+            client->trace_x[b], client->trace_y[b]);
+    }
+}
+
+static void draw_world(Drive* env, Client* client) {
+    for (int i = 0; i < env->num_entities; i++) {
+        int type = env->entities[i].type;
+        if (type < ROAD_LANE || type > ROAD_EDGE) {
+            continue;
+        }
+        Color line = road_color(type);
         for (int j = 0; j < env->entities[i].array_size - 1; j++) {
             float ax = env->entities[i].pts_x[j];
             float ay = env->entities[i].pts_y[j];
             float bx = env->entities[i].pts_x[j + 1];
             float by = env->entities[i].pts_y[j + 1];
-            if (env->entities[i].type == ROAD_EDGE) {
-                if (!IsKeyDown(KEY_LEFT_CONTROL)) {
-                    draw_road_edge(env, ax, ay, bx, by);
-                }
+            if (ax == INVALID_POSITION || ay == INVALID_POSITION
+                    || bx == INVALID_POSITION || by == INVALID_POSITION) {
                 continue;
-            }
-            Color line = (Color){120, 120, 120, 255};
-            if (env->entities[i].type == ROAD_LANE) {
-                line = (Color){180, 180, 180, 255};
             }
             DrawLine3D(
                 (Vector3){ax, ay, 0.05f},
@@ -1295,121 +1486,449 @@ static void draw_world(Drive* env, Client* client) {
                 line);
         }
     }
-
-    // One line per cell edge, under the lane marks. A wire box on every
-    // cell sat on the cars and took a draw call per cell.
-    if (!puf_record_enabled() && env->map_corners) {
-        float x0 = env->map_corners[0];
-        float y0 = env->map_corners[1];
-        float x1 = env->map_corners[2];
-        float y1 = env->map_corners[3];
-        float z = 0.02f;
-        for (int i = 0; i <= env->grid_cols; i++) {
-            float x = x0 + i * GRID_CELL_SIZE;
-            DrawLine3D((Vector3){x, y0, z}, (Vector3){x, y1, z}, GRID);
+    rlDisableDepthTest();
+    draw_ego_trace(client);
+    rlDisableBackfaceCulling();
+    for (int i = 0; i < env->body_count; i++) {
+        Entity* car = &env->entities[i];
+        int kind = car->type == VEHICLE || car->type == TRUCK;
+        if (!kind || car->valid == 0
+                || car->x == INVALID_POSITION
+                || car->y == INVALID_POSITION) {
+            continue;
         }
-        for (int j = 0; j <= env->grid_rows; j++) {
-            float y = y0 + j * GRID_CELL_SIZE;
-            DrawLine3D((Vector3){x0, y, z}, (Vector3){x1, y, z}, GRID);
+        Color fill = REPLAY_GREY;
+        Color edge = BOX_EDGE;
+        car_paint(env, i, &fill, &edge);
+        draw_flat_car(car->x, car->y, car->heading,
+            car->length, car->width, fill, edge);
+    }
+    rlEnableBackfaceCulling();
+    rlEnableDepthTest();
+}
+
+static Vector2 sheet_point(Camera3D camera, int sw, int sh, float x, float y) {
+    Vector2 p = GetWorldToScreenEx((Vector3){x, y, 0.0f}, camera, sw, sh);
+    p.x += (float)sheet_origin_x;
+    p.y += (float)sheet_origin_y;
+    return p;
+}
+
+static float sheet_ppm(Camera3D camera, int sw, int sh) {
+    Vector2 a = sheet_point(camera, sw, sh, camera.target.x, camera.target.y);
+    Vector2 b = sheet_point(camera, sw, sh, camera.target.x + 1.0f, camera.target.y);
+    float dx = b.x - a.x;
+    float dy = b.y - a.y;
+    return sqrtf(dx * dx + dy * dy);
+}
+
+static int sheet_on_screen(Vector2 p, int sw, int sh) {
+    float x = p.x - (float)sheet_origin_x;
+    float y = p.y - (float)sheet_origin_y;
+    return x >= -80.0f && y >= -80.0f && x <= (float)sw + 80.0f
+        && y <= (float)sh + 80.0f;
+}
+
+static void tri_both(Vector3 a, Vector3 b, Vector3 c, Color color) {
+    DrawTriangle3D(a, b, c, color);
+    DrawTriangle3D(a, c, b, color);
+}
+
+static void quad_z(float x0, float y0, float x1, float y1,
+        float x2, float y2, float x3, float y3, float z, Color color) {
+    Vector3 a = {x0, y0, z};
+    Vector3 b = {x1, y1, z};
+    Vector3 c = {x2, y2, z};
+    Vector3 d = {x3, y3, z};
+    tri_both(a, b, c, color);
+    tri_both(a, c, d, color);
+}
+
+// Offset from a polyline vertex. Sharp corners are clamped so the join
+// stays a short bevel instead of a spike.
+static void ribbon_sides(float x0, float y0, float x1, float y1, float x2, float y2,
+        int has_prev, int has_next, float half,
+        float* lx, float* ly, float* rx, float* ry) {
+    float ax = 0.0f;
+    float ay = 0.0f;
+    float bx = 0.0f;
+    float by = 0.0f;
+    if (has_prev) {
+        float dx = x1 - x0;
+        float dy = y1 - y0;
+        float len = sqrtf(dx * dx + dy * dy);
+        if (len > 1.0e-5f) {
+            ax = dx / len;
+            ay = dy / len;
         }
     }
-    draw_goal_markers(env);
+    if (has_next) {
+        float dx = x2 - x1;
+        float dy = y2 - y1;
+        float len = sqrtf(dx * dx + dy * dy);
+        if (len > 1.0e-5f) {
+            bx = dx / len;
+            by = dy / len;
+        }
+    }
+    if (!has_prev) {
+        ax = bx;
+        ay = by;
+    }
+    if (!has_next) {
+        bx = ax;
+        by = ay;
+    }
+    float nax = -ay;
+    float nay = ax;
+    float nbx = -by;
+    float nby = bx;
+    float mx = nax + nbx;
+    float my = nay + nby;
+    float mlen = sqrtf(mx * mx + my * my);
+    if (mlen < 1.0e-4f) {
+        mx = nax;
+        my = nay;
+    } else {
+        mx /= mlen;
+        my /= mlen;
+    }
+    float dot = nax * mx + nay * my;
+    if (dot < 0.35f) {
+        dot = 0.35f;
+    }
+    float scale = half / dot;
+    *lx = x1 + mx * scale;
+    *ly = y1 + my * scale;
+    *rx = x1 - mx * scale;
+    *ry = y1 - my * scale;
+}
 
+static void draw_ribbon(const float* xs, const float* ys, int n,
+        float width, float z, Color color) {
+    if (n < 2 || width <= 0.0f) {
+        return;
+    }
+    float half = width * 0.5f;
+    float plx = 0.0f;
+    float ply = 0.0f;
+    float prx = 0.0f;
+    float pry = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float x0 = xs[i];
+        float y0 = ys[i];
+        float x2 = xs[i];
+        float y2 = ys[i];
+        if (i > 0) {
+            x0 = xs[i - 1];
+            y0 = ys[i - 1];
+        }
+        if (i + 1 < n) {
+            x2 = xs[i + 1];
+            y2 = ys[i + 1];
+        }
+        float lx, ly, rx, ry;
+        ribbon_sides(x0, y0, xs[i], ys[i], x2, y2, i > 0, i + 1 < n, half,
+            &lx, &ly, &rx, &ry);
+        if (i > 0) {
+            quad_z(plx, ply, prx, pry, rx, ry, lx, ly, z, color);
+        }
+        plx = lx;
+        ply = ly;
+        prx = rx;
+        pry = ry;
+    }
+}
+
+static float rib_x[8192];
+static float rib_y[8192];
+
+static void draw_sheet_roads(Drive* env) {
     for (int i = 0; i < env->num_entities; i++) {
-        // Draw vehicles
-        if (i < env->active_agent_count
-                && (env->entities[i].type == VEHICLE || env->entities[i].type == TRUCK)) {
-            int agent_index = i;
-            if (env->entities[i].x == INVALID_POSITION
-                || env->entities[i].y == INVALID_POSITION) {
-                continue;
-            }
-
-            Vector3 position = {env->entities[i].x, env->entities[i].y, 1};
-            float heading = env->entities[i].heading;
-            Vector3 size = {env->entities[i].length, env->entities[i].width, env->entities[i].height};
-
-            rlPushMatrix();
-            rlTranslatef(position.x, position.y, position.z);
-            rlRotatef(heading * RAD2DEG, 0.0f, 0.0f, 1.0f);
-
-            Model car_model = client->cars[client->car_assignments[i]];
-            Color car_tint = WHITE;
-            if (env->entities[i].collision_state > NO_COLLISION) {
-                car_tint = CRIMSON;
-            } else if (puf_record_enabled()
-                    && agent_index == env->selected_agent_idx) {
-                car_tint = STEEL;
-            }
-
-            // The marker floats 8 m above the car. Skip it in the chase shot
-            // so it does not fill the zoomed frame.
-            if (!puf_record_enabled()
-                && agent_index == env->selected_agent_idx
-                && !env->entities[agent_index].reached_goal) {
-                draw_agent_obs(env, agent_index);
-            }
-
-            BoundingBox bounds = GetModelBoundingBox(car_model);
-            Vector3 model_size = {
-                bounds.max.x - bounds.min.x,
-                bounds.max.y - bounds.min.y,
-                bounds.max.z - bounds.min.z
-            };
-            // glb files are Y-up. The 90° turn about X maps model Y to
-            // world Z and model Z to world Y. Length stays on X.
-            Vector3 scale = {
-                size.x / model_size.x,
-                size.z / model_size.y,
-                size.y / model_size.z,
-            };
-            DrawModelEx(car_model, (Vector3){0, 0, 0}, (Vector3){1, 0, 0}, 90.0f, scale, car_tint);
-            rlPopMatrix();
-
-            // Draw collision box
-            float cos_h = env->entities[i].heading_x;
-            float sin_h = env->entities[i].heading_y;
-            float hl = env->entities[i].length * 0.5f;
-            float hw = env->entities[i].width * 0.5f;
-            Vector3 corners[4] = {
-                {position.x + (hl * cos_h - hw * sin_h), position.y + (hl * sin_h + hw * cos_h), position.z},
-                {position.x + (hl * cos_h + hw * sin_h), position.y + (hl * sin_h - hw * cos_h), position.z},
-                {position.x + (-hl * cos_h - hw * sin_h), position.y + (-hl * sin_h + hw * cos_h), position.z},
-                {position.x + (-hl * cos_h + hw * sin_h), position.y + (-hl * sin_h - hw * cos_h), position.z}
-            };
-            for (int j = 0; j < 4; j++) {
-                DrawLine3D(corners[j], corners[(j + 1) % 4], STEEL_INK);
-            }
-            if (puf_record_enabled() && agent_index == env->selected_agent_idx) {
-                DrawCircle3D((Vector3){position.x, position.y, 0.35f},
-                    2.4f, (Vector3){0.0f, 0.0f, 1.0f}, 90.0f, STEEL_INK);
-            }
-
-            // FPV camera
-            if (IsKeyDown(KEY_SPACE) && env->selected_agent_idx == agent_index) {
-                if (env->entities[agent_index].reached_goal) {
-                    env->selected_agent_idx = rand_r(&env->rng) % env->active_agent_count;
-                }
-                client->camera.position = (Vector3){
-                    position.x - 25.0f * cosf(heading),
-                    position.y - 25.0f * sinf(heading),
-                    position.z + 15
-                };
-                client->camera.target = (Vector3){
-                    position.x + 40.0f * cosf(heading),
-                    position.y + 40.0f * sinf(heading),
-                    position.z - 5.0f
-                };
-                client->camera.up = (Vector3){0, 0, 1};
-            }
-            if (IsKeyReleased(KEY_SPACE)) {
-                client->camera.position = client->default_camera_position;
-                client->camera.target = client->default_camera_target;
-                client->camera.up = (Vector3){0, 0, 1};
-            }
-
+        int type = env->entities[i].type;
+        if (type < ROAD_LANE || type > ROAD_EDGE) {
+            continue;
         }
+        float width = 0.16f;
+        float z = 0.05f;
+        if (type == ROAD_LINE) {
+            width = 0.13f;
+            z = 0.06f;
+        } else if (type == ROAD_EDGE) {
+            width = 0.28f;
+            z = 0.07f;
+        }
+        Color line = road_color(type);
+        int n = 0;
+        int count = env->entities[i].array_size;
+        for (int j = 0; j < count; j++) {
+            float x = env->entities[i].pts_x[j];
+            float y = env->entities[i].pts_y[j];
+            int bad = x == INVALID_POSITION || y == INVALID_POSITION;
+            if (bad || n == 8192) {
+                draw_ribbon(rib_x, rib_y, n, width, z, line);
+                n = 0;
+                if (bad) {
+                    continue;
+                }
+            }
+            rib_x[n] = x;
+            rib_y[n] = y;
+            n++;
+        }
+        draw_ribbon(rib_x, rib_y, n, width, z, line);
     }
+}
+
+static void draw_oriented_box(float x, float y, float heading,
+        float length, float width, float z, Color color) {
+    float hx = cosf(heading);
+    float hy = sinf(heading);
+    float px = -hy;
+    float py = hx;
+    float hl = length * 0.5f;
+    float hw = width * 0.5f;
+    float fx[4] = {hl, hl, -hl, -hl};
+    float fy[4] = {hw, -hw, -hw, hw};
+    Vector3 c[4];
+    for (int k = 0; k < 4; k++) {
+        c[k] = (Vector3){
+            x + fx[k] * hx + fy[k] * px,
+            y + fx[k] * hy + fy[k] * py,
+            z
+        };
+    }
+    tri_both(c[0], c[1], c[2], color);
+    tri_both(c[0], c[2], c[3], color);
+}
+
+// Filled box and a filled heading arrow. The outline is a slightly
+// larger box under the fill, so the edge stays a constant width.
+static void draw_sheet_car(Drive* env, int i) {
+    Entity* car = &env->entities[i];
+    Color fill = REPLAY_GREY;
+    Color edge = BOX_EDGE;
+    car_paint(env, i, &fill, &edge);
+    float length = car->length;
+    float width = car->width;
+    if (length < 0.6f) {
+        length = 0.6f;
+    }
+    if (width < 0.5f) {
+        width = 0.5f;
+    }
+    float outline = 0.10f;
+    draw_oriented_box(car->x, car->y, car->heading,
+        length + outline * 2.0f, width + outline * 2.0f, 0.80f, edge);
+    draw_oriented_box(car->x, car->y, car->heading,
+        length, width, 0.90f, fill);
+    float hx = cosf(car->heading);
+    float hy = sinf(car->heading);
+    float half = length * 0.5f;
+    float z = 1.15f;
+    Color mark = INK;
+    float head = 0.70f;
+    float tip_x = car->x + hx * (half + 1.05f);
+    float tip_y = car->y + hy * (half + 1.05f);
+    float base_x = tip_x - hx * head;
+    float base_y = tip_y - hy * head;
+    float wing = head * 0.42f;
+    float shaft = 0.12f;
+    float sx = -hy * shaft;
+    float sy = hx * shaft;
+    float tail = half * 0.15f;
+    quad_z(car->x + hx * tail + sx, car->y + hy * tail + sy,
+        car->x + hx * tail - sx, car->y + hy * tail - sy,
+        base_x - sx, base_y - sy, base_x + sx, base_y + sy, z, mark);
+    Vector3 tip = {tip_x, tip_y, z};
+    Vector3 left = {base_x - hy * wing, base_y + hx * wing, z};
+    Vector3 right = {base_x + hy * wing, base_y - hx * wing, z};
+    tri_both(tip, left, right, mark);
+}
+
+static void draw_disk(float x, float y, float radius, float z, int seg, Color color) {
+    if (radius <= 0.0f) {
+        return;
+    }
+    Vector3 center = {x, y, z};
+    float step = 2.0f * PI / (float)seg;
+    for (int i = 0; i < seg; i++) {
+        float a0 = step * (float)i;
+        float a1 = step * (float)(i + 1);
+        Vector3 p0 = {x + cosf(a0) * radius, y + sinf(a0) * radius, z};
+        Vector3 p1 = {x + cosf(a1) * radius, y + sinf(a1) * radius, z};
+        tri_both(center, p0, p1, color);
+    }
+}
+
+static void draw_annulus(float x, float y, float inner, float outer,
+        float z, int seg, Color color) {
+    if (outer <= inner || inner < 0.0f) {
+        return;
+    }
+    float step = 2.0f * PI / (float)seg;
+    for (int i = 0; i < seg; i++) {
+        float a0 = step * (float)i;
+        float a1 = step * (float)(i + 1);
+        float c0 = cosf(a0);
+        float s0 = sinf(a0);
+        float c1 = cosf(a1);
+        float s1 = sinf(a1);
+        quad_z(
+            x + c0 * inner, y + s0 * inner,
+            x + c0 * outer, y + s0 * outer,
+            x + c1 * outer, y + s1 * outer,
+            x + c1 * inner, y + s1 * inner,
+            z, color);
+    }
+}
+
+// Goal of the followed car. It stays after that car is parked.
+static void draw_sheet_goal(Drive* env) {
+    int slot = env->selected_agent_idx;
+    if (!env->entities || slot < 0 || slot >= env->active_agent_count) {
+        return;
+    }
+    Entity* car = &env->entities[slot];
+    if (car->goals_sampled <= 0) {
+        return;
+    }
+    float gx = car->goal_position_x;
+    float gy = car->goal_position_y;
+    if (gx == INVALID_POSITION || gy == INVALID_POSITION) {
+        return;
+    }
+    float reach = MIN_DISTANCE_TO_GOAL;
+    if (env->goal_radius > 0.0f) {
+        reach = env->goal_radius;
+    }
+    float z = 1.25f;
+    draw_annulus(gx, gy, reach - 0.16f, reach + 0.06f, z, 96, EGO_BLUE);
+    draw_disk(gx, gy, 0.55f, z, 24, EGO_BLUE);
+}
+
+// Logged pose of the followed car, under its controlled box.
+static void draw_sheet_ghosts(Drive* env) {
+    if (!env->gt_x || env->gt_n <= 0 || env->gt_len <= 0) {
+        return;
+    }
+    int i = env->selected_agent_idx;
+    if (i < 0 || i >= env->gt_n || i >= env->active_agent_count) {
+        return;
+    }
+    int frame = env->init_steps + env->timestep;
+    if (frame < 0 || frame >= env->gt_len) {
+        return;
+    }
+    int k = i * env->gt_len + frame;
+    if (!env->gt_v[k]) {
+        return;
+    }
+    float x = env->gt_x[k];
+    float y = env->gt_y[k];
+    if (x == INVALID_POSITION || y == INVALID_POSITION) {
+        return;
+    }
+    Entity* car = &env->entities[i];
+    float length = car->length;
+    float width = car->width;
+    if (length < 0.6f) {
+        length = 0.6f;
+    }
+    if (width < 0.5f) {
+        width = 0.5f;
+    }
+    float outline = 0.10f;
+    float heading = env->gt_h[k];
+    draw_oriented_box(x, y, heading,
+        length + outline * 2.0f, width + outline * 2.0f,
+        0.50f, GHOST_GREEN_EDGE);
+    draw_oriented_box(x, y, heading, length, width, 0.60f, GHOST_GREEN);
+}
+
+// Top-down sheet drawn inside BeginMode3D. Marks are filled ribbons
+// so the joins stay smooth. The palette stays the light one.
+static void draw_sheet(Drive* env) {
+    rlDisableBackfaceCulling();
+    rlDisableDepthTest();
+    draw_sheet_roads(env);
+    draw_ego_trace(env->client);
+    draw_sheet_ghosts(env);
+    for (int i = 0; i < env->body_count; i++) {
+        Entity* car = &env->entities[i];
+        int kind = car->type == VEHICLE || car->type == TRUCK;
+        if (!kind || car->valid == 0
+                || car->x == INVALID_POSITION
+                || car->y == INVALID_POSITION) {
+            continue;
+        }
+        draw_sheet_car(env, i);
+    }
+    draw_sheet_goal(env);
+    rlEnableDepthTest();
+    rlEnableBackfaceCulling();
+}
+
+static void draw_halo(Drive* env, const char* text, float x, float y, float size) {
+    float pad = size * 0.06f;
+    if (pad < 1.0f) {
+        pad = 1.0f;
+    }
+    sim_sans(env, text, x - pad, y, size, PAPER);
+    sim_sans(env, text, x + pad, y, size, PAPER);
+    sim_sans(env, text, x, y - pad, size, PAPER);
+    sim_sans(env, text, x, y + pad, size, PAPER);
+    sim_sans(env, text, x, y, size, INK);
+}
+
+// Screen-space labels. The record path never reaches the HUD.
+static void draw_sheet_overlay(Drive* env, Camera3D camera, int sw, int sh) {
+    float ppm = sheet_ppm(camera, sw, sh);
+    Font font = sim_font(env);
+    float size = ppm * 0.72f;
+    if (size < 14.0f) {
+        size = 14.0f;
+    }
+    if (size > 36.0f) {
+        size = 36.0f;
+    }
+    for (int i = 0; i < env->body_count; i++) {
+        Entity* car = &env->entities[i];
+        int kind = car->type == VEHICLE || car->type == TRUCK;
+        if (!kind || car->valid == 0
+                || car->x == INVALID_POSITION
+                || car->y == INVALID_POSITION) {
+            continue;
+        }
+        float lx = car->x;
+        float ly = car->y;
+        float spd = sqrtf(car->vx * car->vx + car->vy * car->vy);
+        float back = car->length * 0.5f;
+        if (back < 0.3f) {
+            back = 0.3f;
+        }
+        back += size / ppm + 0.35f;
+        if (spd > 0.5f) {
+            lx -= car->vx / spd * back;
+            ly -= car->vy / spd * back;
+        }
+        Vector2 s = sheet_point(camera, sw, sh, lx, ly);
+        if (!sheet_on_screen(s, sw, sh)) {
+            continue;
+        }
+        char label[16];
+        snprintf(label, sizeof(label), "%d", i);
+        Vector2 tw = MeasureTextEx(font, label, size, 0.4f);
+        draw_halo(env, label, s.x - tw.x * 0.5f, s.y - tw.y * 0.5f, size);
+    }
+    char step[32];
+    snprintf(step, sizeof(step), "t = %d", env->timestep);
+    float title = (float)sh * 0.055f;
+    if (title < 40.0f) {
+        title = 40.0f;
+    }
+    draw_halo(env, step, 18.0f + (float)sheet_origin_x,
+        14.0f + (float)sheet_origin_y, title);
 }
 
 static void puf_render_hud(Drive* env, Client* client) {
@@ -1431,6 +1950,11 @@ static void puf_render_hud(Drive* env, Client* client) {
 }
 
 void close_client(Client* client) {
+    if (sheet_hi.id != 0) {
+        UnloadRenderTexture(sheet_hi);
+        sheet_hi.id = 0;
+        sheet_hi_side = 0;
+    }
     if (client->record_views) {
         UnloadRenderTexture(client->record_bev);
         UnloadRenderTexture(client->record_pov);

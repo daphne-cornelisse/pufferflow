@@ -5,7 +5,6 @@
 #include <unistd.h>
 #include <math.h>
 #include <assert.h>
-#include <errno.h>
 #include <string.h>
 #include "raylib.h"
 typedef float obs_t;
@@ -101,13 +100,6 @@ typedef struct Entity {
     float path_lon;
     int path_n;
 } Entity;
-
-void free_entity(Entity* entity) {
-    free(entity->pts_x);
-    free(entity->pts_y);
-    entity->pts_x = NULL;
-    entity->pts_y = NULL;
-}
 
 float relative_distance_2d(float x1, float y1, float x2, float y2) {
     float dx = x2 - x1;
@@ -273,6 +265,11 @@ struct Env {
     // control_mode picks who is spawned. max_controlled caps mixed play.
     LogSpawn* spawns;
     int spawn_n;
+    // Invalid at init_steps. Not controlled. They follow the log.
+    LogSpawn* ghosts;
+    int ghost_n;
+    // 0 skips that replay. Offline labeling places those tracks.
+    int replay_invalid;
     int log_spawn;
     // State count of this log. 0 on a road map. Waymo is 91.
     int log_traj;
@@ -292,11 +289,12 @@ struct Env {
     float* wosac_x;
     float* wosac_y;
     float* wosac_h;
-    // Policy cars plus log-replay partners. Equal to active_agent_count
-    // except in human-replay, where partners sit past the policy slots.
+    // Policy cars plus log-replay bodies. Equal to active_agent_count
+    // except when partners sit past the policy slots.
     int body_count;
-    // Logged poses for human-replay, centered with the roads. Index
-    // spawn * replay_len + frame. Empty unless control_sdc_only.
+    // Logged poses, centered with the roads. Index is
+    // series * replay_len + frame. Human-replay stores every spawn,
+    // including the self-driving car. Training stores ghosts only.
     int replay_len;
     float* replay_x;
     float* replay_y;
@@ -304,6 +302,15 @@ struct Env {
     float* replay_vx;
     float* replay_vy;
     unsigned char* replay_v;
+    // Logged pose of each policy car, same centering as the roads.
+    // Index is agent * gt_len + frame. Drawing only. The step never
+    // reads it.
+    int gt_n;
+    int gt_len;
+    float* gt_x;
+    float* gt_y;
+    float* gt_h;
+    unsigned char* gt_v;
 };
 
 static int puf_sim_paused(Drive* env) {
@@ -341,21 +348,6 @@ static void skip_bytes(FILE* file, long n) {
     assert(fseek(file, n, SEEK_CUR) == 0);
 }
 
-// One sample at `step`, then skip the rest of a length-traj series.
-static float read_at(FILE* file, int traj, int step) {
-    assert(step >= 0 && step < traj);
-    if (step > 0) {
-        skip_bytes(file, (long)step * (long)sizeof(float));
-    }
-    float v = 0.0f;
-    assert(fread(&v, sizeof(float), 1, file) == 1);
-    int rest = traj - step - 1;
-    if (rest > 0) {
-        skip_bytes(file, (long)rest * (long)sizeof(float));
-    }
-    return v;
-}
-
 #define CONTROL_VEHICLES 0
 #define CONTROL_AGENTS 1
 #define CONTROL_WOSAC 2
@@ -380,11 +372,8 @@ static int drive_control_mode(const char* name) {
     if (strcmp(name, "control_agents") == 0) {
         return CONTROL_AGENTS;
     }
-    fprintf(stderr,
-        "control_mode must be control_vehicles, control_agents, "
-        "control_wosac, control_sdc_only, or control_mixed_play, got %s\n",
-        name);
-    exit(1);
+    assert(0 && "unknown control_mode");
+    return -1;
 }
 
 static int control_type_ok(int mode, int type) {
@@ -395,6 +384,32 @@ static int control_type_ok(int mode, int type) {
         return 0;
     }
     return type == PEDESTRIAN || type == CYCLIST;
+}
+
+static void free_replay(Drive* env) {
+    free(env->replay_x);
+    free(env->replay_y);
+    free(env->replay_h);
+    free(env->replay_vx);
+    free(env->replay_vy);
+    free(env->replay_v);
+    env->replay_x = NULL;
+    env->replay_y = NULL;
+    env->replay_h = NULL;
+    env->replay_vx = NULL;
+    env->replay_vy = NULL;
+    env->replay_v = NULL;
+    env->replay_len = 0;
+    free(env->gt_x);
+    free(env->gt_y);
+    free(env->gt_h);
+    free(env->gt_v);
+    env->gt_x = NULL;
+    env->gt_y = NULL;
+    env->gt_h = NULL;
+    env->gt_v = NULL;
+    env->gt_n = 0;
+    env->gt_len = 0;
 }
 
 // map_id-th int in <map dir>/sdc.bin. -1 if that file is absent.
@@ -420,6 +435,29 @@ static int read_map_sdc(const char* map_file, int map_id) {
     return sdc;
 }
 
+// One actor's compacted pose row. vx and vy are omitted when those
+// pointers are null. Heading is channel 4 of the stored series.
+static void copy_log_tracks(float* x, float* y, float* h,
+        float* vx, float* vy, unsigned char* valid,
+        float* series, int* vseries, LogSpawn* src, int n, int traj) {
+    for (int j = 0; j < n; j++) {
+        size_t row = (size_t)src[j].id * 5 * (size_t)traj;
+        size_t dst = (size_t)j * (size_t)traj;
+        size_t bytes = (size_t)traj * sizeof(float);
+        int* flags = vseries + (size_t)src[j].id * (size_t)traj;
+        memcpy(x + dst, series + row, bytes);
+        memcpy(y + dst, series + row + (size_t)traj, bytes);
+        if (vx) {
+            memcpy(vx + dst, series + row + 2 * (size_t)traj, bytes);
+            memcpy(vy + dst, series + row + 3 * (size_t)traj, bytes);
+        }
+        memcpy(h + dst, series + row + 4 * (size_t)traj, bytes);
+        for (int t = 0; t < traj; t++) {
+            valid[dst + (size_t)t] = flags[t] ? 1 : 0;
+        }
+    }
+}
+
 // CARLA files are roads only: int count, then road records.
 // Log files are int objects, roads, first agent type, trajectory
 // length, then each object (series, size, goal, mark, next type,
@@ -428,29 +466,16 @@ static int read_map_sdc(const char* map_file, int map_id) {
 // the first road header. Roads then use the CARLA record.
 Entity* load_map_binary(const char* filename, Drive* env) {
     FILE* file = fopen(filename, "rb");
-    if (!file) {
-        fprintf(stderr, "load_map_binary: cannot open %s: %s\n",
-            filename ? filename : "(null)", strerror(errno));
-        exit(1);
-    }
+    assert(file);
     free(env->spawns);
     env->spawns = NULL;
     env->spawn_n = 0;
+    free(env->ghosts);
+    env->ghosts = NULL;
+    env->ghost_n = 0;
     env->log_spawn = 0;
     env->log_traj = 0;
-    free(env->replay_x);
-    free(env->replay_y);
-    free(env->replay_h);
-    free(env->replay_vx);
-    free(env->replay_vy);
-    free(env->replay_v);
-    env->replay_x = NULL;
-    env->replay_y = NULL;
-    env->replay_h = NULL;
-    env->replay_vx = NULL;
-    env->replay_vy = NULL;
-    env->replay_v = NULL;
-    env->replay_len = 0;
+    free_replay(env);
     int head[4];
     assert(fread(head, sizeof(int), 4, file) == 4);
     int log_map = head[3] >= 2 && head[3] <= DRIVE_LOG_MAX
@@ -484,21 +509,36 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     int traj = head[3];
     assert(traj >= 2 && traj <= DRIVE_LOG_MAX);
     int replay = env->control_mode == CONTROL_SDC_ONLY;
-    // Five pose series per object, kept only for human-replay.
+    // Tracks invalid at init stay on the log. WOSAC and human-replay
+    // do not. Room is the body slots left after the policy cars.
+    int ghost_mode = env->replay_invalid
+        && env->control_mode != CONTROL_SDC_ONLY
+        && env->control_mode != CONTROL_WOSAC;
+    int room = 0;
+    if (ghost_mode) {
+        room = DRIVE_AGENT_MAX - env->max_agents;
+        if (room > 512) {
+            room = 512;
+        }
+        if (room < 0) {
+            room = 0;
+        }
+    }
+    // Five pose series per object. Replay keeps the rows it needs.
     float* series = NULL;
     int* vseries = NULL;
-    if (replay && nobj > 0) {
+    if (nobj > 0) {
         series = (float*)malloc(
             (size_t)5 * (size_t)nobj * (size_t)traj * sizeof(float));
         vseries = (int*)malloc((size_t)nobj * (size_t)traj * sizeof(int));
         assert(series && vseries);
     }
     LogSpawn cand[512];
-    int cand_i[512];
-    int cand_type[512];
     int cand_expert[512];
     float dist2[512];
     int nc = 0;
+    LogSpawn gkeep[512];
+    int gk = 0;
     int road_type = 0;
     int road_size = 0;
     for (int i = 0; i < nobj; i++) {
@@ -510,45 +550,27 @@ Entity* load_map_binary(const char* filename, Drive* env) {
         float vy = 0.0f;
         float heading = 0.0f;
         int valid = 0;
-        if (replay) {
-            float* row = series + (size_t)i * 5 * (size_t)traj;
-            assert(fread(row, sizeof(float), (size_t)traj, file)
-                == (size_t)traj);
-            assert(fread(row + traj, sizeof(float), (size_t)traj, file)
-                == (size_t)traj);
-            skip_bytes(file, (long)traj * (long)sizeof(float));
-            assert(fread(row + 2 * traj, sizeof(float), (size_t)traj, file)
-                == (size_t)traj);
-            assert(fread(row + 3 * traj, sizeof(float), (size_t)traj, file)
-                == (size_t)traj);
-            skip_bytes(file, (long)traj * (long)sizeof(float));
-            assert(fread(row + 4 * traj, sizeof(float), (size_t)traj, file)
-                == (size_t)traj);
-            int* vv = vseries + (size_t)i * (size_t)traj;
-            assert(fread(vv, sizeof(int), (size_t)traj, file) == (size_t)traj);
-            x = row[step];
-            y = row[traj + step];
-            vx = row[2 * traj + step];
-            vy = row[3 * traj + step];
-            heading = row[4 * traj + step];
-            valid = vv[step];
-        } else {
-            x = read_at(file, traj, step);
-            y = read_at(file, traj, step);
-            skip_bytes(file, (long)traj * (long)sizeof(float));
-            vx = read_at(file, traj, step);
-            vy = read_at(file, traj, step);
-            skip_bytes(file, (long)traj * (long)sizeof(float));
-            heading = read_at(file, traj, step);
-            if (step > 0) {
-                skip_bytes(file, (long)step * (long)sizeof(int));
+        float* row = series + (size_t)i * 5 * (size_t)traj;
+        // File order is x, y, z, vx, vy, one unused channel, heading.
+        // z and the unused channel are not stored.
+        int kept[7] = {0, 1, -1, 2, 3, -1, 4};
+        for (int ch = 0; ch < 7; ch++) {
+            if (kept[ch] < 0) {
+                skip_bytes(file, (long)traj * (long)sizeof(float));
+                continue;
             }
-            assert(fread(&valid, sizeof(int), 1, file) == 1);
-            int rest = traj - step - 1;
-            if (rest > 0) {
-                skip_bytes(file, (long)rest * (long)sizeof(int));
-            }
+            float* dest = row + kept[ch] * traj;
+            assert(fread(dest, sizeof(float), (size_t)traj, file)
+                == (size_t)traj);
         }
+        int* vv = vseries + (size_t)i * (size_t)traj;
+        assert(fread(vv, sizeof(int), (size_t)traj, file) == (size_t)traj);
+        x = row[step];
+        y = row[traj + step];
+        vx = row[2 * traj + step];
+        vy = row[3 * traj + step];
+        heading = row[4 * traj + step];
+        valid = vv[step];
         float width = 0.0f;
         float length = 0.0f;
         float height = 0.0f;
@@ -571,22 +593,35 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             assert(nc < 512);
             float dx = gx - x;
             float dy = gy - y;
-            cand[nc].x = x;
-            cand[nc].y = y;
-            cand[nc].heading = heading;
-            cand[nc].vx = vx;
-            cand[nc].vy = vy;
-            cand[nc].gx = gx;
-            cand[nc].gy = gy;
-            cand[nc].length = length;
-            cand[nc].width = width;
-            cand[nc].id = i;
-            cand[nc].type = type;
-            cand_i[nc] = i;
-            cand_type[nc] = type;
+            cand[nc] = (LogSpawn){
+                .x = x, .y = y, .heading = heading,
+                .vx = vx, .vy = vy, .gx = gx, .gy = gy,
+                .length = length, .width = width,
+                .id = i, .type = type,
+            };
             cand_expert[nc] = mark != 0;
             dist2[nc] = dx * dx + dy * dy;
             nc++;
+        } else if (gk < room && moving
+                && control_type_ok(env->control_mode, type)) {
+            int later = 0;
+            for (int t = step; t < traj; t++) {
+                if (vv[t]) {
+                    later = 1;
+                    break;
+                }
+            }
+            if (later) {
+                gkeep[gk] = (LogSpawn){
+                    .x = INVALID_POSITION,
+                    .y = INVALID_POSITION,
+                    .length = length,
+                    .width = width,
+                    .id = i,
+                    .type = type,
+                };
+                gk++;
+            }
         }
         type = road_type;
     }
@@ -594,12 +629,13 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     // Human-replay keeps the SDC plus other valid movers, capped at
     // REPLAY_ACTORS, and does not drop experts or near goals.
     // The other modes skip expert tracks and goals closer than 5 m.
+    // A mover that is invalid here and valid later is log-replayed.
     int mode = env->control_mode;
     int sdc = read_map_sdc(filename, env->map_id);
     int sdc_at = -1;
     if (sdc >= 0) {
         for (int i = 0; i < nc; i++) {
-            if (cand_i[i] == sdc) {
+            if (cand[i].id == sdc) {
                 sdc_at = i;
                 break;
             }
@@ -611,50 +647,47 @@ Entity* load_map_binary(const char* filename, Drive* env) {
         cap = env->max_controlled;
     }
     float min2 = MIN_DISTANCE_TO_GOAL * MIN_DISTANCE_TO_GOAL;
-    LogSpawn keep[512];
-    int keep_from[512];
-    int nk = 0;
+    int limit = cap;
     if (mode == CONTROL_SDC_ONLY) {
+        limit = REPLAY_ACTORS;
         assert(sdc_at >= 0);
-        keep[0] = cand[sdc_at];
-        keep_from[0] = cand_i[sdc_at];
-        nk = 1;
-        for (int i = 0; i < nc && nk < REPLAY_ACTORS; i++) {
-            if (i == sdc_at) {
-                continue;
-            }
-            if (!control_type_ok(mode, cand_type[i])) {
-                continue;
-            }
-            keep[nk] = cand[i];
-            keep_from[nk] = cand_i[i];
-            nk++;
+    }
+    LogSpawn keep[512];
+    int nk = 0;
+    // Self-driving car first. Human-replay keeps it even when the
+    // control filter would drop that type. Everyone else is file order.
+    if (sdc_at >= 0 && (mode == CONTROL_SDC_ONLY
+            || control_type_ok(mode, cand[sdc_at].type))) {
+        keep[nk++] = cand[sdc_at];
+    }
+    for (int i = 0; i < nc && nk < limit; i++) {
+        if (i == sdc_at || !control_type_ok(mode, cand[i].type)) {
+            continue;
         }
-    } else {
-        if (sdc_at >= 0 && control_type_ok(mode, cand_type[sdc_at])) {
-            keep[nk++] = cand[sdc_at];
+        if (mode != CONTROL_SDC_ONLY && mode != CONTROL_WOSAC
+                && (cand_expert[i] || dist2[i] < min2)) {
+            continue;
         }
-        for (int i = 0; i < nc && nk < cap; i++) {
-            if (i == sdc_at) {
-                continue;
-            }
-            if (!control_type_ok(mode, cand_type[i])) {
-                continue;
-            }
-            if (mode != CONTROL_WOSAC
-                    && (cand_expert[i] || dist2[i] < min2)) {
-                continue;
-            }
-            keep[nk++] = cand[i];
-        }
+        keep[nk++] = cand[i];
     }
     if (nk > 0) {
         env->spawns = (LogSpawn*)malloc((size_t)nk * sizeof(LogSpawn));
         assert(env->spawns);
         memcpy(env->spawns, keep, (size_t)nk * sizeof(LogSpawn));
     }
+    // Human-replay stores every kept actor, SDC first, so route
+    // progress reads series 0. Training stores the ghost tracks only.
+    LogSpawn* tracked = NULL;
+    int nreplay = 0;
     if (replay && nk > 0) {
-        size_t m = (size_t)nk * (size_t)traj;
+        tracked = keep;
+        nreplay = nk;
+    } else if (gk > 0) {
+        tracked = gkeep;
+        nreplay = gk;
+    }
+    if (nreplay > 0) {
+        size_t m = (size_t)nreplay * (size_t)traj;
         env->replay_len = traj;
         env->replay_x = (float*)malloc(m * sizeof(float));
         env->replay_y = (float*)malloc(m * sizeof(float));
@@ -664,19 +697,30 @@ Entity* load_map_binary(const char* filename, Drive* env) {
         env->replay_v = (unsigned char*)malloc(m);
         assert(env->replay_x && env->replay_y && env->replay_h
             && env->replay_vx && env->replay_vy && env->replay_v);
-        for (int j = 0; j < nk; j++) {
-            float* row = series + (size_t)keep_from[j] * 5 * (size_t)traj;
-            int* vv = vseries + (size_t)keep_from[j] * (size_t)traj;
-            for (int t = 0; t < traj; t++) {
-                size_t k = (size_t)j * (size_t)traj + (size_t)t;
-                env->replay_x[k] = row[t];
-                env->replay_y[k] = row[traj + t];
-                env->replay_vx[k] = row[2 * traj + t];
-                env->replay_vy[k] = row[3 * traj + t];
-                env->replay_h[k] = row[4 * traj + t];
-                env->replay_v[k] = vv[t] ? 1 : 0;
-            }
-        }
+        copy_log_tracks(env->replay_x, env->replay_y, env->replay_h,
+            env->replay_vx, env->replay_vy, env->replay_v,
+            series, vseries, tracked, nreplay, traj);
+    }
+    // Policy cars. Kept beside the ghost replay so a rollout can draw
+    // the logged pose without moving the controlled body.
+    if (nk > 0) {
+        size_t m = (size_t)nk * (size_t)traj;
+        env->gt_len = traj;
+        env->gt_n = nk;
+        env->gt_x = (float*)malloc(m * sizeof(float));
+        env->gt_y = (float*)malloc(m * sizeof(float));
+        env->gt_h = (float*)malloc(m * sizeof(float));
+        env->gt_v = (unsigned char*)malloc(m);
+        assert(env->gt_x && env->gt_y && env->gt_h && env->gt_v);
+        copy_log_tracks(env->gt_x, env->gt_y, env->gt_h,
+            NULL, NULL, env->gt_v,
+            series, vseries, keep, nk, traj);
+    }
+    if (gk > 0) {
+        env->ghosts = (LogSpawn*)malloc((size_t)gk * sizeof(LogSpawn));
+        assert(env->ghosts);
+        memcpy(env->ghosts, gkeep, (size_t)gk * sizeof(LogSpawn));
+        env->ghost_n = gk;
     }
     free(series);
     free(vseries);
@@ -753,10 +797,8 @@ void init_grid_map(Drive* env) {
         }
         Entity* e = &env->entities[i];
         for (int j = 0; j < e->array_size; j++) {
-            if (e->pts_x[j] == INVALID_POSITION) {
-                continue;
-            }
-            if (e->pts_y[j] == INVALID_POSITION) {
+            if (e->pts_x[j] == INVALID_POSITION
+                    || e->pts_y[j] == INVALID_POSITION) {
                 continue;
             }
             if (!first_valid_point) {
@@ -939,10 +981,8 @@ void set_means(Drive* env) {
             continue;
         }
         for (int j = 0; j < e->array_size; j++) {
-            if (e->pts_x[j] == INVALID_POSITION) {
-                continue;
-            }
-            if (e->pts_y[j] == INVALID_POSITION) {
+            if (e->pts_x[j] == INVALID_POSITION
+                    || e->pts_y[j] == INVALID_POSITION) {
                 continue;
             }
             point_count++;
@@ -1085,6 +1125,10 @@ static int agent_cell(Drive* env, float x, float y) {
     return cy * env->near_cols + cx;
 }
 
+// Partner index for the last agent-agent contact, or -1. The other
+// body's own check may not run when it is a log car.
+static int drive_hit_with[DRIVE_AGENT_MAX];
+
 int collision_check(Drive* env, int agent_idx) {
     Entity* agent = &env->entities[agent_idx];
     if (agent->x == INVALID_POSITION) {
@@ -1148,7 +1192,9 @@ int collision_check(Drive* env, int agent_idx) {
         memset(env->bin_head, 0xff, (size_t)cells * sizeof(int));
         for (int i = 0; i < env->body_count; i++) {
             Entity* e = &env->entities[i];
-            if (e->x == INVALID_POSITION || e->y == INVALID_POSITION) {
+            if (e->valid == 0
+                    || e->x == INVALID_POSITION
+                    || e->y == INVALID_POSITION) {
                 continue;
             }
             int cell = agent_cell(env, e->x, e->y);
@@ -1186,6 +1232,8 @@ int collision_check(Drive* env, int agent_idx) {
 
     agent->offroad_state = offroad;
     agent->collision_state = collided;
+    assert(agent_idx >= 0 && agent_idx < DRIVE_AGENT_MAX);
+    drive_hit_with[agent_idx] = car_collided_with_index;
     return car_collided_with_index;
 }
 
@@ -1296,7 +1344,8 @@ static int lane_succ(Drive* env, int node, int* out) {
 static void release_world(Drive* env) {
     if (env->entities) {
         for (int i = 0; i < env->num_entities; i++) {
-            free_entity(&env->entities[i]);
+            free(env->entities[i].pts_x);
+            free(env->entities[i].pts_y);
         }
         free(env->entities);
         env->entities = NULL;
@@ -1329,21 +1378,12 @@ static void release_world(Drive* env) {
     free(env->spawns);
     env->spawns = NULL;
     env->spawn_n = 0;
+    free(env->ghosts);
+    env->ghosts = NULL;
+    env->ghost_n = 0;
     env->log_spawn = 0;
     env->log_traj = 0;
-    free(env->replay_x);
-    free(env->replay_y);
-    free(env->replay_h);
-    free(env->replay_vx);
-    free(env->replay_vy);
-    free(env->replay_v);
-    env->replay_x = NULL;
-    env->replay_y = NULL;
-    env->replay_h = NULL;
-    env->replay_vx = NULL;
-    env->replay_vy = NULL;
-    env->replay_v = NULL;
-    env->replay_len = 0;
+    free_replay(env);
     free(env->wosac_x);
     free(env->wosac_y);
     free(env->wosac_h);
@@ -1360,6 +1400,8 @@ static void load_world(Drive* env) {
     int extra = 0;
     if (env->control_mode == CONTROL_SDC_ONLY && env->spawn_n > 1) {
         extra = env->spawn_n - 1;
+    } else if (env->ghost_n > 0) {
+        extra = env->ghost_n;
     }
     int bodies = n + extra;
     assert(bodies <= DRIVE_AGENT_MAX);
@@ -1398,7 +1440,11 @@ static void load_world(Drive* env) {
     }
     if (env->replay_x) {
         int len = env->replay_len;
-        for (int s = 0; s < env->spawn_n; s++) {
+        int nseries = env->spawn_n;
+        if (env->control_mode != CONTROL_SDC_ONLY) {
+            nseries = env->ghost_n;
+        }
+        for (int s = 0; s < nseries; s++) {
             for (int t = 0; t < len; t++) {
                 int k = s * len + t;
                 if (!env->replay_v[k]) {
@@ -1406,6 +1452,19 @@ static void load_world(Drive* env) {
                 }
                 env->replay_x[k] -= env->world_mean_x;
                 env->replay_y[k] -= env->world_mean_y;
+            }
+        }
+    }
+    if (env->gt_x) {
+        int len = env->gt_len;
+        for (int s = 0; s < env->gt_n; s++) {
+            for (int t = 0; t < len; t++) {
+                int k = s * len + t;
+                if (!env->gt_v[k]) {
+                    continue;
+                }
+                env->gt_x[k] -= env->world_mean_x;
+                env->gt_y[k] -= env->world_mean_y;
             }
         }
     }
@@ -1545,7 +1604,9 @@ void compute_observations(Drive* env) {
             }
 
             Entity* other = &env->entities[index];
-            if (other->x == INVALID_POSITION || other->y == INVALID_POSITION) {
+            if (other->valid == 0
+                    || other->x == INVALID_POSITION
+                    || other->y == INVALID_POSITION) {
                 continue;
             }
 
@@ -1571,10 +1632,8 @@ void compute_observations(Drive* env) {
             cars_seen++;
             obs_idx += PARTNER_FEATURES;
         }
-        int remaining_partner_obs =
-            (MAX_AGENTS - cars_seen) * PARTNER_FEATURES;
-        memset(&obs[obs_idx], 0, remaining_partner_obs * sizeof(float));
-        obs_idx += remaining_partner_obs;
+        // The buffer was cleared. Empty partner slots stay zero.
+        obs_idx += (MAX_AGENTS - cars_seen) * PARTNER_FEATURES;
 
         // Road observations
         int entity_list[MAX_ROAD_SEGMENT_OBSERVATIONS * 2];
@@ -1621,9 +1680,6 @@ void compute_observations(Drive* env) {
             obs[obs_idx + 6] = entity->type - (float)ROAD_LANE;
             obs_idx += ROAD_FEATURES;
         }
-        int remaining_obs =
-            (MAX_ROAD_SEGMENT_OBSERVATIONS - list_size) * ROAD_FEATURES;
-        memset(&obs[obs_idx], 0, remaining_obs * sizeof(float));
     }
 }
 
@@ -2011,29 +2067,70 @@ static void seat_logged(Entity* e, LogSpawn* s, int scored) {
     e->goals_sampled = scored;
 }
 
-// Policy slot 0 is the self-driving car. Human-replay partners occupy
-// the body slots past active_agent_count and are not scored.
+// Policy slot 0 is the self-driving car. Partners and training ghosts
+// sit past active_agent_count and are not scored. A ghost stays off
+// the map until its log frame is valid.
 static void place_logged(Drive* env) {
     int n = env->active_agent_count;
-    int replay = env->control_mode == CONTROL_SDC_ONLY;
+    int sdc = env->control_mode == CONTROL_SDC_ONLY;
     for (int i = 0; i < env->body_count; i++) {
         LogSpawn* s = NULL;
         int scored = 0;
-        if (replay) {
-            if (i == 0 && env->spawn_n > 0) {
-                s = &env->spawns[0];
-                scored = 1;
-            } else if (i >= n) {
-                int si = i - n + 1;
-                if (si < env->spawn_n) {
-                    s = &env->spawns[si];
-                }
-            }
-        } else if (i < env->spawn_n) {
+        if (sdc && i == 0 && env->spawn_n > 0) {
+            s = &env->spawns[0];
+            scored = 1;
+        } else if (sdc && i >= n && i - n + 1 < env->spawn_n) {
+            s = &env->spawns[i - n + 1];
+        } else if (!sdc && i < env->spawn_n) {
             s = &env->spawns[i];
             scored = 1;
+        } else if (!sdc && i >= n && i - n < env->ghost_n) {
+            s = &env->ghosts[i - n];
         }
         seat_logged(&env->entities[i], s, scored);
+    }
+    env->bins_ready = 0;
+}
+
+// Log frame is init_steps plus the sim clock. An invalid flag, or a
+// frame past the log, parks the body. The policy car is series 0 in
+// a human replay and is not moved. Training ghosts start at series 0.
+static void replay_partners(Drive* env) {
+    if (!env->replay_x) {
+        return;
+    }
+    int sdc = env->control_mode == CONTROL_SDC_ONLY;
+    int frame = env->init_steps + env->timestep;
+    int len = env->replay_len;
+    int count = env->ghost_n;
+    int series = 0;
+    if (sdc) {
+        count = env->spawn_n - 1;
+        series = 1;
+    }
+    if (count < 0) {
+        count = 0;
+    }
+    int live = frame >= 0 && frame < len;
+    for (int i = 0; i < count; i++) {
+        Entity* e = &env->entities[env->active_agent_count + i];
+        int k = (series + i) * len + frame;
+        if (!live || !env->replay_v[k]) {
+            e->x = INVALID_POSITION;
+            e->y = INVALID_POSITION;
+            e->vx = 0.0f;
+            e->vy = 0.0f;
+            e->valid = 0;
+            continue;
+        }
+        e->x = env->replay_x[k];
+        e->y = env->replay_y[k];
+        e->heading = env->replay_h[k];
+        e->heading_x = cosf(e->heading);
+        e->heading_y = sinf(e->heading);
+        e->vx = env->replay_vx[k];
+        e->vy = env->replay_vy[k];
+        e->valid = 1;
     }
     env->bins_ready = 0;
 }
@@ -2043,6 +2140,7 @@ void puf_reset(Drive* env) {
     set_start_position(env);
     if (env->log_spawn) {
         place_logged(env);
+        replay_partners(env);
     } else {
         initialize_env(env);
     }
@@ -2421,41 +2519,6 @@ static float route_progress(Drive* env, float px, float py, int frame,
     return ratio;
 }
 
-// Partners follow the log. Past the last logged frame they leave
-// the map, matching PufferDrive move_expert. The SDC is not moved.
-static void replay_partners(Drive* env) {
-    if (env->control_mode != CONTROL_SDC_ONLY || !env->replay_x) {
-        return;
-    }
-    int frame = env->init_steps + env->timestep;
-    int len = env->replay_len;
-    int base = env->active_agent_count;
-    for (int s = 1; s < env->spawn_n; s++) {
-        Entity* e = &env->entities[base + s - 1];
-        int ok = frame >= 0 && frame < len;
-        int k = s * len + frame;
-        if (ok) {
-            ok = env->replay_v[k];
-        }
-        if (!ok) {
-            e->x = INVALID_POSITION;
-            e->y = INVALID_POSITION;
-            e->vx = 0.0f;
-            e->vy = 0.0f;
-            continue;
-        }
-        e->x = env->replay_x[k];
-        e->y = env->replay_y[k];
-        e->heading = env->replay_h[k];
-        e->heading_x = cosf(e->heading);
-        e->heading_y = sinf(e->heading);
-        e->vx = env->replay_vx[k];
-        e->vy = env->replay_vy[k];
-        e->valid = 1;
-    }
-    env->bins_ready = 0;
-}
-
 // Pads (goals_sampled == 0) are not cars. A logged scene ends when
 // every spawned car has arrived, or at episode_length, whichever
 // comes first. That length is this log's state count, unless the
@@ -2468,7 +2531,8 @@ static void end_episode(Drive* env) {
         puf_reset(env);
         return;
     }
-    if (env->replay_x && env->entities[0].goals_sampled > 0) {
+    if (env->control_mode == CONTROL_SDC_ONLY && env->replay_x
+            && env->entities[0].goals_sampled > 0) {
         Entity* sdc = &env->entities[0];
         Log* lg = &env->logs[0];
         if (sdc->path_n > 0) {
@@ -2656,7 +2720,8 @@ void puf_step(Drive* env) {
                 arrived = 0;
             }
         }
-        if (env->replay_x && i == 0 && agent->goals_sampled > 0
+        if (env->control_mode == CONTROL_SDC_ONLY && env->replay_x
+                && i == 0 && agent->goals_sampled > 0
                 && agent->x != INVALID_POSITION) {
             float lat = 0.0f;
             float lon = 0.0f;
@@ -2671,7 +2736,8 @@ void puf_step(Drive* env) {
             env->agents[i].rewards[0] += env->reward_goal;
             env->logs[i].episode_return += env->reward_goal;
             agent->reached_goal = 1;
-            if (env->replay_x && i == 0) {
+            if (env->control_mode == CONTROL_SDC_ONLY && env->replay_x
+                    && i == 0) {
                 env->logs[i].route_progress = 1.0f;
             }
             agent->goals_completed++;
@@ -2708,7 +2774,12 @@ void puf_step(Drive* env) {
 
     // Human-replay runs to episode_length. Stopping at the goal would
     // reset inside a trainer horizon and count another episode.
-    if (env->log_spawn && !env->goal_stop && !env->replay_x
+    // Training ends once every scored car has arrived. A recording
+    // leaves that reset to the player: each arrival still parks that
+    // car, and the player stops when every followed car has arrived.
+    if (env->log_spawn && !env->goal_stop
+            && env->control_mode != CONTROL_SDC_ONLY
+            && !puf_record_enabled()
             && logs_finished(env)) {
         end_episode(env);
         return;
@@ -2729,6 +2800,11 @@ void puf_init(Env* env, Dict* kwargs) {
     env->speed_band = dict_get(kwargs, "speed_band") * KMH_TO_MPS;
     env->cfg = kwargs;
     env->use_action_values = 0;
+    env->replay_invalid = 1;
+    DictItem* replay_off = dict_find(kwargs, "replay_invalid");
+    if (replay_off && replay_off->value == 0.0) {
+        env->replay_invalid = 0;
+    }
     DictItem* control = dict_find(kwargs, "control_mode");
     env->control_mode = drive_control_mode(
         (control && control->str && control->str[0])
@@ -2785,7 +2861,8 @@ void puf_init(Env* env, Dict* kwargs) {
     // Waymo training stops at the scenario length (91). The ini value
     // is the longest log, so a shorter scene is not held open past its
     // last frame. Human-replay and goal_stop keep the ini horizon.
-    if (env->log_spawn && !env->wosac_on && !env->replay_x
+    if (env->log_spawn && !env->wosac_on
+            && env->control_mode != CONTROL_SDC_ONLY
             && !env->goal_stop && env->log_traj > 1
             && env->episode_length > env->log_traj) {
         env->episode_length = env->log_traj;

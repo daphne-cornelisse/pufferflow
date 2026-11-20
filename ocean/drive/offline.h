@@ -581,6 +581,9 @@ static void offline_integrate(Drive* env, int stop_at_goal) {
     if (!env->entities || env->active_agent_count <= 0) {
         return;
     }
+    // Same clock as puf_step: the log frame is the step we are entering.
+    env->timestep++;
+    replay_partners(env);
     for (int i = 0; i < env->active_agent_count; i++) {
         if (!env->agents[i].rewards) {
             continue;

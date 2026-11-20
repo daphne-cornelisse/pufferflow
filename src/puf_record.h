@@ -140,7 +140,7 @@ static int puf_record_open(int width, int height) {
             "-f", "rawvideo", "-pix_fmt", "rgba",
             "-s", size, "-r", fps, "-i", "-",
             "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-preset", "veryfast", "-crf", "23",
+            "-preset", "slow", "-crf", "10",
             "-movflags", "+faststart",
             "-loglevel", "error",
             rec->path, (char*)NULL);
