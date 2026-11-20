@@ -6,14 +6,14 @@ I24 realism scores. The histograms are the WOSAC 2024 bins in `dreal.ini`.
 python eval/dreal_highway/score.py
 ```
 
-The script reads the three scenes in `data/i24` and the greedy anchor `analysis/offline/i24/bc_3.npz`. It writes `analysis/offline/i24/dreal_highway.json`.
+The script reads the three scenes in `data/i24` and the greedy anchor `checkpoints/bc_i24.npz`. It writes `analysis/offline/i24/dreal_highway.json`.
 
 A drive checkpoint is an extra controller on that same report. It does not replace the three, and it does not write `dreal_highway.json`.
 
 ```
 python eval/dreal_highway/score.py \
-  --policy coef0=checkpoints/i24_anchor/drive/i24_coef0/0000000999817216.bin \
-  --policy coef0p1=checkpoints/i24_anchor/drive/i24_coef0p1/0000000999817216.bin \
+  --policy coef0=checkpoints/rl_i24_coef0.bin \
+  --policy coef0p068=checkpoints/rl_i24_coef0p068.bin \
   --out analysis/offline/i24/dreal_rl.json
 ```
 
@@ -25,7 +25,7 @@ Every run scores these three controllers on every scene, in this order. The repo
 
 - **Ground truth.** The logged window, copied across 32 rollouts. This is the ceiling.
 - **Discretized expert.** Closed-loop rollout of the stored action bins. A missing bin coasts.
-- **Anchor.** Greedy closed-loop rollout of `bc_3.npz`.
+- **Anchor.** Greedy closed-loop rollout of `bc_i24.npz`.
 
 ## Window
 

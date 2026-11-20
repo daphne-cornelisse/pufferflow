@@ -21,7 +21,7 @@ feature, and the histogram still sees 32 * 81 samples.
 
 Every report scores three controllers. Ground truth is the logged
 window. The discretized expert replays stored bins and coasts when a
-bin is missing. The anchor is the greedy bc_3.npz policy. A run that
+bin is missing. The anchor is the greedy bc_i24.npz policy. A run that
 is missing one of them does not write a score. Unfit agents are parked.
 Integrate does not freeze a car that enters its goal disk, so the eight
 seconds stay on the bicycle model.
@@ -54,7 +54,7 @@ from train_bc_map import load_policy
 
 DATA = ROOT / "data" / "i24"
 JSON_DIR = DATA / "json"
-CKPT = ROOT / "analysis" / "offline" / "i24" / "bc_3.npz"
+CKPT = ROOT / "checkpoints" / "bc_i24.npz"
 OUT_PATH = ROOT / "analysis" / "offline" / "i24" / "dreal_highway.json"
 RL_OUT = ROOT / "analysis" / "offline" / "i24" / "dreal_rl.json"
 INI = Path(__file__).with_name("dreal.ini")
