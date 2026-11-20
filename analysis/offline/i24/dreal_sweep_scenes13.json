@@ -1,0 +1,759 @@
+{
+  "agents": 93,
+  "placed": 93,
+  "ceiling": {
+    "linear_speed": 0.7577089459529687,
+    "linear_acceleration": 0.3199153754429155,
+    "angular_speed": 0.9616535986906902,
+    "angular_acceleration": 0.9676188761828375,
+    "distance_to_nearest_object": 0.46592706263049843,
+    "time_to_collision": 0.9062941103513007,
+    "distance_to_road_edge": 0.9664173641838147
+  },
+  "methods": {
+    "ground_truth": {
+      "scenes": 2,
+      "agents": 93,
+      "raw": {
+        "linear_speed": {
+          "mean": 0.7577089459529687,
+          "std": 0.28577289626843033,
+          "n": 93
+        },
+        "linear_acceleration": {
+          "mean": 0.3199153754429155,
+          "std": 0.13221274052151885,
+          "n": 93
+        },
+        "angular_speed": {
+          "mean": 0.9616535986906902,
+          "std": 0.14273987287046014,
+          "n": 93
+        },
+        "angular_acceleration": {
+          "mean": 0.9676188761828375,
+          "std": 0.1311576171429688,
+          "n": 93
+        },
+        "distance_to_nearest_object": {
+          "mean": 0.46592706263049843,
+          "std": 0.23450933810908126,
+          "n": 93
+        },
+        "time_to_collision": {
+          "mean": 0.9062941103513007,
+          "std": 0.1582125345172551,
+          "n": 93
+        },
+        "distance_to_road_edge": {
+          "mean": 0.9664173641838147,
+          "std": 0.13289049641867087,
+          "n": 93
+        }
+      },
+      "normalized": {
+        "linear_speed": {
+          "mean": 1.0000000000000002,
+          "std": 0.37715391615050087,
+          "n": 93
+        },
+        "linear_acceleration": {
+          "mean": 1.0000000000000002,
+          "std": 0.41327410518632723,
+          "n": 93
+        },
+        "angular_speed": {
+          "mean": 0.9999999999999997,
+          "std": 0.14843169418260713,
+          "n": 93
+        },
+        "angular_acceleration": {
+          "mean": 1.0000000000000007,
+          "std": 0.13554677401537768,
+          "n": 93
+        },
+        "distance_to_nearest_object": {
+          "mean": 1.0,
+          "std": 0.5033177012408441,
+          "n": 93
+        },
+        "time_to_collision": {
+          "mean": 1.0000000000000002,
+          "std": 0.17457085146005005,
+          "n": 93
+        },
+        "distance_to_road_edge": {
+          "mean": 1.0000000000000002,
+          "std": 0.13750839062262005,
+          "n": 93
+        }
+      },
+      "meta": {
+        "mean": 1.0000000000000002,
+        "std": 0.11907597658458602,
+        "n": 93
+      },
+      "ade": {
+        "mean": 0.0,
+        "std": 0.0,
+        "n": 93
+      },
+      "controllability": {
+        "agents_collided": {
+          "count": 2,
+          "slots": 93,
+          "percent": 2.150537634408602
+        },
+        "collisions_per_agent": {
+          "count": 2,
+          "slots": 93,
+          "percent": 2.150537634408602
+        },
+        "agents_offroad": {
+          "count": 0,
+          "slots": 93,
+          "percent": 0.0
+        },
+        "offroad_per_agent": {
+          "count": 0,
+          "slots": 93,
+          "percent": 0.0
+        }
+      },
+      "per_scene": [
+        {
+          "scenario_id": "i24_00000",
+          "num_agents": 55,
+          "likelihood_linear_speed": 0.8761026636471475,
+          "likelihood_linear_acceleration": 0.31378123827822835,
+          "likelihood_angular_speed": 0.9996046024277417,
+          "likelihood_angular_acceleration": 0.9995943369437349,
+          "likelihood_distance_to_nearest_object": 0.4419150821676496,
+          "likelihood_time_to_collision": 0.9196536580871228,
+          "likelihood_distance_to_road_edge": 0.9587496316094266,
+          "ade": 0.0,
+          "min_ade": 0.0,
+          "ctrl_rollouts": 1,
+          "map_id": 0
+        },
+        {
+          "scenario_id": "i24_00002",
+          "num_agents": 38,
+          "likelihood_linear_speed": 0.586349617711394,
+          "likelihood_linear_acceleration": 0.3287937318654889,
+          "likelihood_angular_speed": 0.9067245143344327,
+          "likelihood_angular_acceleration": 0.9213386040289082,
+          "likelihood_distance_to_nearest_object": 0.5006812448793586,
+          "likelihood_time_to_collision": 0.8869579228389283,
+          "likelihood_distance_to_road_edge": 0.977515398173062,
+          "ade": 0.0,
+          "min_ade": 0.0,
+          "ctrl_rollouts": 1,
+          "map_id": 2
+        }
+      ]
+    },
+    "discretized_expert": {
+      "scenes": 2,
+      "agents": 93,
+      "raw": {
+        "linear_speed": {
+          "mean": 0.8830190926562808,
+          "std": 0.23527685426940811,
+          "n": 93
+        },
+        "linear_acceleration": {
+          "mean": 0.31196558727388357,
+          "std": 0.13917309102018274,
+          "n": 93
+        },
+        "angular_speed": {
+          "mean": 0.9615131812425437,
+          "std": 0.14331885417065815,
+          "n": 93
+        },
+        "angular_acceleration": {
+          "mean": 0.967583770371881,
+          "std": 0.13127900977698562,
+          "n": 93
+        },
+        "distance_to_nearest_object": {
+          "mean": 0.48840734607129865,
+          "std": 0.25149304611516804,
+          "n": 93
+        },
+        "time_to_collision": {
+          "mean": 0.9260174165367886,
+          "std": 0.17502241867300633,
+          "n": 93
+        },
+        "distance_to_road_edge": {
+          "mean": 0.9126538124982947,
+          "std": 0.1974975240234343,
+          "n": 93
+        }
+      },
+      "normalized": {
+        "linear_speed": {
+          "mean": 1.1653803183565554,
+          "std": 0.31051085713855603,
+          "n": 93
+        },
+        "linear_acceleration": {
+          "mean": 0.9751503404360432,
+          "std": 0.4350309541312318,
+          "n": 93
+        },
+        "angular_speed": {
+          "mean": 0.9998539833383477,
+          "std": 0.14903376264154733,
+          "n": 93
+        },
+        "angular_acceleration": {
+          "mean": 0.9999637193818557,
+          "std": 0.13567222902354753,
+          "n": 93
+        },
+        "distance_to_nearest_object": {
+          "mean": 1.0482485033470317,
+          "std": 0.5397691318793678,
+          "n": 93
+        },
+        "time_to_collision": {
+          "mean": 1.0217625889434978,
+          "std": 0.19311878635641092,
+          "n": 93
+        },
+        "distance_to_road_edge": {
+          "mean": 0.9443681853430629,
+          "std": 0.20436048786253996,
+          "n": 93
+        }
+      },
+      "meta": {
+        "mean": 1.022103948449485,
+        "std": 0.12207393318060736,
+        "n": 93
+      },
+      "ade": {
+        "mean": 0.3150188801493665,
+        "std": 0.36201208044140865,
+        "n": 93
+      },
+      "controllability": {
+        "agents_collided": {
+          "count": 6,
+          "slots": 93,
+          "percent": 6.451612903225806
+        },
+        "collisions_per_agent": {
+          "count": 6,
+          "slots": 93,
+          "percent": 6.451612903225806
+        },
+        "agents_offroad": {
+          "count": 2,
+          "slots": 93,
+          "percent": 2.150537634408602
+        },
+        "offroad_per_agent": {
+          "count": 2,
+          "slots": 93,
+          "percent": 2.150537634408602
+        }
+      },
+      "per_scene": [
+        {
+          "scenario_id": "i24_00000",
+          "num_agents": 55,
+          "likelihood_linear_speed": 0.9996441281138788,
+          "likelihood_linear_acceleration": 0.3071048104898481,
+          "likelihood_angular_speed": 0.9996046024277417,
+          "likelihood_angular_acceleration": 0.9995943369437349,
+          "likelihood_distance_to_nearest_object": 0.4638414489580091,
+          "likelihood_time_to_collision": 0.9431841126290185,
+          "likelihood_distance_to_road_edge": 0.9014847669751042,
+          "ade": 0.3777884234318697,
+          "min_ade": 0.3777884234318697,
+          "ctrl_rollouts": 1,
+          "map_id": 0
+        },
+        {
+          "scenario_id": "i24_00002",
+          "num_agents": 38,
+          "likelihood_linear_speed": 0.7142196992308093,
+          "likelihood_linear_acceleration": 0.3190009220928822,
+          "likelihood_angular_speed": 0.9063808611060744,
+          "likelihood_angular_acceleration": 0.9212526871757778,
+          "likelihood_distance_to_nearest_object": 0.5239632497879018,
+          "likelihood_time_to_collision": 0.9011708827190894,
+          "likelihood_distance_to_road_edge": 0.9288195362818613,
+          "ade": 0.22416822539837514,
+          "min_ade": 0.22416822539837514,
+          "ctrl_rollouts": 1,
+          "map_id": 2
+        }
+      ]
+    },
+    "anchor": {
+      "scenes": 2,
+      "agents": 93,
+      "raw": {
+        "linear_speed": {
+          "mean": 0.8139054353112496,
+          "std": 0.3711607827767029,
+          "n": 93
+        },
+        "linear_acceleration": {
+          "mean": 0.09349166236201509,
+          "std": 0.11678954544546319,
+          "n": 93
+        },
+        "angular_speed": {
+          "mean": 0.9360655823806029,
+          "std": 0.22883789395920093,
+          "n": 93
+        },
+        "angular_acceleration": {
+          "mean": 0.9467942985904962,
+          "std": 0.20960105357167205,
+          "n": 93
+        },
+        "distance_to_nearest_object": {
+          "mean": 0.37687633006376176,
+          "std": 0.28605094203978493,
+          "n": 93
+        },
+        "time_to_collision": {
+          "mean": 0.8992516529529901,
+          "std": 0.20948302634885668,
+          "n": 93
+        },
+        "distance_to_road_edge": {
+          "mean": 0.9087517130695024,
+          "std": 0.19969711651348837,
+          "n": 93
+        }
+      },
+      "normalized": {
+        "linear_speed": {
+          "mean": 1.0741663268705408,
+          "std": 0.4898461140773453,
+          "n": 93
+        },
+        "linear_acceleration": {
+          "mean": 0.2922387279216512,
+          "std": 0.3650638712933718,
+          "n": 93
+        },
+        "angular_speed": {
+          "mean": 0.973391649191636,
+          "std": 0.23796291541025597,
+          "n": 93
+        },
+        "angular_acceleration": {
+          "mean": 0.9784785331240212,
+          "std": 0.2166153004357747,
+          "n": 93
+        },
+        "distance_to_nearest_object": {
+          "mean": 0.8088740927303507,
+          "std": 0.613939315790799,
+          "n": 93
+        },
+        "time_to_collision": {
+          "mean": 0.9922293907486827,
+          "std": 0.23114243373782517,
+          "n": 93
+        },
+        "distance_to_road_edge": {
+          "mean": 0.9403304894433334,
+          "std": 0.20663651535498023,
+          "n": 93
+        }
+      },
+      "meta": {
+        "mean": 0.8656727442900308,
+        "std": 0.1557821367558096,
+        "n": 93
+      },
+      "ade": {
+        "mean": 3.4685398130396594,
+        "std": 2.7800323506040527,
+        "n": 93
+      },
+      "controllability": {
+        "agents_collided": {
+          "count": 10,
+          "slots": 93,
+          "percent": 10.75268817204301
+        },
+        "collisions_per_agent": {
+          "count": 11,
+          "slots": 93,
+          "percent": 11.827956989247312
+        },
+        "agents_offroad": {
+          "count": 3,
+          "slots": 93,
+          "percent": 3.225806451612903
+        },
+        "offroad_per_agent": {
+          "count": 3,
+          "slots": 93,
+          "percent": 3.225806451612903
+        }
+      },
+      "per_scene": [
+        {
+          "scenario_id": "i24_00000",
+          "num_agents": 55,
+          "likelihood_linear_speed": 0.9996441281138788,
+          "likelihood_linear_acceleration": 0.10362648884949331,
+          "likelihood_angular_speed": 0.9996046024277417,
+          "likelihood_angular_acceleration": 0.9995943369437349,
+          "likelihood_distance_to_nearest_object": 0.36054091510036046,
+          "likelihood_time_to_collision": 0.9327556438034558,
+          "likelihood_distance_to_road_edge": 0.8942057158681237,
+          "ade": 3.015129481571708,
+          "min_ade": 3.015129481571708,
+          "ctrl_rollouts": 1,
+          "map_id": 0
+        },
+        {
+          "scenario_id": "i24_00002",
+          "num_agents": 38,
+          "likelihood_linear_speed": 0.5450731167811278,
+          "likelihood_linear_acceleration": 0.07882283455119128,
+          "likelihood_angular_speed": 0.8441012112597452,
+          "likelihood_angular_acceleration": 0.870373190447652,
+          "likelihood_distance_to_nearest_object": 0.40051969382657926,
+          "likelihood_time_to_collision": 0.8507590346167914,
+          "likelihood_distance_to_road_edge": 0.9298051300714989,
+          "ade": 4.12479160858538,
+          "min_ade": 4.12479160858538,
+          "ctrl_rollouts": 1,
+          "map_id": 2
+        }
+      ]
+    },
+    "spiced": {
+      "scenes": 2,
+      "agents": 93,
+      "raw": {
+        "linear_speed": {
+          "mean": 0.6537735192160931,
+          "std": 0.29123332750367864,
+          "n": 93
+        },
+        "linear_acceleration": {
+          "mean": 0.1348534989365498,
+          "std": 0.048220514597035684,
+          "n": 93
+        },
+        "angular_speed": {
+          "mean": 0.5343799003020027,
+          "std": 0.1568138356923818,
+          "n": 93
+        },
+        "angular_acceleration": {
+          "mean": 0.46706979781112734,
+          "std": 0.16195293305669273,
+          "n": 93
+        },
+        "distance_to_nearest_object": {
+          "mean": 0.15104754124499573,
+          "std": 0.074965112184511,
+          "n": 93
+        },
+        "time_to_collision": {
+          "mean": 0.9228676909435921,
+          "std": 0.15594910195059603,
+          "n": 93
+        },
+        "distance_to_road_edge": {
+          "mean": 0.2248738143369859,
+          "std": 0.13281491845843724,
+          "n": 93
+        }
+      },
+      "normalized": {
+        "linear_speed": {
+          "mean": 0.8628293524947679,
+          "std": 0.38436041841553714,
+          "n": 93
+        },
+        "linear_acceleration": {
+          "mean": 0.42152865816420426,
+          "std": 0.15072896865389945,
+          "n": 93
+        },
+        "angular_speed": {
+          "mean": 0.5556885567002207,
+          "std": 0.1630668630636716,
+          "n": 93
+        },
+        "angular_acceleration": {
+          "mean": 0.4827001718421124,
+          "std": 0.16737264747829367,
+          "n": 93
+        },
+        "distance_to_nearest_object": {
+          "mean": 0.3241870957059719,
+          "std": 0.16089452233420012,
+          "n": 93
+        },
+        "time_to_collision": {
+          "mean": 1.0182871988276159,
+          "std": 0.1720733922568983,
+          "n": 93
+        },
+        "distance_to_road_edge": {
+          "mean": 0.23268809385156533,
+          "std": 0.13743018635701537,
+          "n": 93
+        }
+      },
+      "meta": {
+        "mean": 0.5568441610837798,
+        "std": 0.06703477819719494,
+        "n": 93
+      },
+      "ade": {
+        "mean": 71.69278059952148,
+        "std": 47.84304302591408,
+        "n": 93
+      },
+      "controllability": {
+        "agents_collided": {
+          "count": 1357,
+          "slots": 2976,
+          "percent": 45.598118279569896
+        },
+        "collisions_per_agent": {
+          "count": 2175,
+          "slots": 2976,
+          "percent": 73.08467741935483
+        },
+        "agents_offroad": {
+          "count": 2765,
+          "slots": 2976,
+          "percent": 92.90994623655914
+        },
+        "offroad_per_agent": {
+          "count": 8581,
+          "slots": 2976,
+          "percent": 288.34005376344084
+        }
+      },
+      "per_scene": [
+        {
+          "scenario_id": "i24_00000",
+          "num_agents": 55,
+          "likelihood_linear_speed": 0.8090765304288436,
+          "likelihood_linear_acceleration": 0.11496835549592703,
+          "likelihood_angular_speed": 0.5681036372982124,
+          "likelihood_angular_acceleration": 0.49570181552656906,
+          "likelihood_distance_to_nearest_object": 0.12214805854205807,
+          "likelihood_time_to_collision": 0.9389884901489982,
+          "likelihood_distance_to_road_edge": 0.19038220079126042,
+          "ade": 90.59363439097339,
+          "min_ade": 19.221471666745234,
+          "ctrl_rollouts": 32,
+          "map_id": 0
+        },
+        {
+          "scenario_id": "i24_00002",
+          "num_agents": 38,
+          "likelihood_linear_speed": 0.4289928450923755,
+          "likelihood_linear_acceleration": 0.16363462760060907,
+          "likelihood_angular_speed": 0.48556922833380445,
+          "likelihood_angular_acceleration": 0.4256287195387775,
+          "likelihood_distance_to_nearest_object": 0.19287573989398446,
+          "likelihood_time_to_collision": 0.8995349552515572,
+          "likelihood_distance_to_road_edge": 0.27479588657422005,
+          "ade": 44.33628169084104,
+          "min_ade": 10.245437245022913,
+          "ctrl_rollouts": 32,
+          "map_id": 2
+        }
+      ]
+    },
+    "regular": {
+      "scenes": 2,
+      "agents": 93,
+      "raw": {
+        "linear_speed": {
+          "mean": 0.7550910069268888,
+          "std": 0.3757460654181455,
+          "n": 93
+        },
+        "linear_acceleration": {
+          "mean": 0.08881301898373742,
+          "std": 0.035106986373567746,
+          "n": 93
+        },
+        "angular_speed": {
+          "mean": 0.010194950730043601,
+          "std": 0.015064388564094696,
+          "n": 93
+        },
+        "angular_acceleration": {
+          "mean": 0.1209883329632087,
+          "std": 0.09516751923658158,
+          "n": 93
+        },
+        "distance_to_nearest_object": {
+          "mean": 0.1599444969688706,
+          "std": 0.08225779109196342,
+          "n": 93
+        },
+        "time_to_collision": {
+          "mean": 0.9189735271832976,
+          "std": 0.17031428430906137,
+          "n": 93
+        },
+        "distance_to_road_edge": {
+          "mean": 0.25387179075544003,
+          "std": 0.17070457153747218,
+          "n": 93
+        }
+      },
+      "normalized": {
+        "linear_speed": {
+          "mean": 0.9965449279171602,
+          "std": 0.49589762325634235,
+          "n": 93
+        },
+        "linear_acceleration": {
+          "mean": 0.2776140998561818,
+          "std": 0.10973835291587014,
+          "n": 93
+        },
+        "angular_speed": {
+          "mean": 0.01060147931014268,
+          "std": 0.015665088327652652,
+          "n": 93
+        },
+        "angular_acceleration": {
+          "mean": 0.12503717728254324,
+          "std": 0.09835227647894614,
+          "n": 93
+        },
+        "distance_to_nearest_object": {
+          "mean": 0.3432822641077493,
+          "std": 0.17654649770193243,
+          "n": 93
+        },
+        "time_to_collision": {
+          "mean": 1.0139903996806092,
+          "std": 0.18792385646536264,
+          "n": 93
+        },
+        "distance_to_road_edge": {
+          "mean": 0.26269373892080966,
+          "std": 0.1766364904687327,
+          "n": 93
+        }
+      },
+      "meta": {
+        "mean": 0.43282344101074216,
+        "std": 0.08119446909581518,
+        "n": 93
+      },
+      "ade": {
+        "mean": 56.856511336960104,
+        "std": 35.43018546369546,
+        "n": 93
+      },
+      "controllability": {
+        "agents_collided": {
+          "count": 1798,
+          "slots": 2976,
+          "percent": 60.416666666666664
+        },
+        "collisions_per_agent": {
+          "count": 4019,
+          "slots": 2976,
+          "percent": 135.0470430107527
+        },
+        "agents_offroad": {
+          "count": 2946,
+          "slots": 2976,
+          "percent": 98.99193548387096
+        },
+        "offroad_per_agent": {
+          "count": 16410,
+          "slots": 2976,
+          "percent": 551.4112903225806
+        }
+      },
+      "per_scene": [
+        {
+          "scenario_id": "i24_00000",
+          "num_agents": 55,
+          "likelihood_linear_speed": 0.9530069377044466,
+          "likelihood_linear_acceleration": 0.08751192165546484,
+          "likelihood_angular_speed": 0.002994237979015173,
+          "likelihood_angular_acceleration": 0.1054392040153267,
+          "likelihood_distance_to_nearest_object": 0.1407978023789111,
+          "likelihood_time_to_collision": 0.9347049786623766,
+          "likelihood_distance_to_road_edge": 0.24172985449226025,
+          "ade": 66.37624078308836,
+          "min_ade": 30.898270848149753,
+          "ctrl_rollouts": 32,
+          "map_id": 0
+        },
+        {
+          "scenario_id": "i24_00002",
+          "num_agents": 38,
+          "likelihood_linear_speed": 0.46863373869621266,
+          "likelihood_linear_acceleration": 0.09069618616939512,
+          "likelihood_angular_speed": 0.02061703497495317,
+          "likelihood_angular_acceleration": 0.14349365117724838,
+          "likelihood_distance_to_nearest_object": 0.18765681808591733,
+          "likelihood_time_to_collision": 0.8962043210951571,
+          "likelihood_distance_to_road_edge": 0.27144564587320036,
+          "ade": 43.077955559669235,
+          "min_ade": 21.930800374872458,
+          "ctrl_rollouts": 32,
+          "map_id": 2
+        }
+      ]
+    }
+  },
+  "protocol": {
+    "init_steps": 10,
+    "sim_steps": 81,
+    "rollouts": 32,
+    "metrics": [
+      "linear_speed",
+      "linear_acceleration",
+      "angular_speed",
+      "angular_acceleration",
+      "distance_to_nearest_object",
+      "time_to_collision",
+      "distance_to_road_edge"
+    ],
+    "meta": "per agent, the unweighted mean of the seven normalized likelihoods",
+    "ceiling": "mean ground-truth agent likelihood of each metric",
+    "spread": "sample standard deviation across agents",
+    "agents": 93,
+    "methods": [
+      "ground_truth",
+      "discretized_expert",
+      "anchor",
+      "spiced",
+      "regular"
+    ],
+    "checkpoint": "/home/daphne/pufferflow/analysis/offline/i24/bc_3.npz",
+    "anchor_joint_accuracy": 0.9930870532989502,
+    "goal_freeze": false,
+    "controllability": "not in meta; agents with at least one event, and events per agent-episode; a continuous overlap counts once",
+    "policies": {
+      "spiced": "checkpoints/i24_r28/drive/i24_r28_coef0p068/0000000999817216.bin",
+      "regular": "checkpoints/i24_r28/drive/i24_r28_coef0/0000000999817216.bin"
+    },
+    "policy_actions": "32 sampled closed loops, MinGRU cleared on the first step"
+  }
+}
