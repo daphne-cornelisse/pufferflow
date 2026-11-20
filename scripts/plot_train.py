@@ -40,6 +40,14 @@ RATES = (
     ("env/completion_rate", "completion rate"),
 )
 
+# One row, used by --row.
+ROW = (
+    ("env/completion_rate", "completion rate"),
+    ("env/collision_rate", "collision rate"),
+    ("env/episode_return", "episode return"),
+    ("loss/anchor", "anchor loss"),
+)
+
 
 def parse_ini(path):
     sections = {}
@@ -77,7 +85,13 @@ def load_runs(log_dir):
         if not steps:
             continue
         base = sections.get("base", {})
+        train = sections.get("train", {})
         run_id = base.get("run_id") or path.stem
+        coef_text = train.get("anchor_coef")
+        try:
+            anchor_coef = float(coef_text) if coef_text not in (None, "") else None
+        except ValueError:
+            anchor_coef = None
         series = {}
         for key, _label in CURVES + RATES:
             vals = as_floats(metrics.get(key))
@@ -90,6 +104,7 @@ def load_runs(log_dir):
         adv_steps = as_floats(adv.get("step"))
         runs.append({
             "id": run_id,
+            "anchor_coef": anchor_coef,
             "path": path,
             "steps": np.asarray(steps, dtype=float),
             "series": series,
@@ -105,11 +120,39 @@ def align(steps, values):
     return steps[:n], values[:n]
 
 
+def is_unreg(run):
+    coef = run.get("anchor_coef")
+    return coef is not None and abs(coef) < 1e-12
+
+
+def run_label(run):
+    coef = run.get("anchor_coef")
+    if coef is None:
+        return run["id"]
+    if is_unreg(run):
+        return "unreg"
+    return f"{coef:g}"
+
+
+def run_colors(runs):
+    n_reg = sum(0 if is_unreg(run) else 1 for run in runs)
+    palette = sns.color_palette("deep", n_reg if n_reg else 1)
+    colors = []
+    reg_i = 0
+    for run in runs:
+        if is_unreg(run):
+            colors.append("black")
+            continue
+        colors.append(palette[reg_i])
+        reg_i += 1
+    return colors
+
+
 def draw(runs, out):
     sns.set_style("ticks")
     n = len(runs)
-    palette = sns.color_palette("deep", n if n else 1)
-    fig = plt.figure(figsize=(12, 13), dpi=100)
+    colors = run_colors(runs)
+    fig = plt.figure(figsize=(12, 13.4), dpi=100)
     gs = fig.add_gridspec(4, 3, hspace=0.55, wspace=0.35)
     axes = [fig.add_subplot(gs[i, j]) for i in range(3) for j in range(3)]
     var_ax = fig.add_subplot(gs[3, 0])
@@ -117,7 +160,7 @@ def draw(runs, out):
 
     for ax, (key, label) in zip(axes, CURVES):
         drew = False
-        for run, color in zip(runs, palette):
+        for run, color in zip(runs, colors):
             vals = run["series"].get(key)
             if vals is None:
                 continue
@@ -135,7 +178,7 @@ def draw(runs, out):
         else:
             ax.set_axis_off()
 
-    for run, color in zip(runs, palette):
+    for run, color in zip(runs, colors):
         xs, ys = align(run["adv_steps"], run["adv_var"])
         if len(xs) == 0:
             vals = run["series"].get("adv/var")
@@ -153,7 +196,7 @@ def draw(runs, out):
 
     for ax, (key, label) in zip(rate_axes, RATES):
         drew = False
-        for run, color in zip(runs, palette):
+        for run, color in zip(runs, colors):
             vals = run["series"].get(key)
             if not vals:
                 continue
@@ -171,7 +214,63 @@ def draw(runs, out):
         else:
             ax.set_axis_off()
 
-    fig.suptitle(f"training  ({n} runs)")
+    handles = [
+        plt.Line2D([0], [0], color=color, lw=1.4, label=run_label(run))
+        for run, color in zip(runs, colors)
+    ]
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        ncol=min(n, 6),
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.995),
+    )
+    fig.suptitle(f"training  ({n} runs)", y=1.03)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {out} runs={n}", flush=True)
+
+
+def draw_row(runs, out, panels):
+    sns.set_style("ticks")
+    n = len(runs)
+    colors = run_colors(runs)
+    fig, axes = plt.subplots(1, len(panels), figsize=(3.3 * len(panels), 3.15), dpi=140)
+    if len(panels) == 1:
+        axes = [axes]
+    for ax, (key, label) in zip(axes, panels):
+        drew = False
+        for run, color in zip(runs, colors):
+            vals = run["series"].get(key)
+            if not vals:
+                continue
+            xs, ys = align(run["steps"], vals)
+            if len(xs) == 0:
+                continue
+            ax.plot(xs, ys, color=color, lw=1.6)
+            drew = True
+        ax.set_title(label)
+        ax.set_xlabel("steps")
+        ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
+        ax.grid(True, alpha=0.3)
+        if drew:
+            sns.despine(ax=ax)
+        else:
+            ax.set_axis_off()
+    handles = [
+        plt.Line2D([0], [0], color=color, lw=1.6, label=run_label(run))
+        for run, color in zip(runs, colors)
+    ]
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        ncol=min(n, 6),
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.08),
+    )
+    fig.tight_layout()
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, bbox_inches="tight")
@@ -207,6 +306,11 @@ def main():
         action="store_true",
         help="keep redrawing as runs finish",
     )
+    parser.add_argument(
+        "--row",
+        action="store_true",
+        help="one row: completion, collision, return, anchor loss",
+    )
     args = parser.parse_args()
     out = args.o or str(Path(args.log_dir) / "train.png")
     if not args.watch:
@@ -214,14 +318,21 @@ def main():
         if not runs:
             print(f"no finished runs in {args.log_dir}", flush=True)
             return
-        draw(runs, out)
+        if args.row:
+            draw_row(runs, out, ROW)
+        else:
+            draw(runs, out)
         return
 
     plotted = 0
     while True:
         n = finished_count(args.log_dir)
         if n >= plotted + args.every and n > 0:
-            draw(load_runs(args.log_dir), out)
+            runs = load_runs(args.log_dir)
+            if args.row:
+                draw_row(runs, out, ROW)
+            else:
+                draw(runs, out)
             plotted = n
         time.sleep(30)
 

@@ -263,6 +263,19 @@ class I24ConversionTest(unittest.TestCase):
             count, sdc_index = struct.unpack("<ii", raw)
             self.assertEqual((count, sdc_index), (1, 0))
 
+    def test_scene1_clock_drops_samples_after_90_seconds(self):
+        early = self.raw_object(1, 6.0, start=1000.0, seconds=10.0)
+        late = self.raw_object(2, 18.0, start=1095.0, seconds=10.0)
+        crossing = self.raw_object(3, 6.0, start=1080.0, seconds=20.0)
+        kept, stats = CONVERTER.clip_scene_clock(
+            [early, late, crossing], CONVERTER.SCENE1_CLOCK_SECONDS
+        )
+        self.assertEqual(stats["dropped_tracks"], 1)
+        self.assertEqual(stats["clipped_tracks"], 1)
+        self.assertEqual([obj["id"] for obj in kept], [1, 3])
+        self.assertLessEqual(max(kept[1]["timestamp"]), 1090.0 + 1e-9)
+        self.assertGreater(len(crossing["timestamp"]), len(kept[1]["timestamp"]))
+
     def test_caps_a_track_at_the_90_second_scene(self):
         sdc = CONVERTER.normalize_object(
             self.raw_object(4, 6.0, seconds=100.0), self.road_grid

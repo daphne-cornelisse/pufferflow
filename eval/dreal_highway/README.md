@@ -37,10 +37,10 @@ Features are computed on that one trajectory and repeated along the rollout axis
 
 The seven likelihoods are linear speed, linear acceleration, angular speed, angular acceleration, distance to the nearest object, time to collision, and signed distance to the road edge.
 
-Each agent's likelihood is the exp of its mean log probability. The ground-truth ceiling for a metric is the mean of those agent likelihoods, and the reported value divides by that ceiling. Every score is the mean ± the sample standard deviation across agents, and the report gives the total number of agents. An agent is included when the ground-truth likelihood is finite on all seven metrics. Eta is the unweighted mean of the seven normalized likelihoods for each agent. ADE is the displacement from the log over the same window.
+Each agent's likelihood is the exp of its mean log probability. The ground-truth ceiling for a metric is the mean of those agent likelihoods, and the reported value divides by that ceiling. Every score is the mean ± the sample standard deviation across agents, and the report gives the total number of agents. An agent is included when the ground-truth likelihood is finite on all seven metrics. Meta is the unweighted mean of the seven normalized likelihoods for each agent. ADE is the displacement from the log over the same window.
 
 ## Controllability
 
-Reported beside the likelihoods, and not inside eta. The denominator is the scored agents. A sampled policy uses agents × rollouts, one episode per rollout.
+Reported beside the likelihoods, and not inside meta. The denominator is the scored agents. A sampled policy uses agents × rollouts, one episode per rollout.
 
 A collision is the simulator's vehicle-box overlap. An off-road collision is the simulator's road-edge intersection. A run of overlapping steps counts as one event. The two rates are agents with at least one event in the episode, and total events divided by those agents. Ground truth ignores timesteps the log marks invalid.

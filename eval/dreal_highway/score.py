@@ -623,7 +623,7 @@ def _rising_events(flags):
 
 
 def _control_row(collision, offroad, step_valid):
-    """Per agent, summed over rollouts. Not part of eta."""
+    """Per agent, summed over rollouts. Not part of meta."""
     collided = np.asarray(collision, dtype=bool)
     outside = np.asarray(offroad, dtype=bool)
     if collided.shape != outside.shape or collided.ndim != 3:
@@ -809,9 +809,9 @@ def aggregate(by_method):
             normalized[name] = _mean_std(scaled)
             per_agent.append(scaled)
         stacked = np.stack(per_agent, axis=0)
-        eta = _mean_std(stacked.mean(axis=0))
+        meta_score = _mean_std(stacked.mean(axis=0))
         ade = _mean_std(_pool_masked(rows, "agent_ade", masks))
-        for stat in (*normalized.values(), eta, ade):
+        for stat in (*normalized.values(), meta_score, ade):
             if stat["n"] != n_agents:
                 raise RuntimeError(f"{method} does not use all {n_agents} agents")
         control = _control_summary(rows, masks)
@@ -825,7 +825,7 @@ def aggregate(by_method):
             "agents": n_agents,
             "raw": raw,
             "normalized": normalized,
-            "eta": eta,
+            "meta": meta_score,
             "ade": ade,
             "controllability": control,
             "per_scene": [_scene_public(row) for row in rows],
@@ -863,7 +863,7 @@ def print_report(summary, accuracy):
                 flush=True,
             )
         print(
-            f"{method:22s} {'eta':28s} {_fmt_pm(block['eta']):>22s} {block['eta']['n']:6d}",
+            f"{method:22s} {'meta':28s} {_fmt_pm(block['meta']):>22s} {block['meta']['n']:6d}",
             flush=True,
         )
         print(
@@ -914,11 +914,22 @@ def main():
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument(
+        "--maps",
+        default=None,
+        help="comma-separated map ids (default: every scene, in order)",
+    )
     args = parser.parse_args()
     policies = parse_policies(args.policy)
     paths = sorted(JSON_DIR.glob("*.json"))
     if len(paths) != 3:
         raise RuntimeError(f"expected 3 I24 scenes, found {len(paths)}")
+    selected = list(enumerate(paths))
+    if args.maps:
+        want = [int(part) for part in args.maps.split(",") if part != ""]
+        selected = [(map_id, path) for map_id, path in selected if map_id in want]
+        if [map_id for map_id, _path in selected] != want:
+            raise RuntimeError(f"--maps {args.maps} does not match the scene files")
     cfg = load_config()
     for name in FIELDS:
         hist_params(cfg, name)
@@ -933,7 +944,7 @@ def main():
     by_method = {method: [] for method in REQUIRED}
     for name, _ckpt in policies:
         by_method[name] = []
-    for map_id, path in enumerate(paths):
+    for map_id, path in selected:
         doc = json.loads(path.read_text())
         h = drv.create_scenario(lib, DATA, map_id, path)
         try:
@@ -990,7 +1001,7 @@ def main():
         "sim_steps": SIM_STEPS,
         "rollouts": ROLLOUTS,
         "metrics": list(FIELDS),
-        "eta": "per agent, the unweighted mean of the seven normalized likelihoods",
+        "meta": "per agent, the unweighted mean of the seven normalized likelihoods",
         "ceiling": "mean ground-truth agent likelihood of each metric",
         "spread": "sample standard deviation across agents",
         "agents": summary["agents"],
@@ -999,7 +1010,7 @@ def main():
         "anchor_joint_accuracy": accuracy,
         "goal_freeze": False,
         "controllability": (
-            "not in eta; agents with at least one event, and events per "
+            "not in meta; agents with at least one event, and events per "
             "agent-episode; a continuous overlap counts once"
         ),
     }
@@ -1014,7 +1025,9 @@ def main():
         if out.resolve() == OUT_PATH.resolve():
             raise RuntimeError("refusing to overwrite the anchor comparison")
     else:
-        out = OUT_PATH
+        out = args.out or OUT_PATH
+        if out.resolve() == OUT_PATH.resolve() and args.maps:
+            raise RuntimeError("refusing to overwrite the anchor comparison")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, indent=2) + "\n")
     print_report(summary, accuracy)

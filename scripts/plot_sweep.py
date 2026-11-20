@@ -355,7 +355,14 @@ def load_frames(log_path, metrics_dir):
             ),
             "parameters": policy_params(hidden, layers),
         })
+        # Map 0 is logged as score_town_01. On I24 that is the highway
+        # score, not a CARLA town, so the density panel stays empty.
+        data_dir = section_text(text, "env", "data_dir") or ""
+        i24 = "i24" in data_dir
         for key, _title in TOWN_FIELDS:
+            if i24:
+                summary[-1][key] = float("nan")
+                continue
             vals = metric_series(text, "env/" + key)
             summary[-1][key] = vals[-1] if vals else float("nan")
         for label, section, key in HYPER_FIELDS:
@@ -1691,6 +1698,7 @@ def main():
     allowed = (
         (ROOT / "logs" / "drive").resolve(),
         (ROOT / "logs" / "replay_sweep").resolve(),
+        (ROOT / "logs" / "i24_sweep").resolve(),
     )
     if out.parent.resolve() not in allowed:
         out = ROOT / "logs" / "drive" / out.name
