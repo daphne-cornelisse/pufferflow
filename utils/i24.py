@@ -68,6 +68,8 @@ ROAD_SAMPLE_METERS = 5.0
 # Longest I24 scene clock. Inclusive 10 Hz states: t = 0 through t = 90.
 MAX_SCENARIO_SECONDS = 90
 MAX_TRAJECTORY_STATES = MAX_SCENARIO_SECONDS * SAMPLE_HZ + 1
+# Scene 1's raw file runs about 114 s. Samples after this clock are unused.
+SCENE1_CLOCK_SECONDS = 90.0
 assert MAX_TRAJECTORY_STATES == DRIVE_LOG_MAX
 HEADING_WINDOW_HALF_SECONDS = 0.5
 HEADING_MIN_RELIABLE_SPEED_MPS = 0.5
@@ -838,6 +840,56 @@ def normalize_object(
     return normalized
 
 
+def clip_scene_clock(
+    raw_objects: list[dict[str, Any]], seconds: float
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Drop samples later than `seconds` after the file's first timestamp.
+
+    A track with fewer than two samples left is removed. Parallel sample
+    arrays are sliced together. Scalar fields are copied through.
+    """
+    starts = [
+        float(raw["timestamp"][0])
+        for raw in raw_objects
+        if raw.get("timestamp")
+    ]
+    if not starts:
+        return raw_objects, {
+            "clock_seconds": float(seconds),
+            "origin_unix": None,
+            "limit_unix": None,
+            "dropped_tracks": 0,
+            "clipped_tracks": 0,
+            "kept_tracks": 0,
+        }
+    origin = min(starts)
+    limit = origin + float(seconds)
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    clipped = 0
+    for raw in raw_objects:
+        timestamps = [float(value) for value in raw["timestamp"]]
+        chosen = [index for index, stamp in enumerate(timestamps) if stamp <= limit + 1e-9]
+        if len(chosen) < 2:
+            dropped += 1
+            continue
+        if chosen[-1] != len(timestamps) - 1 or chosen != list(range(len(chosen))):
+            clipped += 1
+            raw = dict(raw)
+            raw["timestamp"] = [raw["timestamp"][index] for index in chosen]
+            raw["x_position"] = [raw["x_position"][index] for index in chosen]
+            raw["y_position"] = [raw["y_position"][index] for index in chosen]
+        kept.append(raw)
+    return kept, {
+        "clock_seconds": float(seconds),
+        "origin_unix": origin,
+        "limit_unix": limit,
+        "dropped_tracks": dropped,
+        "clipped_tracks": clipped,
+        "kept_tracks": len(kept),
+    }
+
+
 def normalize_scene(
     i24_root: Path, scene: int, stabilize_headings: bool = True
 ) -> dict[str, Any]:
@@ -845,6 +897,10 @@ def normalize_scene(
     homography_path = i24_root / "data" / "hg" / f"scene{scene}_hg.json"
     with splines_path.open() as file:
         raw_objects = json.load(file)
+    source_count = len(raw_objects)
+    clock_clip = None
+    if scene == 1:
+        raw_objects, clock_clip = clip_scene_clock(raw_objects, SCENE1_CLOCK_SECONDS)
     road_grid = load_road_grid(homography_path)
     objects = []
     removed = []
@@ -866,7 +922,8 @@ def normalize_scene(
             "heading": "radians",
         },
         "source": str(splines_path),
-        "source_object_count": len(raw_objects),
+        "source_object_count": source_count,
+        "scene_clock_clip": clock_clip,
         "object_count": len(objects),
         "heading_estimation": _heading_estimation_metadata(stabilize_headings),
         "position_repair": _position_repair_summary(repairs, removed),
@@ -1585,6 +1642,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
                 "scenario_count": len(scenarios) - scene_scenarios_before,
                 "quality_flag_counts": dict(sorted(scene_flag_counts.items())),
                 "position_repair": scene_data.get("position_repair", {}),
+                "scene_clock_clip": scene_data.get("scene_clock_clip"),
             }
         )
 

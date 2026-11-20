@@ -34,6 +34,7 @@ Processing assumptions:
 
 - Positions and sizes in the splines are feet. Logs are meters.
 - Time is 10 Hz with both endpoints. A track keeps its own length, capped at 90 s.
+- Scene 1 is also cut on the file clock. The origin is the earliest timestamp in `scene1_splobj.json`. A sample later than 90 s after that origin is dropped before resampling, and a track with fewer than two samples left is removed. Scenes 2 and 3 keep their full clocks.
 - Body styles `sedan`, `midsize`, `pickup`, `van`, `semi`, `truck`, and `cs` are vehicle-like. The exported length then selects `vehicle` or `truck` with the shared 7.5 m cut. `cs` is the one car-sized track in scene 3. Any other label is an error.
 - Exported length, width, and height are 0.90 of the annotated size, after the small-size defaults (4.5 m, 1.8 m, 1.5 m).
 - Heading is a 1.0 s centered regression on position. Below 0.5 m/s the last reliable heading is held. That regression leaves the samples unchanged. Position repair below rewrites samples first, and velocity is the centered difference of the repaired samples. `--no-stabilize-headings` uses the per-frame velocity heading instead.
