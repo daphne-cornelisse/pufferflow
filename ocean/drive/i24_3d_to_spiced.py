@@ -1,8 +1,8 @@
-"""Prototype converter from I24-3D ground-truth splines to spiced self-play.
+"""Prototype converter from I24-3D trajectories to spiced self-play.
 
 The converter deliberately has two outputs:
 
-1. A scene-level, full-length 10 Hz file that retains every ground-truth spline.
+1. A scene-level, full-length 10 Hz file that retains every source trajectory.
 2. One or more 91-state (9.0 second) scenarios accepted by spiced_self_play,
    or full-SDC scenarios for exact PufferDrive replay.
 
@@ -13,8 +13,10 @@ in feet; all exported distances are in meters.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
+import statistics
 from collections import Counter
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -146,6 +148,160 @@ def _interpolate(
         return values[index], index
     fraction = max(0.0, min(1.0, (target - left_t) / (right_t - left_t)))
     return values[index] + fraction * (values[index + 1] - values[index]), index
+
+
+def load_authored_annotation_rows(
+    i24_root: Path, scene: int
+) -> dict[int, list[dict[str, Any]]]:
+    """Load manual and inspected-linear rows with corrected camera timestamps."""
+    timestamp_path = i24_root / "data" / "ts" / f"scene{scene}_ts.csv"
+    timestamps: dict[int, dict[str, float]] = {}
+    with timestamp_path.open(newline="") as file:
+        for row in csv.DictReader(file):
+            frame = int(row["frame"])
+            timestamps[frame] = {
+                camera: float(value)
+                for camera, value in row.items()
+                if camera != "frame" and value not in (None, "")
+            }
+
+    annotation_path = i24_root / "data" / "obj" / f"scene{scene}_annotations.csv"
+    objects: dict[int, list[dict[str, Any]]] = {}
+    with annotation_path.open(newline="") as file:
+        for row in csv.DictReader(file):
+            if row["gen"] not in {"manual", "interpolation"}:
+                continue
+            frame = int(row["frame"])
+            camera = row["camera"]
+            if frame not in timestamps or camera not in timestamps[frame]:
+                raise ValueError(
+                    f"No corrected timestamp for scene {scene}, frame {frame}, camera {camera}"
+                )
+            object_id = int(row["id"])
+            objects.setdefault(object_id, []).append(
+                {
+                    "frame": frame,
+                    "camera": camera,
+                    "timestamp": timestamps[frame][camera],
+                    "x": float(row["x"]),
+                    "y": float(row["y"]),
+                    "l": float(row["l"]),
+                    "w": float(row["w"]),
+                    "h": float(row["h"]),
+                    "direction": int(row["direction"]),
+                    "class": str(row["class"]),
+                    "gen": row["gen"],
+                }
+            )
+    return objects
+
+
+def _dedupe_series(rows: list[dict[str, Any]]) -> tuple[list[float], list[float], list[float]]:
+    """Sort one camera's rows and average observations with identical timestamps."""
+    grouped: dict[float, list[tuple[float, float]]] = {}
+    for row in rows:
+        grouped.setdefault(float(row["timestamp"]), []).append((float(row["x"]), float(row["y"])))
+    timestamps = sorted(grouped)
+    xs = [statistics.fmean(value[0] for value in grouped[timestamp]) for timestamp in timestamps]
+    ys = [statistics.fmean(value[1] for value in grouped[timestamp]) for timestamp in timestamps]
+    return timestamps, xs, ys
+
+
+def annotation_rows_to_raw_object(
+    object_id: int, rows: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Fuse per-camera annotations into a single 10 Hz trajectory.
+
+    Each camera is interpolated independently only over the interval in which
+    it observes the vehicle. Simultaneous camera estimates are combined by
+    coordinate-wise median. Empty ticks between observed ticks are filled by
+    linear interpolation and recorded in the returned provenance fields.
+    """
+    if len(rows) < 2:
+        raise ValueError(f"Annotation trajectory {object_id} has fewer than two authored rows")
+
+    by_camera: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_camera.setdefault(str(row["camera"]), []).append(row)
+    camera_series = {
+        camera: _dedupe_series(camera_rows) for camera, camera_rows in by_camera.items()
+    }
+
+    first_timestamp = min(series[0][0] for series in camera_series.values())
+    last_timestamp = max(series[0][-1] for series in camera_series.values())
+    first_tick = math.ceil(first_timestamp * SAMPLE_HZ - 1e-5)
+    last_tick = math.floor(last_timestamp * SAMPLE_HZ + 1e-5)
+    fused: dict[int, tuple[float, float]] = {}
+    for tick in range(first_tick, last_tick + 1):
+        target = tick / SAMPLE_HZ
+        candidates_x: list[float] = []
+        candidates_y: list[float] = []
+        for timestamps, xs, ys in camera_series.values():
+            if len(timestamps) < 2 or target < timestamps[0] or target > timestamps[-1]:
+                continue
+            x, _ = _interpolate(timestamps, xs, target, 0)
+            y, _ = _interpolate(timestamps, ys, target, 0)
+            candidates_x.append(x)
+            candidates_y.append(y)
+        if candidates_x:
+            fused[tick] = (statistics.median(candidates_x), statistics.median(candidates_y))
+
+    if len(fused) < 2:
+        raise ValueError(f"Annotation trajectory {object_id} has fewer than two fused ticks")
+
+    observed_ticks = sorted(fused)
+    output_first = observed_ticks[0]
+    output_last = observed_ticks[-1]
+    filled_ticks = 0
+    max_gap_ticks = 0
+    positions: list[tuple[float, float]] = []
+    left_index = 0
+    for tick in range(output_first, output_last + 1):
+        if tick in fused:
+            positions.append(fused[tick])
+            continue
+        filled_ticks += 1
+        while left_index + 1 < len(observed_ticks) and observed_ticks[left_index + 1] < tick:
+            left_index += 1
+        left_tick = observed_ticks[left_index]
+        right_tick = observed_ticks[left_index + 1]
+        max_gap_ticks = max(max_gap_ticks, right_tick - left_tick - 1)
+        fraction = (tick - left_tick) / (right_tick - left_tick)
+        left = fused[left_tick]
+        right = fused[right_tick]
+        positions.append(
+            (
+                left[0] + fraction * (right[0] - left[0]),
+                left[1] + fraction * (right[1] - left[1]),
+            )
+        )
+
+    representative = max(rows, key=lambda row: (row["gen"] == "manual", row["timestamp"]))
+    return {
+        "id": object_id,
+        "class": representative["class"],
+        "direction": representative["direction"],
+        "l": statistics.median(float(row["l"]) for row in rows),
+        "w": statistics.median(float(row["w"]) for row in rows),
+        "h": statistics.median(float(row["h"]) for row in rows),
+        "timestamp": [tick / SAMPLE_HZ for tick in range(output_first, output_last + 1)],
+        "x_position": [position[0] for position in positions],
+        "y_position": [position[1] for position in positions],
+        "trajectory_source": "manual_and_interpolated_annotations",
+        "source_annotation_count": len(rows),
+        "source_camera_count": len(by_camera),
+        "annotation_gap_filled_ticks": filled_ticks,
+        "annotation_max_gap_ticks": max_gap_ticks,
+    }
+
+
+def load_annotation_raw_objects(i24_root: Path, scene: int) -> list[dict[str, Any]]:
+    authored = load_authored_annotation_rows(i24_root, scene)
+    return [
+        annotation_rows_to_raw_object(object_id, rows)
+        for object_id, rows in sorted(authored.items())
+        if len(rows) >= 2
+    ]
 
 
 def _stabilized_headings(
@@ -312,18 +468,38 @@ def normalize_object(
         "heading_rad": headings,
         "source_sample_count": len(raw["timestamp"]),
     }
+    for key in (
+        "trajectory_source",
+        "source_annotation_count",
+        "source_camera_count",
+        "annotation_gap_filled_ticks",
+        "annotation_max_gap_ticks",
+    ):
+        if key in raw:
+            normalized[key] = raw[key]
     if quality_flags:
         normalized["quality_flags"] = quality_flags
     return normalized
 
 
 def normalize_scene(
-    i24_root: Path, scene: int, stabilize_headings: bool = False
+    i24_root: Path,
+    scene: int,
+    stabilize_headings: bool = False,
+    trajectory_source: str = "splines",
 ) -> dict[str, Any]:
     splines_path = i24_root / "data" / "spl_obj" / f"scene{scene}_splobj.json"
+    annotations_path = i24_root / "data" / "obj" / f"scene{scene}_annotations.csv"
     homography_path = i24_root / "data" / "hg" / f"scene{scene}_hg.json"
-    with splines_path.open() as file:
-        raw_objects = json.load(file)
+    if trajectory_source == "splines":
+        with splines_path.open() as file:
+            raw_objects = json.load(file)
+        source_path = splines_path
+    elif trajectory_source == "annotations":
+        raw_objects = load_annotation_raw_objects(i24_root, scene)
+        source_path = annotations_path
+    else:
+        raise ValueError(f"Unsupported trajectory source: {trajectory_source}")
     road_grid = load_road_grid(homography_path)
     objects = [
         normalize_object(raw, road_grid, stabilize_headings=stabilize_headings)
@@ -334,7 +510,8 @@ def normalize_scene(
         "scene": scene,
         "sample_hz": SAMPLE_HZ,
         "units": {"position": "meters", "velocity": "meters_per_second", "heading": "radians"},
-        "source": str(splines_path),
+        "source": str(source_path),
+        "trajectory_source": trajectory_source,
         "object_count": len(objects),
         "heading_estimation": _heading_estimation_metadata(stabilize_headings),
         "map": road_grid,
@@ -499,6 +676,7 @@ def build_spiced_scenario(
             "duration_seconds": (state_count - 1) / SAMPLE_HZ,
             "source_scene": scene_data["scene"],
             "source_sdc_id": sdc_id,
+            "trajectory_source": scene_data.get("trajectory_source", "splines"),
             "source_start_time_unix": start_tick / SAMPLE_HZ,
             "heading_estimation": scene_data.get(
                 "heading_estimation", _heading_estimation_metadata(False)
@@ -925,7 +1103,10 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
 
     for scene in scenes:
         scene_data = normalize_scene(
-            args.i24_root.resolve(), scene, stabilize_headings=args.stabilize_headings
+            args.i24_root.resolve(),
+            scene,
+            stabilize_headings=args.stabilize_headings,
+            trajectory_source=args.trajectory_source,
         )
         source_object_count += scene_data["object_count"]
         scene_flag_counts = Counter(
@@ -1007,6 +1188,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
         "scenes": list(scenes),
         "source_object_count": source_object_count,
         "sample_hz": SAMPLE_HZ,
+        "trajectory_source": args.trajectory_source,
         "heading_estimation": _heading_estimation_metadata(args.stabilize_headings),
         "full_trajectory_outputs": full_paths,
         "full_trajectory_files": full_files,
@@ -1035,6 +1217,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
             "max_objects": args.max_objects,
             "exclude_major_flags": args.exclude_major_flags,
             "stabilize_headings": args.stabilize_headings,
+            "trajectory_source": args.trajectory_source,
         },
         "notes": [
             "Quality flags are warnings; the prototype retains flagged source trajectories.",
@@ -1043,6 +1226,7 @@ def convert(args: argparse.Namespace) -> dict[str, Any]:
             "Each 91-state file spans 9.0 seconds because both endpoints are included at 10 Hz.",
             "Full-length scenarios are for PufferDrive replay; the current spiced self-play training pipeline still expects 91 states.",
             "Heading stabilization is opt-in and never modifies exported positions or velocities.",
+            "Annotation trajectories use only manual and inspected linear-interpolation rows; per-camera estimates are fused by coordinate-wise median at 10 Hz.",
         ],
     }
     write_json(args.output_dir / "manifest.json", manifest)
@@ -1057,6 +1241,12 @@ def parser() -> argparse.ArgumentParser:
     argument_parser.add_argument("--output-dir", type=Path, default=repo_root / "data" / "i24_3d_prototype")
     argument_parser.add_argument("--scene", type=int, choices=(1, 2, 3), default=2)
     argument_parser.add_argument("--all-scenes", action="store_true", help="Process scenes 1, 2, and 3")
+    argument_parser.add_argument(
+        "--trajectory-source",
+        choices=("splines", "annotations"),
+        default="splines",
+        help="Use released spl_obj trajectories or reconstruct from per-camera authored annotations",
+    )
     argument_parser.add_argument("--sdc-id", type=int, default=None, help="Default: automatically choose a long, clean trajectory")
     argument_parser.add_argument("--all-sdcs", action="store_true", help="Export every SDC with a complete 91-state window")
     argument_parser.add_argument(
@@ -1109,6 +1299,7 @@ def main() -> None:
         "schema",
         "mode",
         "scenes",
+        "trajectory_source",
         "source_object_count",
         "eligible_sdc_count",
         "exported_sdc_count",

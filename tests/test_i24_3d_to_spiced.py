@@ -87,6 +87,35 @@ class I24ConversionTest(unittest.TestCase):
         self.assertAlmostEqual(obj["velocity_mps"][50][0], 30 * CONVERTER.FEET_TO_METERS)
         self.assertAlmostEqual(obj["heading_rad"][50], 0.0)
 
+    def test_fuses_overlapping_per_camera_annotations_at_10_hz(self):
+        rows = []
+        for camera, start_x, y in (("p1c1", 0.0, 6.0), ("p1c2", 2.0, 8.0)):
+            for timestamp, offset in ((10.0, 0.0), (10.2, 2.0)):
+                rows.append(
+                    {
+                        "frame": round((timestamp - 10.0) * 30),
+                        "camera": camera,
+                        "timestamp": timestamp,
+                        "x": start_x + offset,
+                        "y": y,
+                        "l": 15.0,
+                        "w": 6.0,
+                        "h": 5.0,
+                        "direction": 1,
+                        "class": "sedan",
+                        "gen": "manual",
+                    }
+                )
+
+        raw = CONVERTER.annotation_rows_to_raw_object(4, rows)
+
+        self.assertEqual(raw["timestamp"], [10.0, 10.1, 10.2])
+        self.assertEqual(raw["x_position"], [1.0, 2.0, 3.0])
+        self.assertEqual(raw["y_position"], [7.0, 7.0, 7.0])
+        self.assertEqual(raw["source_camera_count"], 2)
+        self.assertEqual(raw["annotation_gap_filled_ticks"], 0)
+        self.assertEqual(raw["trajectory_source"], "manual_and_interpolated_annotations")
+
     def test_heading_stabilization_is_opt_in_and_only_changes_headings(self):
         raw = self.raw_object_with_noisy_stop()
         default = CONVERTER.normalize_object(raw, self.road_grid)

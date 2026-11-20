@@ -187,6 +187,36 @@ their closest approach anywhere along the full ego trajectory. Add
 `--stabilize-headings` to a full-length export when a separate stabilized
 visualization dataset is desired; use a new output directory to retain both.
 
+To reconstruct a replay from the authored per-camera rows instead of the
+released splines, add `--trajectory-source annotations`. This excludes rows
+whose `gen` field is `spline`, interpolates each camera independently at 10 Hz,
+and takes the coordinate-wise median where cameras overlap. For example:
+
+```bash
+python ocean/drive/i24_3d_to_spiced.py \
+  --scene 1 \
+  --sdc-id 277 \
+  --full-length \
+  --trajectory-source annotations \
+  --output-dir data/i24_s1_v277_full_annotations \
+  --skip-full \
+  --skip-preview
+```
+
+Audit every released spline against only the manual and inspected-interpolation
+annotation rows with:
+
+```bash
+python ocean/drive/audit_i24_splines.py
+```
+
+The audit writes a per-trajectory CSV and a JSON summary under
+`data/i24_spline_audit/`. Its conservative `bad` tier flags a p95 positional
+residual over 25 feet, a wrong-way longitudinal excursion over 50 feet, or more
+than 6 feet of carriageway departure not already present in the annotations.
+The lower `review` tier is intended for visual inspection rather than automatic
+exclusion.
+
 `checkpoints/bottleneck.bin` is the 512×5 policy:
 
 ```

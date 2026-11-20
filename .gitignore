@@ -208,4 +208,10 @@ resources/trailer/shots/*.mp4
 # Local refactor baselines (not for commit)
 .refactor-snapshots/
 
+# Local generated I-24 and experiment artifacts
+/drive_gui
+/hg/
+/videos/
+/ring_road_jams.gif
+
 vendor/fast-nle/
