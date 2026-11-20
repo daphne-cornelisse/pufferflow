@@ -190,8 +190,11 @@ ocean/antibody/generated/
 
 # Data. The bottleneck map is tracked so tests can load it.
 # The four mixed CARLA maps are the drive sweep: Town01, Town02,
-# Town06, Town10HD.
+# Town06, Town10HD. data/i24 is the three-scene highway release:
+# processed logs, map binaries, figures, and the raw BMVC files.
 data/*
+!data/i24/
+data/i24/**/.~lock.*
 !data/bottleneck/
 data/bottleneck/*
 !data/bottleneck/binaries/
