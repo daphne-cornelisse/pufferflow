@@ -163,6 +163,7 @@ dmypy.json
 # (846,336 parameters), the Town01 run 173 weights (512x3,
 # 2,872,320 parameters), and the 1000-map Waymo BC anchor
 # (704x3, 257 bins, joint accuracy 0.797).
+# I24: the 3-scene anchor and the two 1B self-play policies.
 checkpoints/*
 !checkpoints/bottleneck.bin
 !checkpoints/bottleneck_1m.bin
@@ -171,6 +172,9 @@ checkpoints/*
 !checkpoints/bottleneck_2m.bin
 !checkpoints/town01.bin
 !checkpoints/bc_womd_1000.npz
+!checkpoints/bc_i24.npz
+!checkpoints/rl_i24_coef0.bin
+!checkpoints/rl_i24_coef0p068.bin
 experiments/
 wandb/
 .neptune/
