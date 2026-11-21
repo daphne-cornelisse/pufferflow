@@ -204,6 +204,13 @@ struct Env {
     char* map_name;
     // Index of map_%03d.bin. 0 Town01, 1 Town02, 2 Town06, 3 Town10HD.
     int map_id;
+    // Env steps between map batches. 0 keeps the batch chosen at startup.
+    // The trainer applies it between rollouts, not inside puf_step.
+    int resample_frequency;
+    // Finished episodes per copy between map batches. 0 uses the step count.
+    int resample_episodes;
+    // Finished episodes since the trainer last read this copy.
+    int episode_ends;
     float world_mean_x;
     float world_mean_y;
     float reward_goal;
@@ -282,6 +289,8 @@ struct Env {
     float goal_speed;
     // Hold the logged goal. Training removes the car and can end early.
     int goal_stop;
+    // 1 samples another goal on arrival. 0 removes the car, including CARLA.
+    int goal_resample;
     int wosac_on;
     int wosac_fill;
     int wosac_rolls;
@@ -355,6 +364,8 @@ static void skip_bytes(FILE* file, long n) {
 #define CONTROL_MIXED_PLAY 4
 // PufferDrive keeps this many actors in a human-replay scene.
 #define REPLAY_ACTORS 32
+// Objects read from one log before the agent cap. One Waymo scene has 515.
+#define LOG_CAND_MAX 1024
 
 static int drive_control_mode(const char* name) {
     if (strcmp(name, "control_vehicles") == 0) {
@@ -479,12 +490,30 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     int head[4];
     assert(fread(head, sizeof(int), 4, file) == 4);
     int log_map = head[3] >= 2 && head[3] <= DRIVE_LOG_MAX
-        && head[0] >= 0 && head[0] <= 512
+        && head[0] >= 0 && head[0] <= LOG_CAND_MAX
         && head[1] > 0 && head[2] >= VEHICLE && head[2] <= TRUCK;
     if (!log_map) {
         assert(fseek(file, 0, SEEK_SET) == 0);
         assert(fread(&env->num_roads, sizeof(int), 1, file) == 1);
         assert(env->num_roads >= 0);
+        // Road maps from before truck took id 4 stored lane as 4.
+        // A file that still has a 4 is that encoding. Logs are unchanged.
+        long roads_at = ftell(file);
+        int legacy = 0;
+        for (int i = 0; i < env->num_roads; i++) {
+            int type = 0;
+            int size = 0;
+            assert(fread(&type, sizeof(int), 1, file) == 1);
+            assert(fread(&size, sizeof(int), 1, file) == 1);
+            if (type == 4) {
+                legacy = 1;
+            }
+            assert(size >= 1);
+            long skip = (long)size * 3L * (long)sizeof(float)
+                + 6L * (long)sizeof(float) + (long)sizeof(int);
+            assert(fseek(file, skip, SEEK_CUR) == 0);
+        }
+        assert(fseek(file, roads_at, SEEK_SET) == 0);
         env->num_objects = 0;
         env->log_spawn = 0;
         env->num_entities = env->num_roads;
@@ -495,6 +524,9 @@ Entity* load_map_binary(const char* filename, Drive* env) {
             int size = 0;
             assert(fread(&type, sizeof(int), 1, file) == 1);
             assert(fread(&size, sizeof(int), 1, file) == 1);
+            if (legacy) {
+                type += 1;
+            }
             read_road(file, &entities[i], type, size);
         }
         unsigned char extra = 0;
@@ -533,9 +565,9 @@ Entity* load_map_binary(const char* filename, Drive* env) {
         vseries = (int*)malloc((size_t)nobj * (size_t)traj * sizeof(int));
         assert(series && vseries);
     }
-    LogSpawn cand[512];
-    int cand_expert[512];
-    float dist2[512];
+    LogSpawn cand[LOG_CAND_MAX];
+    int cand_expert[LOG_CAND_MAX];
+    float dist2[LOG_CAND_MAX];
     int nc = 0;
     LogSpawn gkeep[512];
     int gk = 0;
@@ -590,7 +622,7 @@ Entity* load_map_binary(const char* filename, Drive* env) {
         int moving = type == VEHICLE || type == TRUCK
             || type == PEDESTRIAN || type == CYCLIST;
         if (moving && valid) {
-            assert(nc < 512);
+            assert(nc < LOG_CAND_MAX);
             float dx = gx - x;
             float dy = gy - y;
             cand[nc] = (LogSpawn){
@@ -2522,8 +2554,11 @@ static float route_progress(Drive* env, float px, float py, int frame,
 // Pads (goals_sampled == 0) are not cars. A logged scene ends when
 // every spawned car has arrived, or at episode_length, whichever
 // comes first. That length is this log's state count, unless the
-// ini is shorter. goal_stop runs the configured horizon. CARLA respawns.
+// ini is shorter. goal_stop runs the configured horizon. CARLA
+// respawns while goal_resample is on, and ends the same way as a
+// log when it is off.
 static void end_episode(Drive* env) {
+    env->episode_ends++;
     if (env->wosac_on) {
         assert(env->wosac_fill == env->episode_length);
         wosac_dump(env);
@@ -2613,7 +2648,8 @@ void puf_step(Drive* env) {
         env->agents[i].terminals[0] = 0;
         int pad = env->entities[i].goals_sampled <= 0;
         int done = env->entities[i].reached_goal && !env->goal_stop;
-        if (env->log_spawn && (pad || done)) {
+        int hold = env->log_spawn || !env->goal_resample;
+        if (hold && (pad || done)) {
             env->agents[i].terminals[0] = 1;
         }
     }
@@ -2757,10 +2793,11 @@ void puf_step(Drive* env) {
         float bonus = speed_bonus(env, agent);
         env->agents[i].rewards[0] += bonus;
         env->logs[i].episode_return += bonus;
+        int remove = env->log_spawn || !env->goal_resample;
         if (arrived && env->log_spawn && env->goal_stop) {
             agent->vx = 0.0f;
             agent->vy = 0.0f;
-        } else if (arrived && env->log_spawn) {
+        } else if (arrived && remove) {
             env->agents[i].terminals[0] = 1;
             agent->vx = 0.0f;
             agent->vy = 0.0f;
@@ -2777,7 +2814,8 @@ void puf_step(Drive* env) {
     // Training ends once every scored car has arrived. A recording
     // leaves that reset to the player: each arrival still parks that
     // car, and the player stops when every followed car has arrived.
-    if (env->log_spawn && !env->goal_stop
+    // goal_resample off uses that same early end on a road map.
+    if ((env->log_spawn || !env->goal_resample) && !env->goal_stop
             && env->control_mode != CONTROL_SDC_ONLY
             && !puf_record_enabled()
             && logs_finished(env)) {
@@ -2816,6 +2854,17 @@ void puf_init(Env* env, Dict* kwargs) {
     }
     int map_id = dict_get(kwargs, "map_id");
     env->map_id = map_id;
+    env->resample_frequency = 0;
+    env->resample_episodes = 0;
+    env->episode_ends = 0;
+    DictItem* every = dict_find(kwargs, "resample_frequency");
+    if (every && every->value > 0.0) {
+        env->resample_frequency = (int)every->value;
+    }
+    DictItem* every_ep = dict_find(kwargs, "resample_episodes");
+    if (every_ep && every_ep->value > 0.0) {
+        env->resample_episodes = (int)every_ep->value;
+    }
     char bin_dir[480];
     char map_file[512];
     snprintf(bin_dir, sizeof(bin_dir), "%s/binaries", dict_get_str(kwargs, "data_dir"));
@@ -2850,6 +2899,11 @@ void puf_init(Env* env, Dict* kwargs) {
     if (gstop && gstop->value != 0.0) {
         env->goal_stop = 1;
     }
+    env->goal_resample = 1;
+    DictItem* gres = dict_find(kwargs, "goal_resample");
+    if (gres && gres->value == 0.0) {
+        env->goal_resample = 0;
+    }
     DictItem* wdir = dict_find(kwargs, "wosac_dir");
     if (wdir && wdir->str && wdir->str[0]
             && strcmp(wdir->str, "none") != 0) {
@@ -2881,6 +2935,44 @@ void puf_init(Env* env, Dict* kwargs) {
         env->agents[i].policy = 0;
         env->agents[i].action_mask = NULL;
     }
+}
+
+// Swap the logged scene. Agent buffer pointers, policy ids, and masks stay.
+// puf_init clears those, so this reloads the world only.
+void puf_reload_map(Drive* env, int map_id) {
+    if (map_id == env->map_id && env->entities) {
+        puf_reset(env);
+        return;
+    }
+    char bin_dir[480];
+    char map_file[512];
+    const char* data_dir = dict_get_str(env->cfg, "data_dir");
+    snprintf(bin_dir, sizeof(bin_dir), "%s/binaries", data_dir);
+    snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", bin_dir, map_id);
+    release_world(env);
+    free(env->map_name);
+    env->map_name = strdup(map_file);
+    env->map_id = map_id;
+    // A short log clamps episode_length. The next file may be longer.
+    env->episode_length = (int)dict_get(env->cfg, "episode_length");
+    load_world(env);
+    if (env->log_spawn && !env->wosac_on
+            && env->control_mode != CONTROL_SDC_ONLY
+            && !env->goal_stop && env->log_traj > 1
+            && env->episode_length > env->log_traj) {
+        env->episode_length = env->log_traj;
+    }
+    if (env->wosac_on) {
+        int steps = env->episode_length;
+        assert(steps > 0 && steps <= 256);
+        size_t m = (size_t)env->num_agents * (size_t)steps;
+        env->wosac_x = (float*)calloc(m, sizeof(float));
+        env->wosac_y = (float*)calloc(m, sizeof(float));
+        env->wosac_h = (float*)calloc(m, sizeof(float));
+        assert(env->wosac_x && env->wosac_y && env->wosac_h);
+        wosac_meta(env);
+    }
+    puf_reset(env);
 }
 
 // Logged as env/score_town_01 and so on. Town10HD is score_town_10.

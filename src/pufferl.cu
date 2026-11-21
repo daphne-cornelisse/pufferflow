@@ -438,6 +438,16 @@ struct VecEnv {
     pthread_t* threads;
     float* accum;
     int num_workers;
+    // Drive map window. resample_frequency 0 keeps the startup batch.
+    // Swaps run between rollouts; the time is not charged to SPS.
+    int map_cursor;
+    int map_offset;
+    int num_maps;
+    int resample_frequency;
+    int resample_ticks;
+    int resample_episodes;
+    long episode_acc;
+    unsigned char* map_seen;
     // GPU log reduce scratch (unused on CPU)
     float* log_scratch;
 };
@@ -560,18 +570,6 @@ typedef struct {
     int skip_rollout_time;
 } Profile;
 
-// Fixed edges so a CUDA graph can histogram without a host rescale.
-#define ADV_BINS 32
-#define ADV_LO (-32.f)
-#define ADV_HI 32.f
-
-typedef struct {
-    double step;
-    double mean_abs;
-    double var;
-    unsigned int bin[ADV_BINS];
-} AdvSnap;
-
 typedef struct PuffeRL {
     Policy* policies;        // [num_policies]; policies[0] trainable, rest frozen
     int num_policies;
@@ -598,19 +596,9 @@ typedef struct PuffeRL {
     cudaStream_t train_stream;    // dedicated learner stream (always non-default)
     int* act_sizes;        // device ACT_SIZES (NUM_ATNS ints)
     float* losses;         // device loss accumulator (NUM_LOSSES)
-    // Advantage windows, each sum / |sum| / sq.
-    // 0 is the log window. 3 is the snapshot window.
-    // count matches those two. hist is ADV_BINS.
-    // Bin 0 is below ADV_LO, ADV_BINS-1 is at or above ADV_HI.
+    // Log-window moments: sum, sum of |a|, sum of a^2. Cleared each log.
     double* adv_mom;
     unsigned long long* adv_count;
-    unsigned int* adv_hist;
-    AdvSnap* adv_snaps;
-    int adv_snap_n;
-    int adv_snap_cap;
-    int adv_every;
-    FILE* adv_fp;
-    char adv_path[1024];
     PPOBufs ppo_bufs; // Pre-allocated buffers for ppo_loss_fwd_bwd
     Anchor anchor;
     Prec actor_param;      // async flat actor params
@@ -1042,6 +1030,25 @@ static Env* puf_vec_create(int, Dict*, obs_t*, float*, float*, float*) {
 #endif
 
 
+#ifdef PUFFER_DRIVE
+static void drive_mark_maps(VecEnv* vec) {
+    if (!vec->map_seen || vec->num_maps <= 0) {
+        return;
+    }
+    if (vec->num_maps == 1) {
+        vec->map_seen[0] = 1;
+        return;
+    }
+    for (int i = 0; i < vec->size; i++) {
+        int idx = vec->envs[i].map_id - vec->map_offset;
+        if (idx < 0 || idx >= vec->num_maps) {
+            continue;
+        }
+        vec->map_seen[idx] = 1;
+    }
+}
+#endif
+
 static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     if (PUF_BACKEND == PUF_GPU) {
         assert(vec->buffers == 1 && "GPU env: num_buffers must be 1");
@@ -1070,7 +1077,8 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
 #else
     Env* envs = (Env*)calloc(total_agents, sizeof(Env));
     int agents_created = 0;
-    // num_maps 1 leaves map_id alone. Above that, copy i loads map i % num_maps.
+    // num_maps 1 leaves map_id alone. Above that, copy i loads map
+    // map_offset + i, and resample_frequency walks the next window.
     int num_maps = (int)dict_get(ek, "num_maps");
     int map_counts[8];
     double saved_map_id = 0.0;
@@ -1110,6 +1118,30 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
         fprintf(stderr, "\n");
     }
     envs = (Env*)realloc(envs, num_envs * sizeof(Env));
+#ifdef PUFFER_DRIVE
+    vec->num_maps = num_maps;
+    vec->map_offset = map_offset;
+    vec->map_cursor = 0;
+    vec->resample_ticks = 0;
+    vec->resample_frequency = 0;
+    vec->resample_episodes = 0;
+    vec->episode_acc = 0;
+    vec->map_seen = NULL;
+    if (num_envs > 0) {
+        vec->resample_frequency = envs[0].resample_frequency;
+        vec->resample_episodes = envs[0].resample_episodes;
+    }
+    if (num_maps > 0) {
+        vec->map_seen = (unsigned char*)calloc((size_t)num_maps, 1);
+    }
+    if (vec->resample_episodes > 0 && num_maps > 1) {
+        fprintf(stderr, "maps resample every %d episodes\n",
+            vec->resample_episodes);
+    } else if (vec->resample_frequency > 0 && num_maps > 1) {
+        fprintf(stderr, "maps resample every %d steps\n",
+            vec->resample_frequency);
+    }
+#endif
     int buf = 0, buf_agents = 0;
     for (int i = 0; i < num_envs; i++) {
         buf_agents += envs[i].num_agents;
@@ -1123,6 +1155,11 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     vec->envs = envs;
 #endif
     vec->size = num_envs;
+#ifdef PUFFER_DRIVE
+    if (PUF_BACKEND != PUF_GPU) {
+        drive_mark_maps(vec);
+    }
+#endif
 
     size_t obs_bytes = total_agents * OBS_SIZE * sizeof(obs_t);
     size_t mask_bytes = total_agents * vec->mask_size * sizeof(unsigned char);
@@ -1447,9 +1484,18 @@ void rollout_finish(PuffeRL* p, double t0) {
     p->profile.accum[PROF_MODEL] += eval_prof[PROF_MODEL] / p->vec->buffers;
     p->profile.accum[PROF_ENV] += eval_prof[PROF_ENV] / p->vec->buffers;
     p->profile.accum[PROF_COPY] += eval_prof[PROF_COPY] / p->vec->buffers;
+#ifdef PUFFER_DRIVE
+    if (p->vec->resample_frequency > 0) {
+        p->vec->resample_ticks += p->hypers.horizon;
+    }
+#endif
 }
 
 static void env_close(VecEnv* vec) {
+#ifdef PUFFER_DRIVE
+    free(vec->map_seen);
+    vec->map_seen = NULL;
+#endif
     if (PUF_BACKEND == PUF_GPU) {
         puf_close(vec->envs);
         cudaFree(vec->log_scratch);
@@ -1469,10 +1515,13 @@ static void env_close(VecEnv* vec) {
 
 void vec_log(VecEnv* vec, Dict* out, int clear) {
     // Mean score of finished episodes on each town, before the sum clears logs.
+    // Ids 0..3 are Town01/02/06/10 only on the four-map CARLA catalog.
+    // mixed_big reuses those ids for Waymo scenes, and only while that
+    // window is loaded, so a larger catalog must not emit the town keys.
     float town_score[4] = {0};
     float town_n[4] = {0};
     int town_seen[4] = {0};
-    if (PUF_BACKEND != PUF_GPU) {
+    if (PUF_BACKEND != PUF_GPU && vec->num_maps <= 4) {
         for (int i = 0; i < vec->size; i++) {
             int id = vec->envs[i].map_id;
             if (id < 0 || id > 3 || !drive_score_town_key(id)) {
@@ -1512,6 +1561,18 @@ void vec_log(VecEnv* vec, Dict* out, int clear) {
         dict_set(out, key, env_out.items[i].value);
     }
     dict_clear(&env_out);
+#ifdef PUFFER_DRIVE
+    // Share of the catalog loaded so far, in percent. Logged before
+    // the first episode ends, so the curve starts with the startup batch.
+    if (PUF_BACKEND != PUF_GPU && vec->map_seen && vec->num_maps > 0) {
+        int seen = 0;
+        for (int i = 0; i < vec->num_maps; i++) {
+            seen += vec->map_seen[i] ? 1 : 0;
+        }
+        dict_set(out, "env/scenes_seen",
+            100.0 * (double)seen / (double)vec->num_maps);
+    }
+#endif
 }
 
 static Prec slice_rows(Prec p, int off, int n) {
@@ -1705,18 +1766,12 @@ static void anchor_open_stream(Anchor* a) {
 }
 
 // Last horizon index is left 0 by puff_advantage. Skip it so the
-// histogram is not a spike at zero. Bin 0 and the last bin are overflow.
-// Moments are stored twice: [0, 3) is the log window, [3, 6) is the snapshot.
+// mean is not pulled toward zero.
 __global__ void adv_stats(const precision_t* adv, int n, int horizon,
-        double* mom, unsigned long long* count, unsigned int* hist) {
+        double* mom, unsigned long long* count) {
     __shared__ double red[3][BLOCK_SIZE];
     __shared__ int rn[BLOCK_SIZE];
-    __shared__ unsigned int local[ADV_BINS];
     int tid = threadIdx.x;
-    if (tid < ADV_BINS) {
-        local[tid] = 0;
-    }
-    __syncthreads();
 
     double ls = 0;
     double la = 0;
@@ -1726,21 +1781,10 @@ __global__ void adv_stats(const precision_t* adv, int n, int horizon,
     int live = i < n && (horizon <= 1 || (i % horizon) != horizon - 1);
     if (live) {
         float a = to_float(adv[i]);
-        int bin = ADV_BINS - 1;
         ls = a;
         la = fabsf(a);
         lq = (double)a * (double)a;
         ln = 1;
-        if (a < ADV_LO) {
-            bin = 0;
-        } else if (a < ADV_HI) {
-            float u = (a - ADV_LO) / (ADV_HI - ADV_LO);
-            bin = 1 + (int)(u * (float)(ADV_BINS - 2));
-            if (bin > ADV_BINS - 2) {
-                bin = ADV_BINS - 2;
-            }
-        }
-        atomicAdd(local + bin, 1u);
     }
     red[0][tid] = ls;
     red[1][tid] = la;
@@ -1760,15 +1804,7 @@ __global__ void adv_stats(const precision_t* adv, int n, int horizon,
         atomicAdd(mom + 0, red[0][0]);
         atomicAdd(mom + 1, red[1][0]);
         atomicAdd(mom + 2, red[2][0]);
-        atomicAdd(mom + 3, red[0][0]);
-        atomicAdd(mom + 4, red[1][0]);
-        atomicAdd(mom + 5, red[2][0]);
-        atomicAdd(count + 0, (unsigned long long)rn[0]);
-        atomicAdd(count + 1, (unsigned long long)rn[0]);
-    }
-    __syncthreads();
-    if (tid < ADV_BINS && local[tid]) {
-        atomicAdd(hist + tid, local[tid]);
+        atomicAdd(count, (unsigned long long)rn[0]);
     }
 }
 
@@ -1785,68 +1821,6 @@ static void adv_reduce(double sum, double sum_abs, double sum_sq,
     if (*var < 0) {
         *var = 0;
     }
-}
-
-// Copy the snapshot window to the host and clear it. The log window stays.
-static void adv_window_take(double* mom, unsigned long long* count,
-        unsigned int* hist, double out_mom[3], unsigned long long* out_n,
-        unsigned int* out_bins) {
-    cudaMemcpy(out_mom, mom, 3 * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(out_n, count, sizeof(*out_n), cudaMemcpyDeviceToHost);
-    cudaMemcpy(out_bins, hist, ADV_BINS * sizeof(unsigned int),
-        cudaMemcpyDeviceToHost);
-    cudaMemset(mom, 0, 3 * sizeof(double));
-    cudaMemset(count, 0, sizeof(*out_n));
-    cudaMemset(hist, 0, ADV_BINS * sizeof(unsigned int));
-}
-
-static void adv_json_line(PuffeRL* p, long steps, const char* group,
-        double mean_abs, double var, const unsigned int* bins) {
-    FILE* fp;
-    if (!p->adv_path[0]) {
-        return;
-    }
-    fp = p->adv_fp;
-    if (!fp) {
-        fp = fopen(p->adv_path, "a");
-        if (!fp) {
-            fprintf(stderr, "advantage log open failed %s\n", p->adv_path);
-            p->adv_path[0] = 0;
-            return;
-        }
-        p->adv_fp = fp;
-    }
-    fprintf(fp,
-        "{\"steps\":%ld,\"group\":\"%s\",\"mean_abs\":%.6g,\"var\":%.6g,"
-        "\"bins\":[",
-        steps, group, mean_abs, var);
-    for (int i = 0; i < ADV_BINS; i++) {
-        fprintf(fp, "%s%u", i ? "," : "", bins[i]);
-    }
-    fprintf(fp, "]}\n");
-    fflush(fp);
-}
-
-// Histogram window. The log window (mom[0..2], count[0]) stays put.
-static void adv_snap(PuffeRL* p) {
-    double mom[3];
-    unsigned long long cnt = 0;
-    unsigned int bins[ADV_BINS];
-    long steps;
-    if (!p->adv_snaps || p->adv_snap_n >= p->adv_snap_cap) {
-        return;
-    }
-    adv_window_take(p->adv_mom + 3, p->adv_count + 1, p->adv_hist,
-        mom, &cnt, bins);
-    if (!cnt) {
-        return;
-    }
-    steps = p->global_step * p->hypers.world_size;
-    AdvSnap* s = &p->adv_snaps[p->adv_snap_n++];
-    adv_reduce(mom[0], mom[1], mom[2], cnt, &s->mean_abs, &s->var);
-    s->step = (double)steps;
-    memcpy(s->bin, bins, sizeof(bins));
-    adv_json_line(p, steps, "all", s->mean_abs, s->var, bins);
 }
 
 static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
@@ -1939,7 +1913,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             hypers->vtrace_rho_clip, hypers->vtrace_c_clip, Nmb, Tmb);
         adv_stats<<<grid_size(Nmb * Tmb), BLOCK_SIZE, 0, stream>>>(
             graph.mb_advantages.data, Nmb * Tmb, Tmb,
-            pufferl->adv_mom, pufferl->adv_count, pufferl->adv_hist);
+            pufferl->adv_mom, pufferl->adv_count);
         graph.mb_returns = graph.mb_gae_v;
 
         ppo_loss_fwd_bwd(dec, p_logstd, graph,
@@ -2061,9 +2035,6 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
             (float)(h[TE_E] - h[TE_MID]) * 1e-6f;
     }
     pufferl->epoch += 1;
-    if (pufferl->adv_every > 0 && pufferl->epoch % pufferl->adv_every == 0) {
-        adv_snap(pufferl);
-    }
 }
 
 // Load policy weights (flat fp32 checkpoint). Safe between rollouts —
@@ -2838,16 +2809,6 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
 
     PuffeRL* pufferl = (PuffeRL*)calloc(1, sizeof(PuffeRL));
     pufferl->hypers = hypers;
-    if (ctx->artifact_owner) {
-        char dir[512];
-        const char* run_id = puf_ini_get_str(ini, "base", "run_id");
-        snprintf(dir, sizeof(dir), "%s/%s",
-            puf_ini_get_str(ini, "base", "log_dir"),
-            puf_ini_get_str(ini, "base", "env_name"));
-        mkdir_p(dir);
-        snprintf(pufferl->adv_path, sizeof(pufferl->adv_path),
-            "%s/%s-advantages.jsonl", dir, run_id);
-    }
     snprintf(pufferl->env_name, sizeof(pufferl->env_name), "%s", PUFFER_ENV_NAME);
 
     cudaSetDevice(hypers.gpu_id);
@@ -3021,12 +2982,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     cudaMemset(pufferl->rng_offset, 0, (num_buffers + 1) * sizeof(long));
     cudaMalloc((void**)&pufferl->act_sizes, num_action_heads * sizeof(int));
     cudaMalloc((void**)&pufferl->losses, NUM_LOSSES * sizeof(float));
-    cudaMalloc((void**)&pufferl->adv_mom, 6 * sizeof(double));
-    cudaMalloc((void**)&pufferl->adv_count, 2 * sizeof(unsigned long long));
-    cudaMalloc((void**)&pufferl->adv_hist, ADV_BINS * sizeof(unsigned int));
-    cudaMemset(pufferl->adv_mom, 0, 6 * sizeof(double));
-    cudaMemset(pufferl->adv_count, 0, 2 * sizeof(unsigned long long));
-    cudaMemset(pufferl->adv_hist, 0, ADV_BINS * sizeof(unsigned int));
+    cudaMalloc((void**)&pufferl->adv_mom, 3 * sizeof(double));
+    cudaMalloc((void**)&pufferl->adv_count, sizeof(unsigned long long));
+    cudaMemset(pufferl->adv_mom, 0, 3 * sizeof(double));
+    cudaMemset(pufferl->adv_count, 0, sizeof(unsigned long long));
 
     muon_init(&pufferl->muon, &primary->params_alloc, hypers.momentum, acts);
 
@@ -3482,42 +3441,142 @@ static void puf_log_history_add(PufLogHistory* h, Dict* log) {
     h->size++;
 }
 
-// Bin-mean of history[key] over agent_steps into out[0..points-1]. Dense keys.
+// Scalar from one train log. 0 when that snapshot never wrote the key.
+static int log_hist_value(Dict* log, const char* key, double* out) {
+    DictItem* item = dict_find(log, key);
+    if (!item) {
+        return 0;
+    }
+    *out = item->value;
+    return 1;
+}
+
+// Bin-mean of history[key] over agent_steps into out[0..points-1].
 // points==1 → last value only. Last bin forced to final sample.
+// A key on the latest log can be absent earlier. Those rows are skipped.
 static void log_history_bin_mean(PufLogHistory* h, const char* key,
         int points, double* out) {
     assert(h->size > 0 && points >= 1);
+    double last = 0.0;
+    if (!log_hist_value(&h->items[h->size - 1], key, &last)) {
+        for (int i = 0; i < points; i++) {
+            out[i] = 0.0;
+        }
+        return;
+    }
     if (points == 1) {
-        out[0] = dict_get(&h->items[h->size - 1], key);
+        out[0] = last;
         return;
     }
     double final_steps = dict_get(&h->items[h->size - 1], "agent_steps");
     int out_idx = 0;
     int bin_n = 0;
-    double bin_sum = 0;
-    double fallback = dict_get(&h->items[0], key);
+    double bin_sum = 0.0;
+    double fallback = last;
+    for (int i = 0; i < h->size; i++) {
+        double value = 0.0;
+        if (log_hist_value(&h->items[i], key, &value)) {
+            fallback = value;
+            break;
+        }
+    }
     double next_bin = final_steps / (points - 1);
     for (int i = 0; i < h->size; i++) {
         Dict* log = &h->items[i];
-        bin_sum += dict_get(log, key);
-        bin_n++;
+        double value = 0.0;
+        if (log_hist_value(log, key, &value)) {
+            bin_sum += value;
+            bin_n++;
+        }
         double steps = dict_get(log, "agent_steps");
         if (steps < next_bin || out_idx >= points - 1) {
             continue;
         }
-        fallback = bin_n ? bin_sum / bin_n : fallback;
+        if (bin_n) {
+            fallback = bin_sum / bin_n;
+        }
         out[out_idx++] = fallback;
         bin_n = 0;
-        bin_sum = 0;
+        bin_sum = 0.0;
         next_bin += final_steps / (points - 1);
     }
-    out[points - 1] = dict_get(&h->items[h->size - 1], key);
+    out[points - 1] = last;
     while (out_idx < points - 1) {
         out[out_idx++] = fallback;
     }
 }
 
+// Next window of maps. Workers are idle here. Disk time is added back
+// onto the SPS clocks so the step rate does not move.
+static void env_resample_maps(PuffeRL* p) {
+#ifdef PUFFER_DRIVE
+    VecEnv* vec = p->vec;
+    if (PUF_BACKEND == PUF_GPU || vec->num_maps <= 1 || vec->size <= 0) {
+        return;
+    }
+    int pages = 0;
+    if (vec->resample_episodes > 0) {
+        // Workers are BUF_WAITING. episode_ends was written in end_episode.
+        long ended = 0;
+        for (int i = 0; i < vec->size; i++) {
+            ended += vec->envs[i].episode_ends;
+            vec->envs[i].episode_ends = 0;
+        }
+        vec->episode_acc += ended;
+        long need = (long)vec->resample_episodes * (long)vec->size;
+        if (need < 1 || vec->episode_acc < need) {
+            return;
+        }
+        pages = (int)(vec->episode_acc / need);
+        vec->episode_acc -= (long)pages * need;
+    } else if (vec->resample_frequency > 0) {
+        if (vec->resample_ticks < vec->resample_frequency) {
+            return;
+        }
+        pages = vec->resample_ticks / vec->resample_frequency;
+        vec->resample_ticks -= pages * vec->resample_frequency;
+    }
+    if (pages < 1) {
+        return;
+    }
+    long advance = (long)pages * (long)vec->size;
+    vec->map_cursor = (int)((vec->map_cursor + advance) % vec->num_maps);
+    int copies = vec->size;
+    int cursor = vec->map_cursor;
+    int nmaps = vec->num_maps;
+    int off = vec->map_offset;
+    fprintf(stderr, "maps resample cursor=%d copies=%d num_maps=%d\n",
+        off + cursor, copies, nmaps);
+    fflush(stderr);
+    double t0 = wall_clock();
+    int threads = omp_get_max_threads();
+    if (threads < 1) {
+        threads = 1;
+    }
+    #pragma omp parallel for schedule(static) num_threads(threads)
+    for (int i = 0; i < copies; i++) {
+        int map_id = off + (cursor + i) % nmaps;
+        puf_reload_map(&vec->envs[i], map_id);
+    }
+    drive_mark_maps(vec);
+    for (int b = 0; b < p->num_policies; b++) {
+        for (int i = 0; i < vec->buffers; i++) {
+            Prec* st = &p->policies[b].buffer_states[i];
+            cudaMemset(st->data, 0, numel(st->shape) * sizeof(precision_t));
+        }
+    }
+    cpu_upload(p, 0, vec->total_agents, p->default_stream);
+    cudaDeviceSynchronize();
+    double dt = wall_clock() - t0;
+    p->start_time += dt;
+    p->last_log_time += dt;
+#else
+    (void)p;
+#endif
+}
+
 double rollout_start(PuffeRL* p, int slot) {
+    env_resample_maps(p);
 #ifdef PUFFER_NETHACK
     nethack_policy_on_rollout(p->global_step, p->hypers.total_timesteps);
 #endif
@@ -4536,15 +4595,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     long local_timesteps = total_timesteps / ctx->world_size;
     long train_epochs = local_timesteps / batch_size;
     long checkpoint_interval = puf_ini_get(ini, "base", "checkpoint_interval");
-    // About 64 advantage histograms across the run, at least one rollout apart.
-    pufferl->adv_snap_cap = 65;
-    pufferl->adv_every = (int)((train_epochs + 63) / 64);
-    if (pufferl->adv_every < 1) {
-        pufferl->adv_every = 1;
-    }
-    pufferl->adv_snaps = (AdvSnap*)calloc(
-        pufferl->adv_snap_cap, sizeof(AdvSnap));
-    pufferl->adv_snap_n = 0;
     char target_key[128];
     sweep_metric_key(ini, target_key, sizeof(target_key));
     Dict last_log = {0};
@@ -4705,7 +4755,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         }
         dict_clear(&new_log);
     }
-    adv_snap(pufferl);
 
     // TrainResult curve: bin-mean over log_history (same as artifact metrics).
     DictItem* target = dict_find(&last_log, target_key);
@@ -4867,33 +4916,6 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             }
             free(out);
         }
-        if (pufferl->adv_snap_n > 0) {
-            int nsnap = pufferl->adv_snap_n;
-            fprintf(fp, "\n[advantage]\n");
-            fprintf(fp, "lo = %g\nhi = %g\nbins = %d\n",
-                ADV_LO, ADV_HI, ADV_BINS);
-            fprintf(fp, "step = ");
-            for (int i = 0; i < nsnap; i++) {
-                fprintf(fp, "%s%.17g", i ? "," : "", pufferl->adv_snaps[i].step);
-            }
-            fprintf(fp, "\nmean_abs = ");
-            for (int i = 0; i < nsnap; i++) {
-                fprintf(fp, "%s%.17g", i ? "," : "",
-                    pufferl->adv_snaps[i].mean_abs);
-            }
-            fprintf(fp, "\nvar = ");
-            for (int i = 0; i < nsnap; i++) {
-                fprintf(fp, "%s%.17g", i ? "," : "", pufferl->adv_snaps[i].var);
-            }
-            for (int b = 0; b < ADV_BINS; b++) {
-                fprintf(fp, "\nbin_%d = ", b);
-                for (int i = 0; i < nsnap; i++) {
-                    fprintf(fp, "%s%u", i ? "," : "",
-                        pufferl->adv_snaps[i].bin[b]);
-                }
-            }
-            fputc('\n', fp);
-        }
         fclose(fp);
     }
     for (int i = 0; i < log_history.size; i++) {
@@ -5008,17 +5030,121 @@ TrainResult launch_train(Ini* ini) {
     return result;
 }
 
+#ifdef PUFFER_DRIVE
+// One stationary step with the goal glued to the car. A clean arrival
+// is score 1. Prints the mean and returns it. Ghosts stay in the scene.
+static float drive_score_probe(const char* data_dir, int map_id) {
+    Ini ini = {0};
+    puf_ini_load_env(&ini, "drive", 0, NULL);
+    Dict* ek = puf_ini_section(&ini, "env", 0);
+    dict_set_str(ek, "data_dir", data_dir);
+    dict_set(ek, "map_id", (double)map_id);
+    dict_set(ek, "num_maps", 1);
+    dict_set(ek, "num_agents", 1);
+    dict_set(ek, "episode_length", 600);
+    dict_set(ek, "goal_resample", 0);
+    dict_set(ek, "goal_stop", 0);
+    dict_set(ek, "goal_radius", 5);
+    dict_set(ek, "resample_frequency", 0);
+    dict_set(ek, "resample_episodes", 0);
+    dict_set_str(ek, "wosac_dir", "none");
+    dict_set_str(ek, "control_mode", "control_agents");
+    Drive* env = (Drive*)calloc(1, sizeof(Drive));
+    assert(env);
+    puf_init(env, ek);
+    int n = env->num_agents;
+    obs_t* obs = (obs_t*)calloc((size_t)n * OBS_SIZE, sizeof(obs_t));
+    float* actions = (float*)calloc((size_t)n * NUM_ATNS, sizeof(float));
+    float* rewards = (float*)calloc((size_t)n, sizeof(float));
+    float* terminals = (float*)calloc((size_t)n, sizeof(float));
+    assert(obs && actions && rewards && terminals);
+    for (int i = 0; i < n; i++) {
+        env->agents[i].observations = obs + (size_t)i * OBS_SIZE;
+        env->agents[i].actions = actions + (size_t)i * NUM_ATNS;
+        env->agents[i].rewards = rewards + i;
+        env->agents[i].terminals = terminals + i;
+    }
+    puf_reset(env);
+    int glued = 0;
+    for (int i = 0; i < n; i++) {
+        actions[(size_t)i * NUM_ATNS] = (float)ACCEL_COAST_BIN;
+        actions[(size_t)i * NUM_ATNS + 1] = (float)STEER_COAST_BIN;
+        Entity* e = &env->entities[i];
+        if (e->goals_sampled <= 0 || e->x == INVALID_POSITION) {
+            continue;
+        }
+        e->vx = 0.0f;
+        e->vy = 0.0f;
+        e->goal_position_x = e->x;
+        e->goal_position_y = e->y;
+        glued++;
+    }
+    puf_step(env);
+    float score = 0.0f;
+    float collision = 0.0f;
+    float offroad = 0.0f;
+    if (env->log.n > 0.0f) {
+        score = env->log.score / env->log.n;
+        collision = env->log.collision_rate / env->log.n;
+        offroad = env->log.offroad_rate / env->log.n;
+    }
+    fprintf(stderr,
+        "scorecheck dir=%s map=%d log_spawn=%d glued=%d n=%.0f score=%.4f collision=%.4f offroad=%.4f\n",
+        data_dir, map_id, env->log_spawn, glued, env->log.n,
+        score, collision, offroad);
+    fflush(stderr);
+    puf_close(env);
+    free(env->map_name);
+    free(env);
+    free(obs);
+    free(actions);
+    free(rewards);
+    free(terminals);
+    puf_ini_free(&ini);
+    return score;
+}
+
+static int drive_scorecheck(void) {
+    // Flat CARLA towns only: 0 Town01, 1 Town02, 2 Town06, 3 Town10HD.
+    float carla = 1.0f;
+    for (int map_id = 0; map_id < 4; map_id++) {
+        float s = drive_score_probe("data/mixed", map_id);
+        if (s < carla) {
+            carla = s;
+        }
+    }
+    float logged = 0.0f;
+    const char* log_dirs[] = {"data/i24", "data/i24", "data/i24", "data/womd_10k"};
+    int log_maps[] = {0, 1, 2, 0};
+    for (int i = 0; i < 4; i++) {
+        float s = drive_score_probe(log_dirs[i], log_maps[i]);
+        if (s > logged) {
+            logged = s;
+        }
+    }
+    int ok = carla >= 0.999f && logged >= 0.999f;
+    fprintf(stderr, "scorecheck carla=%.4f log=%.4f %s\n",
+        carla, logged, ok ? "ok" : "fail");
+    return ok ? 0 : 1;
+}
+#endif
+
 #ifdef PUFFERLIB_BUILD_MAIN
 int main(int argc, char** argv) {
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s train|eval|match|sweep [latest|MODEL.bin] [--headless] [--section.key=value ...]\n",
+            "usage: %s train|eval|match|sweep|scorecheck [latest|MODEL.bin] [--headless] [--section.key=value ...]\n",
             argv[0]);
         exit(1);
     }
     const char* mode = argv[1];
+#ifdef PUFFER_DRIVE
+    if (strcmp(mode, "scorecheck") == 0) {
+        return drive_scorecheck();
+    }
+#endif
     // Train forks DP workers; CUDA before that fork SIGSEGVs the children.
     if (strcmp(mode, "train") != 0) {
         int total_gpus = 0;

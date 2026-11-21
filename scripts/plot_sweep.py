@@ -268,6 +268,7 @@ def load_frames(log_path, metrics_dir):
     losses = []
     counts = []
     failures = []
+    rates = []
     summary = []
     missing = []
     for path in sweep_ini_paths(metrics_dir):
@@ -327,6 +328,22 @@ def load_frames(log_path, metrics_dir):
                     "steps": step,
                     "distance_before_first_failure": value,
                 })
+        offroad_vals = metric_series(text, "env/offroad_rate")
+        length_vals = metric_series(text, "env/episode_length")
+        seen_vals = metric_series(text, "env/scenes_seen")
+        offroad_ok = bool(offroad_vals) and len(offroad_vals) == len(steps)
+        length_ok = bool(length_vals) and len(length_vals) == len(steps)
+        seen_ok = bool(seen_vals) and len(seen_vals) == len(steps)
+        for i, step in enumerate(steps):
+            rates.append({
+                "run": run,
+                "series_id": series_id,
+                "steps": step,
+                "collision_rate": collision_vals[i],
+                "offroad_rate": offroad_vals[i] if offroad_ok else float("nan"),
+                "episode_length": length_vals[i] if length_ok else float("nan"),
+                "scenes_seen": seen_vals[i] if seen_ok else float("nan"),
+            })
         summary.append({
             "run": run,
             "series_id": series_id,
@@ -394,6 +411,7 @@ def load_frames(log_path, metrics_dir):
         pd.DataFrame(losses),
         pd.DataFrame(counts),
         pd.DataFrame(failures),
+        pd.DataFrame(rates),
         pd.DataFrame(summary),
         missing,
     )
@@ -565,10 +583,10 @@ def blank_panel(ax, title, message):
 
 
 def figure_axes():
-    """Result panels, failure row, anchor and density, coefficients, sizes."""
-    fig = plt.figure(figsize=(22.4, 24.5), dpi=100, layout="constrained")
+    """Result panels, failure row, anchor and density, coverage, coefficients, sizes."""
+    fig = plt.figure(figsize=(22.4, 28.6), dpi=100, layout="constrained")
     outer = fig.add_gridspec(
-        6, 1, height_ratios=[1.0, 1.0, 1.0, 1.0, 1.05, 1.15],
+        7, 1, height_ratios=[1.0, 1.0, 1.0, 1.0, 1.0, 1.05, 1.15],
     )
     top = outer[0].subgridspec(1, 3, wspace=0.28)
     mid = outer[1].subgridspec(1, 3, wspace=0.28)
@@ -579,12 +597,62 @@ def figure_axes():
     pair = outer[3].subgridspec(1, 3, wspace=0.28)
     anchor_ax = fig.add_subplot(pair[0, 0])
     density_ax = fig.add_subplot(pair[0, 1])
-    coef_ax = fig.add_subplot(outer[4])
-    size_grid = outer[5].subgridspec(1, len(SIZE_HYPERS), wspace=0.42)
+    cover_grid = outer[4].subgridspec(1, 4, wspace=0.32)
+    cover_axes = [fig.add_subplot(cover_grid[0, col]) for col in range(4)]
+    coef_ax = fig.add_subplot(outer[5])
+    size_grid = outer[6].subgridspec(1, len(SIZE_HYPERS), wspace=0.42)
     size_axes = [
         fig.add_subplot(size_grid[0, i]) for i in range(len(SIZE_HYPERS))
     ]
-    return fig, axes, failure_axes, anchor_ax, density_ax, coef_ax, size_axes
+    return (
+        fig, axes, failure_axes, anchor_ax, density_ax, cover_axes, coef_ax, size_axes,
+    )
+
+
+COVER_FIELDS = (
+    ("collision_rate", "Collision rate", "rate", (-0.03, 1.03)),
+    ("offroad_rate", "Off-road rate", "rate", (-0.03, 1.03)),
+    ("episode_length", "Episode length", "steps", None),
+    ("scenes_seen", "Map coverage", "percent", (-3.0, 103.0)),
+)
+
+
+def draw_step_series(ax, frame, column, title, ylabel, palette, markers=None, ylim=None):
+    """One logged series against training steps. Blank when the key is absent."""
+    has_curve = (
+        frame is not None and len(frame) > 0
+        and column in getattr(frame, "columns", [])
+        and bool(frame[column].notna().any())
+    )
+    if not has_curve:
+        blank_panel(ax, title, "not logged")
+        return
+    plotted = frame.dropna(subset=[column])
+    if markers is None:
+        sns.lineplot(
+            data=plotted, x="steps", y=column, hue="series",
+            palette=palette, estimator=None, linewidth=1.3, ax=ax, legend=False,
+        )
+    else:
+        for phase, linestyle in (("through", "solid"), ("bump", "dashed")):
+            part = plotted[plotted["phase"] == phase]
+            if len(part) == 0:
+                continue
+            sns.lineplot(
+                data=part, x="steps", y=column, hue="series",
+                palette=palette, estimator=None, linewidth=1.3, linestyle=linestyle,
+                ax=ax, legend=False,
+            )
+    style_steps(ax)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+
+def draw_coverage(axes, rates, palette, markers=None):
+    for ax, (column, title, ylabel, ylim) in zip(axes, COVER_FIELDS):
+        draw_step_series(ax, rates, column, title, ylabel, palette, markers, ylim)
 
 
 def scatter_metric(summary, x, y, ax, palette, markers=None, best=()):
@@ -1422,7 +1490,7 @@ def draw_womd_eval(returns, losses, counts, failures, summary, out):
         PLOT_ACCENT = previous_accent
 
 
-def draw(returns, losses, counts, failures, summary, out):
+def draw(returns, losses, counts, failures, rates, summary, out):
     apply_figure_style()
     summary = with_series(summary)
     returns = with_series(returns)
@@ -1432,10 +1500,12 @@ def draw(returns, losses, counts, failures, summary, out):
         counts = with_series(counts)
     if len(failures):
         failures = with_series(failures)
+    if len(rates):
+        rates = with_series(rates)
     best = best_series(summary)
     palette = series_palette(summary["series"], best)
 
-    fig, axes, failure_axes, anchor_ax, density_ax, hyper_ax, size_axes = figure_axes()
+    fig, axes, failure_axes, anchor_ax, density_ax, cover_axes, hyper_ax, size_axes = figure_axes()
 
     draw_objective(axes[0], summary, palette, "order", best=best)
 
@@ -1489,12 +1559,13 @@ def draw(returns, losses, counts, failures, summary, out):
     draw_failure(failure_axes, summary, failures, palette, "order", best=best)
     draw_score_vs_anchor(anchor_ax, summary, palette, best=best)
     draw_town_density(density_ax, summary, palette)
+    draw_coverage(cover_axes, rates, palette)
     draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
     for ax, label in zip(size_axes, SIZE_HYPERS):
         draw_size_panel(ax, summary, palette, label)
     for ax in (
         list(axes) + list(failure_axes) + [anchor_ax, density_ax]
-        + [hyper_ax] + list(size_axes)
+        + list(cover_axes) + [hyper_ax] + list(size_axes)
     ):
         style_ax(ax)
         lift_best(ax)
@@ -1530,7 +1601,7 @@ def scatter_phases(summary, x, y, ax, palette, markers):
         )
 
 
-def draw_overview(returns, losses, counts, failures, summary, out):
+def draw_overview(returns, losses, counts, failures, rates, summary, out):
     """Both physics phases. The sweep objective is the first panel.
 
     Through runs come first, then bump. Panels use the default seaborn palette, one color per run,
@@ -1541,7 +1612,7 @@ def draw_overview(returns, losses, counts, failures, summary, out):
     apply_figure_style()
     best = best_series(summary)
     palette = series_palette(summary["series"], best)
-    fig, axes, failure_axes, anchor_ax, density_ax, hyper_ax, size_axes = figure_axes()
+    fig, axes, failure_axes, anchor_ax, density_ax, cover_axes, hyper_ax, size_axes = figure_axes()
     markers = {"through": "o", "bump": "s"}
 
     draw_objective(axes[0], summary, palette, "idx", markers, best)
@@ -1606,6 +1677,7 @@ def draw_overview(returns, losses, counts, failures, summary, out):
     draw_failure(failure_axes, summary, failures, palette, "idx", markers, best)
     draw_score_vs_anchor(anchor_ax, summary, palette, markers, best)
     draw_town_density(density_ax, summary, palette)
+    draw_coverage(cover_axes, rates, palette, markers)
     draw_hypers(hyper_ax, summary, palette, SCALED_HYPERS)
     for ax, label in zip(size_axes, SIZE_HYPERS):
         draw_size_panel(ax, summary, palette, label)
@@ -1621,7 +1693,7 @@ def draw_overview(returns, losses, counts, failures, summary, out):
     fig.legend(handles=handles, loc="upper right", frameon=False)
     for ax in (
         list(axes) + list(failure_axes) + [anchor_ax, density_ax]
-        + [hyper_ax] + list(size_axes)
+        + list(cover_axes) + [hyper_ax] + list(size_axes)
     ):
         style_ax(ax)
         lift_best(ax)
@@ -1636,6 +1708,7 @@ def load_overview(phases):
     losses = []
     counts = []
     failures = []
+    rates = []
     summaries = []
     missing = []
     for name, log_path, metrics_dir in phases:
@@ -1645,7 +1718,7 @@ def load_overview(phases):
         try:
             (
                 part_returns, part_losses, part_counts, part_failures,
-                part_summary, part_missing,
+                part_rates, part_summary, part_missing,
             ) = load_frames(log_path, Path(metrics_dir))
         except SystemExit:
             continue
@@ -1653,6 +1726,7 @@ def load_overview(phases):
         losses.append(tag_phase(part_losses, name))
         counts.append(tag_phase(part_counts, name))
         failures.append(tag_phase(part_failures, name))
+        rates.append(tag_phase(part_rates, name))
         summaries.append(tag_phase(part_summary, name))
         missing.extend(f"{name}:{run}" for run in part_missing)
     summaries = [frame for frame in summaries if frame is not None and len(frame)]
@@ -1672,7 +1746,9 @@ def load_overview(phases):
     failures = (
         pd.concat(failure_frames, ignore_index=True) if failure_frames else pd.DataFrame()
     )
-    return returns, losses, counts, failures, summary, missing
+    rate_frames = [frame for frame in rates if frame is not None and len(frame)]
+    rates = pd.concat(rate_frames, ignore_index=True) if rate_frames else pd.DataFrame()
+    return returns, losses, counts, failures, rates, summary, missing
 
 
 def main():
@@ -1691,7 +1767,7 @@ def main():
     )
     parser.add_argument(
         "-o", "--out", type=Path, default=ROOT / "logs" / "drive" / "sweep-panels.png",
-        help="output image under logs/drive or logs/replay_sweep",
+        help="output image under logs/drive, logs/replay_sweep, logs/i24_sweep, or logs/mixed_big",
     )
     args = parser.parse_args()
     out = args.out
@@ -1699,17 +1775,19 @@ def main():
         (ROOT / "logs" / "drive").resolve(),
         (ROOT / "logs" / "replay_sweep").resolve(),
         (ROOT / "logs" / "i24_sweep").resolve(),
+        (ROOT / "logs" / "mixed_big").resolve(),
+        (ROOT / "logs" / "mixed_big" / "drive").resolve(),
     )
     if out.parent.resolve() not in allowed:
         out = ROOT / "logs" / "drive" / out.name
     if args.phase:
-        returns, losses, counts, failures, summary, missing = load_overview(args.phase)
-        draw_overview(returns, losses, counts, failures, summary, out)
+        returns, losses, counts, failures, rates, summary, missing = load_overview(args.phase)
+        draw_overview(returns, losses, counts, failures, rates, summary, out)
     else:
-        returns, losses, counts, failures, summary, missing = load_frames(
+        returns, losses, counts, failures, rates, summary, missing = load_frames(
             args.log, args.metrics_dir,
         )
-        draw(returns, losses, counts, failures, summary, out)
+        draw(returns, losses, counts, failures, rates, summary, out)
         for path in draw_split(summary, out.parent):
             print(f"wrote {path}")
         print(f"wrote {draw_hyper_scores(summary, out.parent)}")
