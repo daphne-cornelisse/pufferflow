@@ -198,6 +198,8 @@ ocean/antibody/generated/
 # processed logs, map binaries, and the raw BMVC files.
 # Videos and plots under assets/ stay local.
 data/*
+# Dataset notes. The map binaries under data/mixed_big stay local.
+!data/MIXED_BIG.md
 !data/i24/
 data/i24/assets/
 data/i24/**/.~lock.*
