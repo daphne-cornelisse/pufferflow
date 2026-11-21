@@ -414,6 +414,16 @@ RolloutBuf rollout_time_view(RolloutBuf* base, int start_t, int T) {
     return view;
 }
 
+// One controllable-agent count. Its copies share that slot count and
+// rotate through maps with the same count.
+typedef struct {
+    int agents;
+    int* ids;
+    int n;
+    int copies;
+    int cursor;
+} DriveLogBucket;
+
 // Env batch. Device IO is always PuffeRL.env (EnvBuf).
 // CPU: host pins + workers. GPU: single-buffer device envs (no host pins).
 struct VecEnv {
@@ -448,6 +458,19 @@ struct VecEnv {
     int resample_episodes;
     long episode_acc;
     unsigned char* map_seen;
+    // Road copies stay on road maps. A log copy keeps the controllable
+    // count of its scene and only reloads a scene with that count.
+    int road_agents;
+    int n_log_copies;
+    int n_road_copies;
+    int* road_ids;
+    int n_road_ids;
+    int road_cursor;
+    unsigned char* copy_road;
+    int* copy_bucket;
+    int* copy_slot;
+    DriveLogBucket* log_buckets;
+    int n_log_buckets;
     // GPU log reduce scratch (unused on CPU)
     float* log_scratch;
 };
@@ -1030,7 +1053,459 @@ static Env* puf_vec_create(int, Dict*, obs_t*, float*, float*, float*) {
 #endif
 
 
+typedef struct {
+    int map_id;
+    int agents;
+    int road;
+} DriveCopy;
+
 #ifdef PUFFER_DRIVE
+static int* drive_read_sdc(const char* data_dir, int* count) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/binaries/sdc.bin", data_dir);
+    FILE* file = fopen(path, "rb");
+    *count = 0;
+    if (!file) {
+        return NULL;
+    }
+    int n = 0;
+    if (fread(&n, sizeof(int), 1, file) != 1 || n <= 0 || n > 1000000) {
+        fclose(file);
+        return NULL;
+    }
+    int* table = (int*)malloc((size_t)n * sizeof(int));
+    if (!table || fread(table, sizeof(int), (size_t)n, file) != (size_t)n) {
+        free(table);
+        fclose(file);
+        return NULL;
+    }
+    fclose(file);
+    *count = n;
+    return table;
+}
+
+// Policy cars in one log. Same rule as load_map_binary and as
+// PufferDrive set_active_agents: the self-driving car first when it
+// is valid at init, then file order. Experts and goals closer than
+// MIN_DISTANCE_TO_GOAL are skipped, except in WOSAC and human-replay.
+// load_map_binary keeps at most 512 of them. Returns -1 on a road file.
+static int drive_controllable_count(const char* filename, int sdc,
+        int init_steps, int mode, int max_controlled, int cap) {
+    FILE* file = fopen(filename, "rb");
+    if (!file) {
+        return -1;
+    }
+    int head[4];
+    if (fread(head, sizeof(int), 4, file) != 4) {
+        fclose(file);
+        return -1;
+    }
+    int nobj = head[0];
+    int nroads = head[1];
+    int type = head[2];
+    int traj = head[3];
+    int log_map = traj >= 2 && traj <= DRIVE_LOG_MAX
+        && nobj >= 0 && nobj <= LOG_CAND_MAX
+        && nroads > 0 && type >= VEHICLE && type <= TRUCK;
+    if (!log_map || init_steps < 0 || init_steps >= traj || cap < 1) {
+        fclose(file);
+        return -1;
+    }
+    int body_n = 8 * traj * (int)sizeof(int) + 28;
+    unsigned char* body = (unsigned char*)malloc((size_t)body_n);
+    typedef struct {
+        int id;
+        int type;
+        int expert;
+        int near;
+    } Cand;
+    Cand* cand = (Cand*)calloc(nobj > 0 ? (size_t)nobj : 1, sizeof(Cand));
+    if (!body || !cand) {
+        free(body);
+        free(cand);
+        fclose(file);
+        return -1;
+    }
+    int nc = 0;
+    int step = init_steps;
+    int ok = 1;
+    for (int i = 0; i < nobj; i++) {
+        int next_type = 0;
+        int next_size = 0;
+        int valid = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+        float gx = 0.0f;
+        float gy = 0.0f;
+        int mark = 0;
+        if (fread(body, 1, (size_t)body_n, file) != (size_t)body_n
+                || fread(&next_type, sizeof(int), 1, file) != 1
+                || fread(&next_size, sizeof(int), 1, file) != 1) {
+            ok = 0;
+            break;
+        }
+        int moving = type == VEHICLE || type == TRUCK
+            || type == PEDESTRIAN || type == CYCLIST;
+        memcpy(&valid, body + (7 * traj + step) * (int)sizeof(int), sizeof(int));
+        if (moving && valid) {
+            float dx = 0.0f;
+            float dy = 0.0f;
+            float min2 = MIN_DISTANCE_TO_GOAL * MIN_DISTANCE_TO_GOAL;
+            memcpy(&x, body + step * (int)sizeof(float), sizeof(float));
+            memcpy(&y, body + (traj + step) * (int)sizeof(float), sizeof(float));
+            memcpy(&gx, body + 8 * traj * (int)sizeof(float)
+                + 3 * (int)sizeof(float), sizeof(float));
+            memcpy(&gy, body + 8 * traj * (int)sizeof(float)
+                + 4 * (int)sizeof(float), sizeof(float));
+            memcpy(&mark, body + 8 * traj * (int)sizeof(float)
+                + 6 * (int)sizeof(float), sizeof(int));
+            dx = gx - x;
+            dy = gy - y;
+            cand[nc].id = i;
+            cand[nc].type = type;
+            cand[nc].expert = mark != 0;
+            cand[nc].near = (dx * dx + dy * dy) < min2;
+            nc++;
+        }
+        type = next_type;
+        (void)next_size;
+    }
+    free(body);
+    fclose(file);
+    if (!ok) {
+        free(cand);
+        return -1;
+    }
+    int sdc_at = -1;
+    if (sdc >= 0) {
+        for (int i = 0; i < nc; i++) {
+            if (cand[i].id == sdc) {
+                sdc_at = i;
+                break;
+            }
+        }
+    }
+    int limit = cap;
+    if (mode == CONTROL_MIXED_PLAY && max_controlled > 0
+            && max_controlled < limit) {
+        limit = max_controlled;
+    }
+    if (mode == CONTROL_SDC_ONLY) {
+        limit = REPLAY_ACTORS;
+    }
+    int nk = 0;
+    if (sdc_at >= 0 && control_type_ok(mode, cand[sdc_at].type)) {
+        nk = 1;
+    }
+    for (int i = 0; i < nc && nk < limit; i++) {
+        if (i == sdc_at || !control_type_ok(mode, cand[i].type)) {
+            continue;
+        }
+        if (mode != CONTROL_SDC_ONLY && mode != CONTROL_WOSAC
+                && (cand[i].expert || cand[i].near)) {
+            continue;
+        }
+        nk++;
+    }
+    free(cand);
+    return nk;
+}
+
+// Road maps (sdc < 0) use road_agents. Each log copy uses that scene's
+// controllable count. Copies of one count only reload that count,
+// because the bound slot count cannot change. Roads are placed first.
+// Returns 0 when every map uses num_agents.
+static int drive_plan_copies(VecEnv* vec, Dict* ek, int total_agents,
+        DriveCopy** out) {
+    *out = NULL;
+    DictItem* road_item = dict_find(ek, "road_agents");
+    if (!road_item || road_item->value < 1.0) {
+        return 0;
+    }
+    int road_n = (int)road_item->value;
+    int num_maps = (int)dict_get(ek, "num_maps");
+    if (num_maps < 1) {
+        num_maps = 1;
+    }
+    int map_offset = 0;
+    DictItem* off = dict_find(ek, "map_offset");
+    if (off) {
+        map_offset = (int)off->value;
+    }
+    if (num_maps <= 1) {
+        return 0;
+    }
+    int apb = vec->agents_per_buf;
+    int nbuf = vec->buffers;
+    assert(apb > 0 && nbuf >= 1 && nbuf <= 16);
+    assert(apb * nbuf == total_agents);
+    assert(road_n >= 1 && road_n <= DRIVE_AGENT_MAX && road_n <= apb);
+    int sdc_n = 0;
+    const char* data_dir = dict_get_str(ek, "data_dir");
+    int* sdc = drive_read_sdc(data_dir, &sdc_n);
+    if (!sdc) {
+        return 0;
+    }
+    int init_steps = 0;
+    DictItem* init_at = dict_find(ek, "init_steps");
+    if (init_at && init_at->value > 0.0) {
+        init_steps = (int)init_at->value;
+    }
+    int mode = CONTROL_AGENTS;
+    DictItem* control = dict_find(ek, "control_mode");
+    if (control && control->str && control->str[0]) {
+        mode = drive_control_mode(control->str);
+    }
+    int max_controlled = 32;
+    DictItem* controlled = dict_find(ek, "max_controlled_agents");
+    if (controlled && controlled->value > 0.0) {
+        max_controlled = (int)controlled->value;
+    }
+    // load_map_binary stores the kept cars in keep[512].
+    int cap = DRIVE_AGENT_MAX;
+    if (cap > 512) {
+        cap = 512;
+    }
+    if (cap > apb) {
+        cap = apb;
+    }
+    assert(cap >= 1);
+    unsigned char* is_road = (unsigned char*)calloc((size_t)num_maps, 1);
+    int* counts = (int*)calloc((size_t)num_maps, sizeof(int));
+    assert(is_road && counts);
+    int threads = omp_get_max_threads();
+    if (threads < 1) {
+        threads = 1;
+    }
+    fprintf(stderr, "maps counting controllable agents\n");
+    fflush(stderr);
+    #pragma omp parallel for schedule(dynamic, 32) num_threads(threads)
+    for (int i = 0; i < num_maps; i++) {
+        int map_id = map_offset + i;
+        int track = -1;
+        if (map_id >= 0 && map_id < sdc_n) {
+            track = sdc[map_id];
+        }
+        if (map_id >= 0 && map_id < sdc_n && track < 0) {
+            is_road[i] = 1;
+            continue;
+        }
+        char path[512];
+        snprintf(path, sizeof(path), "%s/binaries/map_%03d.bin", data_dir, map_id);
+        counts[i] = drive_controllable_count(path, track, init_steps, mode,
+            max_controlled, cap);
+    }
+    free(sdc);
+    int* roads = (int*)malloc((size_t)num_maps * sizeof(int));
+    assert(roads);
+    int n_road = 0;
+    int n_log = 0;
+    int skipped = 0;
+    int hist[513];
+    memset(hist, 0, sizeof(hist));
+    for (int i = 0; i < num_maps; i++) {
+        int map_id = map_offset + i;
+        if (is_road[i]) {
+            roads[n_road++] = map_id;
+            continue;
+        }
+        assert(counts[i] >= 0 && "log map did not load");
+        if (counts[i] == 0) {
+            skipped++;
+            continue;
+        }
+        assert(counts[i] <= cap);
+        hist[counts[i]]++;
+        n_log++;
+    }
+    free(is_road);
+    if (skipped > 0) {
+        fprintf(stderr, "maps skipped %d logs with no controllable agent\n",
+            skipped);
+    }
+    if (n_road == 0 || n_log == 0) {
+        free(roads);
+        free(counts);
+        return 0;
+    }
+    int copies_r = n_road;
+    int prefix = copies_r * road_n;
+    assert(prefix < total_agents && "road copies fill the batch");
+    assert(prefix <= apb || apb % road_n == 0);
+    int log_slots = total_agents - prefix;
+    int nb = 0;
+    int mandatory = 0;
+    for (int k = 1; k <= cap; k++) {
+        if (!hist[k]) {
+            continue;
+        }
+        nb++;
+        mandatory += k;
+    }
+    assert(nb > 0);
+    assert(mandatory <= log_slots
+        && "controllable counts do not fit in total_agents");
+    int index_of[513];
+    for (int k = 0; k <= cap; k++) {
+        index_of[k] = -1;
+    }
+    DriveLogBucket* buckets = (DriveLogBucket*)calloc((size_t)nb, sizeof(DriveLogBucket));
+    assert(buckets);
+    int bi = 0;
+    for (int k = 1; k <= cap; k++) {
+        if (!hist[k]) {
+            continue;
+        }
+        index_of[k] = bi;
+        buckets[bi].agents = k;
+        buckets[bi].n = hist[k];
+        buckets[bi].ids = (int*)malloc((size_t)hist[k] * sizeof(int));
+        assert(buckets[bi].ids);
+        buckets[bi].copies = 1;
+        buckets[bi].cursor = 0;
+        hist[k] = 0;
+        bi++;
+    }
+    for (int i = 0; i < num_maps; i++) {
+        int c = counts[i];
+        if (c <= 0) {
+            continue;
+        }
+        int b = index_of[c];
+        buckets[b].ids[hist[c]++] = map_offset + i;
+    }
+    free(counts);
+    for (int b = 0; b < nb; b++) {
+        assert(hist[buckets[b].agents] == buckets[b].n);
+    }
+    // One copy of every count, then more copies for the common counts.
+    // The least-represented count that still fits gets the next copy.
+    int left = log_slots - mandatory;
+    while (left > 0) {
+        int best = -1;
+        for (int b = 0; b < nb; b++) {
+            int k = buckets[b].agents;
+            if (k > left) {
+                continue;
+            }
+            if (best < 0) {
+                best = b;
+                continue;
+            }
+            long score_b = (long)buckets[b].copies * (long)buckets[best].n;
+            long score_best = (long)buckets[best].copies * (long)buckets[b].n;
+            int smaller = k < buckets[best].agents;
+            if (score_b < score_best
+                    || (score_b == score_best && buckets[b].n > buckets[best].n)
+                    || (score_b == score_best && buckets[b].n == buckets[best].n
+                        && smaller)) {
+                best = b;
+            }
+        }
+        assert(best >= 0 && "log slots cannot be filled");
+        buckets[best].copies++;
+        left -= buckets[best].agents;
+    }
+    int slot_sum = 0;
+    int n_log_copies = 0;
+    for (int b = 0; b < nb; b++) {
+        slot_sum += buckets[b].copies * buckets[b].agents;
+        n_log_copies += buckets[b].copies;
+    }
+    assert(slot_sum == log_slots);
+    int room_space[16];
+    int rooms_n = 0;
+    int road_left = prefix;
+    for (int b = 0; b < nbuf; b++) {
+        int take = road_left < apb ? road_left : apb;
+        assert(take % road_n == 0);
+        road_left -= take;
+        if (apb - take > 0) {
+            room_space[rooms_n++] = apb - take;
+        }
+    }
+    assert(road_left == 0);
+    int* room_item[16];
+    int room_fill[16];
+    memset(room_fill, 0, sizeof(room_fill));
+    for (int r = 0; r < rooms_n; r++) {
+        room_item[r] = (int*)malloc((size_t)room_space[r] * sizeof(int));
+        assert(room_item[r]);
+    }
+    for (int k = cap; k >= 1; k--) {
+        int b = index_of[k];
+        if (b < 0) {
+            continue;
+        }
+        for (int c = 0; c < buckets[b].copies; c++) {
+            int room = -1;
+            int best_space = -1;
+            for (int r = 0; r < rooms_n; r++) {
+                if (room_space[r] >= k && room_space[r] > best_space) {
+                    best_space = room_space[r];
+                    room = r;
+                }
+            }
+            assert(room >= 0 && "log copy does not fit a worker buffer");
+            room_space[room] -= k;
+            room_item[room][room_fill[room]++] = b;
+        }
+    }
+    for (int r = 0; r < rooms_n; r++) {
+        assert(room_space[r] == 0);
+    }
+    int n = copies_r + n_log_copies;
+    DriveCopy* copies = (DriveCopy*)calloc((size_t)n, sizeof(DriveCopy));
+    unsigned char* copy_road = (unsigned char*)malloc((size_t)n);
+    int* copy_bucket = (int*)malloc((size_t)n * sizeof(int));
+    int* copy_slot = (int*)malloc((size_t)n * sizeof(int));
+    assert(copies && copy_road && copy_bucket && copy_slot);
+    int at = 0;
+    for (int i = 0; i < copies_r; i++) {
+        copies[at].map_id = roads[i % n_road];
+        copies[at].agents = road_n;
+        copies[at].road = 1;
+        copy_road[at] = 1;
+        copy_bucket[at] = -1;
+        copy_slot[at] = i;
+        at++;
+    }
+    int* emitted = (int*)calloc((size_t)nb, sizeof(int));
+    assert(emitted);
+    for (int r = 0; r < rooms_n; r++) {
+        for (int j = 0; j < room_fill[r]; j++) {
+            int b = room_item[r][j];
+            int slot = emitted[b]++;
+            copies[at].map_id = buckets[b].ids[slot % buckets[b].n];
+            copies[at].agents = buckets[b].agents;
+            copies[at].road = 0;
+            copy_road[at] = 0;
+            copy_bucket[at] = b;
+            copy_slot[at] = slot;
+            at++;
+        }
+        free(room_item[r]);
+    }
+    assert(at == n);
+    for (int b = 0; b < nb; b++) {
+        assert(emitted[b] == buckets[b].copies);
+    }
+    free(emitted);
+    vec->road_agents = road_n;
+    vec->n_road_copies = copies_r;
+    vec->n_log_copies = n_log_copies;
+    vec->road_ids = roads;
+    vec->n_road_ids = n_road;
+    vec->road_cursor = 0;
+    vec->copy_road = copy_road;
+    vec->copy_bucket = copy_bucket;
+    vec->copy_slot = copy_slot;
+    vec->log_buckets = buckets;
+    vec->n_log_buckets = nb;
+    *out = copies;
+    return n;
+}
+
 static void drive_mark_maps(VecEnv* vec) {
     if (!vec->map_seen || vec->num_maps <= 0) {
         return;
@@ -1096,18 +1571,55 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
         saved_map_id = dict_get(ek, "map_id");
         restore_map_id = 1;
     }
-    while (agents_created < total_agents) {
-        envs[num_envs].rng = num_envs;
-        if (num_maps > 1) {
-            int map_id = map_offset + (num_envs % num_maps);
-            dict_set(ek, "map_id", (double)map_id);
-            if (map_id < 8) {
-                map_counts[map_id]++;
+    DriveCopy* planned = NULL;
+    int nplanned = 0;
+#ifdef PUFFER_DRIVE
+    nplanned = drive_plan_copies(vec, ek, total_agents, &planned);
+#endif
+    double saved_agents = 0.0;
+    if (nplanned > 0) {
+        saved_agents = dict_get(ek, "num_agents");
+        for (int i = 0; i < nplanned; i++) {
+            envs[num_envs].rng = num_envs;
+            dict_set(ek, "map_id", (double)planned[i].map_id);
+            dict_set(ek, "num_agents", (double)planned[i].agents);
+            if (planned[i].map_id < 8) {
+                map_counts[planned[i].map_id]++;
             }
+            puf_init(&envs[num_envs], ek);
+            assert(envs[num_envs].num_agents == planned[i].agents);
+#ifdef PUFFER_DRIVE
+            if (planned[i].road) {
+                assert(!envs[num_envs].log_spawn);
+            } else if (!envs[num_envs].log_spawn
+                    || envs[num_envs].spawn_n != planned[i].agents) {
+                fprintf(stderr,
+                    "maps controllable mismatch map=%d slots=%d spawn=%d\n",
+                    planned[i].map_id, planned[i].agents,
+                    envs[num_envs].spawn_n);
+                assert(0);
+            }
+#endif
+            agents_created += envs[num_envs].num_agents;
+            num_envs++;
         }
-        puf_init(&envs[num_envs], ek);
-        agents_created += envs[num_envs].num_agents;
-        num_envs++;
+        assert(agents_created == total_agents);
+        free(planned);
+        dict_set(ek, "num_agents", saved_agents);
+    } else {
+        while (agents_created < total_agents) {
+            envs[num_envs].rng = num_envs;
+            if (num_maps > 1) {
+                int map_id = map_offset + (num_envs % num_maps);
+                dict_set(ek, "map_id", (double)map_id);
+                if (map_id < 8) {
+                    map_counts[map_id]++;
+                }
+            }
+            puf_init(&envs[num_envs], ek);
+            agents_created += envs[num_envs].num_agents;
+            num_envs++;
+        }
     }
     if (restore_map_id) {
         dict_set(ek, "map_id", saved_map_id);
@@ -1116,6 +1628,30 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
             fprintf(stderr, " m%d=%d", m, map_counts[m]);
         }
         fprintf(stderr, "\n");
+#ifdef PUFFER_DRIVE
+        if (vec->n_road_copies > 0) {
+            int lo = 0;
+            int hi = 0;
+            if (vec->n_log_buckets > 0) {
+                lo = vec->log_buckets[0].agents;
+                hi = lo;
+                for (int b = 1; b < vec->n_log_buckets; b++) {
+                    int a = vec->log_buckets[b].agents;
+                    if (a < lo) {
+                        lo = a;
+                    }
+                    if (a > hi) {
+                        hi = a;
+                    }
+                }
+            }
+            fprintf(stderr,
+                "maps log_copies=%d log_buckets=%d log_agents=%d..%d "
+                "road_copies=%d road_agents=%d\n",
+                vec->n_log_copies, vec->n_log_buckets, lo, hi,
+                vec->n_road_copies, vec->road_agents);
+        }
+#endif
     }
     envs = (Env*)realloc(envs, num_envs * sizeof(Env));
 #ifdef PUFFER_DRIVE
@@ -1495,6 +2031,21 @@ static void env_close(VecEnv* vec) {
 #ifdef PUFFER_DRIVE
     free(vec->map_seen);
     vec->map_seen = NULL;
+    if (vec->log_buckets) {
+        for (int i = 0; i < vec->n_log_buckets; i++) {
+            free(vec->log_buckets[i].ids);
+        }
+    }
+    free(vec->log_buckets);
+    free(vec->road_ids);
+    free(vec->copy_road);
+    free(vec->copy_bucket);
+    free(vec->copy_slot);
+    vec->log_buckets = NULL;
+    vec->road_ids = NULL;
+    vec->copy_road = NULL;
+    vec->copy_bucket = NULL;
+    vec->copy_slot = NULL;
 #endif
     if (PUF_BACKEND == PUF_GPU) {
         puf_close(vec->envs);
@@ -3539,24 +4090,59 @@ static void env_resample_maps(PuffeRL* p) {
     if (pages < 1) {
         return;
     }
-    long advance = (long)pages * (long)vec->size;
-    vec->map_cursor = (int)((vec->map_cursor + advance) % vec->num_maps);
     int copies = vec->size;
-    int cursor = vec->map_cursor;
-    int nmaps = vec->num_maps;
-    int off = vec->map_offset;
-    fprintf(stderr, "maps resample cursor=%d copies=%d num_maps=%d\n",
-        off + cursor, copies, nmaps);
-    fflush(stderr);
     double t0 = wall_clock();
     int threads = omp_get_max_threads();
     if (threads < 1) {
         threads = 1;
     }
-    #pragma omp parallel for schedule(static) num_threads(threads)
-    for (int i = 0; i < copies; i++) {
-        int map_id = off + (cursor + i) % nmaps;
-        puf_reload_map(&vec->envs[i], map_id);
+    if (vec->n_road_ids > 0 && vec->copy_road) {
+        for (int b = 0; b < vec->n_log_buckets; b++) {
+            DriveLogBucket* bk = &vec->log_buckets[b];
+            if (bk->n < 1 || bk->copies < 1) {
+                continue;
+            }
+            bk->cursor = (int)((bk->cursor
+                + (long)pages * bk->copies) % bk->n);
+        }
+        vec->road_cursor = (int)((vec->road_cursor
+            + (long)pages * vec->n_road_copies) % vec->n_road_ids);
+        fprintf(stderr,
+            "maps resample log_copies=%d log_buckets=%d road_map=%d road_copies=%d\n",
+            vec->n_log_copies, vec->n_log_buckets,
+            vec->road_ids[vec->road_cursor], vec->n_road_copies);
+        fflush(stderr);
+        #pragma omp parallel for schedule(static) num_threads(threads)
+        for (int i = 0; i < copies; i++) {
+            int map_id;
+            if (vec->copy_road[i]) {
+                map_id = vec->road_ids[(vec->road_cursor
+                    + vec->copy_slot[i]) % vec->n_road_ids];
+            } else {
+                DriveLogBucket* bk = &vec->log_buckets[vec->copy_bucket[i]];
+                map_id = bk->ids[(bk->cursor + vec->copy_slot[i]) % bk->n];
+            }
+            // Same town stays up. A reset here would cut the long episode
+            // every time the log window moved.
+            if (map_id == vec->envs[i].map_id) {
+                continue;
+            }
+            puf_reload_map(&vec->envs[i], map_id);
+        }
+    } else {
+        long advance = (long)pages * (long)vec->size;
+        vec->map_cursor = (int)((vec->map_cursor + advance) % vec->num_maps);
+        int cursor = vec->map_cursor;
+        int nmaps = vec->num_maps;
+        int off = vec->map_offset;
+        fprintf(stderr, "maps resample cursor=%d copies=%d num_maps=%d\n",
+            off + cursor, copies, nmaps);
+        fflush(stderr);
+        #pragma omp parallel for schedule(static) num_threads(threads)
+        for (int i = 0; i < copies; i++) {
+            int map_id = off + (cursor + i) % nmaps;
+            puf_reload_map(&vec->envs[i], map_id);
+        }
     }
     drive_mark_maps(vec);
     for (int b = 0; b < p->num_policies; b++) {

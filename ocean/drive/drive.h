@@ -661,6 +661,8 @@ Entity* load_map_binary(const char* filename, Drive* env) {
     // Human-replay keeps the SDC plus other valid movers, capped at
     // REPLAY_ACTORS, and does not drop experts or near goals.
     // The other modes skip expert tracks and goals closer than 5 m.
+    // A mixed pool sets max_agents to that controllable count, so the
+    // cap keeps every selected car. A fixed fleet still drops the rest.
     // A mover that is invalid here and valid later is log-replayed.
     int mode = env->control_mode;
     int sdc = read_map_sdc(filename, env->map_id);
