@@ -1774,6 +1774,7 @@ def main():
     allowed = (
         (ROOT / "logs" / "drive").resolve(),
         (ROOT / "logs" / "replay_sweep").resolve(),
+        (ROOT / "logs" / "i24").resolve(),
         (ROOT / "logs" / "i24_sweep").resolve(),
         (ROOT / "logs" / "mixed_big").resolve(),
         (ROOT / "logs" / "mixed_big" / "drive").resolve(),
