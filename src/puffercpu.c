@@ -42,6 +42,10 @@ Weights* load_weights(const char* filename) {
     return weights;
 }
 
+int weights_count(Weights* weights) {
+    return weights ? weights->size - 7 : 0;
+}
+
 float* get_weights(Weights* weights, int num_weights) {
     float* data = &weights->data[weights->idx];
     weights->idx += num_weights;
@@ -916,6 +920,37 @@ static void puf_encode(PufferNet* net, float* obs) {
 #endif
 }
 
+static int puf_align8(int n) {
+    return (n + 7) & ~7;
+}
+
+int puffernet_weight_count(int input_dim, int hidden, int layers,
+        const int logit_sizes[], int num_actions) {
+    int atn_sum = 0;
+    int continuous = 1;
+    for (int i = 0; i < num_actions; i++) {
+        atn_sum += logit_sizes[i];
+        if (logit_sizes[i] != 1) {
+            continuous = 0;
+        }
+    }
+    int n = 0;
+#ifdef PUFFER_DRIVE
+    assert(input_dim == OBS_SIZE);
+    n = drive_encoder_nfloats(hidden);
+#else
+    n = puf_align8(n + hidden * input_dim);
+#endif
+    n = puf_align8(n + (atn_sum + 1) * hidden);
+    if (continuous) {
+        n = puf_align8(n + num_actions);
+    }
+    for (int l = 0; l < layers; l++) {
+        n = puf_align8(n + 3 * hidden * hidden);
+    }
+    return n;
+}
+
 PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
         int hidden_dim, int num_layers, int logit_sizes[], int num_actions) {
     PufferNet* net = calloc(1, sizeof(PufferNet));
@@ -1098,37 +1133,6 @@ void free_puffernet(PufferNet* net) {
 #endif
 
 #if !defined(PUF_NMMO3_NET) && !defined(PUF_ASTEROIDS_NET) && !defined(PUF_MINIMAL_NET) && !defined(PUF_CRAFTAX_NET)
-static int puf_align8(int n) {
-    return (n + 7) & ~7;
-}
-
-static int puffernet_weight_count(int input_dim, int hidden, int layers,
-        const int act_sizes[], int num_actions) {
-    int atn_sum = 0;
-    int continuous = 1;
-    for (int i = 0; i < num_actions; i++) {
-        atn_sum += act_sizes[i];
-        if (act_sizes[i] != 1) {
-            continuous = 0;
-        }
-    }
-    int n = 0;
-#ifdef PUFFER_DRIVE
-    assert(input_dim == OBS_SIZE);
-    n = drive_encoder_nfloats(hidden);
-#else
-    n = puf_align8(n + hidden * input_dim);
-#endif
-    n = puf_align8(n + (atn_sum + 1) * hidden);
-    if (continuous) {
-        n = puf_align8(n + num_actions);
-    }
-    for (int l = 0; l < layers; l++) {
-        n = puf_align8(n + 3 * hidden * hidden);
-    }
-    return n;
-}
-
 #ifdef MAX_AGENTS
 // An old checkpoint has 7 ego features and 63 partners (973 inputs).
 // Extra ego features and the extra partner slot are zero, so that

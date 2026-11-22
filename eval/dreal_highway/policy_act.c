@@ -9,7 +9,7 @@
  *
  * The reply is float actions[n * 2], accel bin then steer bin.
  *
- *   policy_act CKPT HIDDEN LAYERS BATCH [sample|greedy]
+ *   policy_act CKPT HIDDEN LAYERS BATCH [SEED]
  */
 #include <assert.h>
 #include <stdio.h>
@@ -23,6 +23,9 @@ typedef struct Weights Weights;
 typedef struct PufferNet PufferNet;
 
 Weights* load_weights(const char* filename);
+int weights_count(Weights* weights);
+int puffernet_weight_count(int input_dim, int hidden, int layers,
+    const int logit_sizes[], int num_actions);
 PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
     int hidden_dim, int num_layers, int logit_sizes[], int num_actions);
 void forward_puffernet(PufferNet* net, float* observations, float* actions,
@@ -37,6 +40,7 @@ int main(int argc, char** argv) {
     int hidden;
     int layers;
     int batch;
+    unsigned int seed = 1;
     int acts[2] = ACT_SIZES;
     Weights* weights;
     PufferNet* net;
@@ -47,14 +51,17 @@ int main(int argc, char** argv) {
         printf("%d\n", OBS_SIZE);
         return 0;
     }
-    if (argc != 5) {
-        fprintf(stderr, "usage: policy_act CKPT HIDDEN LAYERS BATCH\n");
+    if (argc != 5 && argc != 6) {
+        fprintf(stderr, "usage: policy_act CKPT HIDDEN LAYERS BATCH [SEED]\n");
         return 2;
     }
     path = argv[1];
     hidden = atoi(argv[2]);
     layers = atoi(argv[3]);
     batch = atoi(argv[4]);
+    if (argc == 6) {
+        seed = (unsigned int)strtoul(argv[5], NULL, 10);
+    }
     if (hidden <= 0 || layers <= 0 || batch <= 0) {
         fprintf(stderr, "policy_act bad shape\n");
         return 2;
@@ -62,6 +69,16 @@ int main(int argc, char** argv) {
     weights = load_weights(path);
     if (!weights) {
         fprintf(stderr, "policy_act cannot read %s\n", path);
+        return 1;
+    }
+    int actual = weights_count(weights);
+    int expected = puffernet_weight_count(
+        OBS_SIZE, hidden, layers, acts, NUM_ATNS);
+    if (actual > expected || expected - actual > 7) {
+        fprintf(stderr,
+            "policy_act checkpoint shape mismatch: %s has %d floats, "
+            "but hidden=%d layers=%d needs %d\n",
+            path, actual, hidden, layers, expected);
         return 1;
     }
     net = make_puffernet(weights, batch, OBS_SIZE, hidden, layers, acts, NUM_ATNS);
@@ -73,7 +90,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
-    srand(1);
+    srand(seed);
     for (;;) {
         int32_t op = 0;
         int32_t n = 0;

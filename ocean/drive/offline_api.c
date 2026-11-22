@@ -195,6 +195,13 @@ void pf_set_action(PfHandle* h, int i, float accel_bin, float steer_bin) {
     h->off.drive.agents[i].actions[1] = steer_bin;
 }
 
+void pf_set_actions(PfHandle* h, const float* actions) {
+    for (int i = 0; i < h->off.drive.num_agents; i++) {
+        h->off.drive.agents[i].actions[0] = actions[(size_t)i * NUM_ATNS];
+        h->off.drive.agents[i].actions[1] = actions[(size_t)i * NUM_ATNS + 1];
+    }
+}
+
 // Re-bin logged commands. Does not change which agents are fit.
 void pf_relabel_grid(PfHandle* h, float amin, float amax, int na,
         float smin, float smax, int ns) {
@@ -270,6 +277,31 @@ void pf_agent(PfHandle* h, int i, float* out) {
     out[10] = (e->x == INVALID_POSITION || e->y == INVALID_POSITION) ? 0.0f : 1.0f;
 }
 
+void pf_agents(PfHandle* h, float* out) {
+    for (int i = 0; i < h->off.drive.num_agents; i++) {
+        pf_agent(h, i, out + (size_t)i * 11);
+    }
+}
+
+void pf_censor_invalid(PfHandle* h, int frame) {
+    assert(h->kind == PF_SCENARIO);
+    assert(frame >= 0 && frame < h->off.traj);
+    for (int i = 0; i < h->off.log_n; i++) {
+        if (h->off.logs[i].valid[frame]) {
+            continue;
+        }
+        Entity* e = &h->off.drive.entities[i];
+        e->x = INVALID_POSITION;
+        e->y = INVALID_POSITION;
+        e->valid = 0;
+        e->vx = 0.0f;
+        e->vy = 0.0f;
+        e->collision_state = NO_COLLISION;
+        e->offroad_state = 0;
+    }
+    h->off.drive.bins_ready = 0;
+}
+
 void pf_set_agent(PfHandle* h, int i, float x, float y, float heading,
         float vx, float vy, float width, float length, float gx, float gy) {
     Entity* e = &h->off.drive.entities[i];
@@ -326,6 +358,16 @@ int pf_sdc(PfHandle* h) {
 
 int pf_base_unfit(PfHandle* h, int i) {
     return h->off.logs[i].base_unfit;
+}
+
+// Full-scene macro evaluation performs its eligibility filtering before the
+// scenario is loaded.  It deliberately does not drop snowy-rut trajectories
+// merely because their boxes touch a recovered calibration edge.
+void pf_allow_all_logs(PfHandle* h) {
+    assert(h->kind == PF_SCENARIO);
+    for (int i = 0; i < h->off.log_n; i++) {
+        h->off.logs[i].base_unfit = 0;
+    }
 }
 
 int pf_log_valid(PfHandle* h, int i, int t) {
