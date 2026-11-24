@@ -165,56 +165,14 @@ elif [ "$ENV" = "trailer" ]; then
     EXTRA_CFLAGS+=(-DARCHITECTURE_LIB -Iresources)
     STANDALONE=1
     CLANG_WARN+=(-Wno-unused-function)
-elif [ "$ENV" = "impulse_wars" ]; then
-    SRC_DIR="ocean/$ENV"
-    if [ "$MODE" = "web" ]; then BOX2D_NAME='box2d-web'
-    elif [ "$PLATFORM" = "Linux" ]; then BOX2D_NAME='box2d-linux-amd64'
-    else BOX2D_NAME='box2d-macos-arm64'
-    fi
-    BOX2D_URL="https://github.com/capnspacehook/box2d/releases/latest/download"
-    download "$BOX2D_NAME" "$BOX2D_URL/$BOX2D_NAME.tar.gz"
-    INCLUDES+=(-I./$BOX2D_NAME/include -I./$BOX2D_NAME/src -I./ocean/impulse_wars -I./vendor/collections-c)
-    LINK_ARCHIVES+=("./$BOX2D_NAME/libbox2d.a")
-    # C++ trainer only: game is C (void*/compound literals), not C++17.
-    if [ -z "${MODE:-}" ] || [ "$MODE" = "native" ] || [ "$MODE" = "profile" ]; then
-        EXTRA_SRC="ocean/impulse_wars/impulse_wars_api.c"
-    fi
-elif [ "$ENV" = "nethack" ]; then
-    SRC_DIR="ocean/$ENV"
-    EXTRA_CFLAGS+=(-DPUFFER_NETHACK)
-    NLE_DIR="vendor/fast-nle"
-    NLE_REPO="https://github.com/FinlaySanders/fast-nle.git"
-    if [ ! -d "$NLE_DIR/src" ]; then
-        echo "Cloning fast-nle from $NLE_REPO ..."
-        git clone --depth 1 "$NLE_REPO" "$NLE_DIR"
-    fi
-    NETHACK_LIB_DIR="$(pwd)/$NLE_DIR/build"
-    if [ ! -f "$NETHACK_LIB_DIR/libnethack.so" ]; then
-        echo "Building libnethack.so ..."
-        cmake -S "$NLE_DIR" -B "$NETHACK_LIB_DIR" -DCMAKE_BUILD_TYPE=Release
-        cmake --build "$NETHACK_LIB_DIR" --target nethack -j$(nproc)
-    fi
-    INCLUDES+=(-I./$NLE_DIR/include
-               -I./$NLE_DIR/build/_deps/deboost_context-src/include)
-    EXTRA_LDFLAGS+=(-L"$NETHACK_LIB_DIR" -lnethack
-                    -Xlinker -rpath -Xlinker "$NETHACK_LIB_DIR" -ldl)
 elif [ -d "ocean/$ENV" ]; then
     SRC_DIR="ocean/$ENV"
 else
     echo "Error: environment '$ENV' not found" && exit 1
 fi
 
-# src/ocean.cu compiles only this env's custom net (PUFFER_NETHACK, PUFFER_NMMO3, …).
+# src/ocean.cu compiles only this env's custom net.
 EXTRA_CFLAGS+=(-DPUFFER_${ENV^^})
-
-case "$ENV" in
-    osrs_*)
-        python3 ocean/osrs/scripts/osrs_asset_manifest.py generate-c-header \
-            ocean/osrs/asset_manifest.json \
-            --output ocean/osrs/osrs_assets_generated.h
-        bash ocean/osrs/scripts/setup-data.sh
-        ;;
-esac
 
 USER_OUTPUT_NAME=${OUTPUT_NAME-}
 OUTPUT_NAME=${OUTPUT_NAME:-$ENV}
