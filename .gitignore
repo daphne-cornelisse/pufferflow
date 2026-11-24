@@ -4,6 +4,12 @@ pufferlib/extensions.c
 pufferlib/puffernet.c
 logs/
 logs_release/
+/data/
+/drive_data/
+/puffer
+/puffer_drive2
+/puffer_drive_enc
+/puffer_resample
 ocean/osrs/data/
 
 # Build dir

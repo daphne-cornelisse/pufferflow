@@ -249,6 +249,10 @@ struct Env {
     float reward_goal_post_respawn;
     float reward_vehicle_collision_post_respawn;
     unsigned int rng;
+    // PufferDrive resample: 0 keeps the startup batch. Otherwise the trainer
+    // repacks a new random window of scenes every this many env steps.
+    int resample_frequency;
+    int num_maps;
 };
 
 void add_log(Drive* env) {
@@ -276,66 +280,89 @@ void add_log(Drive* env) {
     }
 }
 
-// Map loading
+// Map loading. A short read used to leave array_size uninitialized and
+// malloc multi-terabyte trajectory buffers. Reject the file instead.
+static int drive_read(FILE* file, void* dst, size_t size, size_t count) {
+    if (count == 0) return 1;
+    return fread(dst, size, count, file) == count;
+}
+
+static void drive_free_entities(Entity* entities, int n) {
+    if (!entities) return;
+    for (int i = 0; i < n; i++) free_entity(&entities[i]);
+    free(entities);
+}
+
+static int drive_alloc_traj(float** dst, int size) {
+    *dst = (float*)malloc((size_t)size * sizeof(float));
+    return *dst != NULL;
+}
+
 Entity* load_map_binary(const char* filename, Drive* env) {
     FILE* file = fopen(filename, "rb");
     if (!file) return NULL;
+    Entity* entities = NULL;
+    int i = 0;
 
-    fread(&env->num_objects, sizeof(int), 1, file);
-    fread(&env->num_roads, sizeof(int), 1, file);
+    if (!drive_read(file, &env->num_objects, sizeof(int), 1) ||
+            !drive_read(file, &env->num_roads, sizeof(int), 1)) {
+        goto fail;
+    }
+    if (env->num_objects < 0 || env->num_roads < 0 ||
+            env->num_objects > 10000 || env->num_roads > 200000) {
+        goto fail;
+    }
     env->num_entities = env->num_objects + env->num_roads;
+    entities = (Entity*)calloc((size_t)env->num_entities, sizeof(Entity));
+    if (!entities) goto fail;
 
-    Entity* entities = (Entity*)malloc(env->num_entities * sizeof(Entity));
-    for (int i = 0; i < env->num_entities; i++) {
-        // Read base entity data
-        fread(&entities[i].type, sizeof(int), 1, file);
-        fread(&entities[i].array_size, sizeof(int), 1, file);
-        // Allocate arrays based on type
+    for (; i < env->num_entities; i++) {
+        if (!drive_read(file, &entities[i].type, sizeof(int), 1) ||
+                !drive_read(file, &entities[i].array_size, sizeof(int), 1)) {
+            goto fail;
+        }
         int size = entities[i].array_size;
-        entities[i].traj_x = (float*)malloc(size * sizeof(float));
-        entities[i].traj_y = (float*)malloc(size * sizeof(float));
-        entities[i].traj_z = (float*)malloc(size * sizeof(float));
-
-        int is_actor = (entities[i].type == VEHICLE ||
-                        entities[i].type == PEDESTRIAN ||
-                        entities[i].type == CYCLIST);
+        int typ = entities[i].type;
+        if (size < 1 || size > 4096 || typ < 0 || typ > 64) goto fail;
+        int is_actor = (typ == VEHICLE || typ == PEDESTRIAN || typ == CYCLIST);
+        int ok = drive_alloc_traj(&entities[i].traj_x, size)
+            && drive_alloc_traj(&entities[i].traj_y, size)
+            && drive_alloc_traj(&entities[i].traj_z, size);
         if (is_actor) {
-            // Allocate arrays for object-specific data
-            entities[i].traj_vx = (float*)malloc(size * sizeof(float));
-            entities[i].traj_vy = (float*)malloc(size * sizeof(float));
-            entities[i].traj_vz = (float*)malloc(size * sizeof(float));
-            entities[i].traj_heading = (float*)malloc(size * sizeof(float));
-            entities[i].traj_valid = (int*)malloc(size * sizeof(int));
-        } else {
-            // Roads don't use these arrays
-            entities[i].traj_vx = NULL;
-            entities[i].traj_vy = NULL;
-            entities[i].traj_vz = NULL;
-            entities[i].traj_heading = NULL;
-            entities[i].traj_valid = NULL;
+            ok = ok && drive_alloc_traj(&entities[i].traj_vx, size)
+                && drive_alloc_traj(&entities[i].traj_vy, size)
+                && drive_alloc_traj(&entities[i].traj_vz, size)
+                && drive_alloc_traj(&entities[i].traj_heading, size);
+            entities[i].traj_valid = (int*)malloc((size_t)size * sizeof(int));
+            ok = ok && entities[i].traj_valid != NULL;
         }
-        // Read array data
-        fread(entities[i].traj_x, sizeof(float), size, file);
-        fread(entities[i].traj_y, sizeof(float), size, file);
-        fread(entities[i].traj_z, sizeof(float), size, file);
-        if (is_actor) {
-            fread(entities[i].traj_vx, sizeof(float), size, file);
-            fread(entities[i].traj_vy, sizeof(float), size, file);
-            fread(entities[i].traj_vz, sizeof(float), size, file);
-            fread(entities[i].traj_heading, sizeof(float), size, file);
-            fread(entities[i].traj_valid, sizeof(int), size, file);
+        if (!ok ||
+                !drive_read(file, entities[i].traj_x, sizeof(float), size) ||
+                !drive_read(file, entities[i].traj_y, sizeof(float), size) ||
+                !drive_read(file, entities[i].traj_z, sizeof(float), size) ||
+                (is_actor && (
+                    !drive_read(file, entities[i].traj_vx, sizeof(float), size) ||
+                    !drive_read(file, entities[i].traj_vy, sizeof(float), size) ||
+                    !drive_read(file, entities[i].traj_vz, sizeof(float), size) ||
+                    !drive_read(file, entities[i].traj_heading, sizeof(float), size) ||
+                    !drive_read(file, entities[i].traj_valid, sizeof(int), size))) ||
+                !drive_read(file, &entities[i].width, sizeof(float), 1) ||
+                !drive_read(file, &entities[i].length, sizeof(float), 1) ||
+                !drive_read(file, &entities[i].height, sizeof(float), 1) ||
+                !drive_read(file, &entities[i].goal_position_x, sizeof(float), 1) ||
+                !drive_read(file, &entities[i].goal_position_y, sizeof(float), 1) ||
+                !drive_read(file, &entities[i].goal_position_z, sizeof(float), 1) ||
+                !drive_read(file, &entities[i].mark_as_expert, sizeof(int), 1)) {
+            goto fail;
         }
-        // Read remaining scalar fields
-        fread(&entities[i].width, sizeof(float), 1, file);
-        fread(&entities[i].length, sizeof(float), 1, file);
-        fread(&entities[i].height, sizeof(float), 1, file);
-        fread(&entities[i].goal_position_x, sizeof(float), 1, file);
-        fread(&entities[i].goal_position_y, sizeof(float), 1, file);
-        fread(&entities[i].goal_position_z, sizeof(float), 1, file);
-        fread(&entities[i].mark_as_expert, sizeof(int), 1, file);
     }
     fclose(file);
     return entities;
+fail:
+    drive_free_entities(entities, entities ? i + 1 : 0);
+    env->num_entities = 0;
+    fclose(file);
+    return NULL;
 }
 
 // Position initialization
@@ -393,7 +420,7 @@ int getGridIndex(Drive* env, float x1, float y1) {
 }
 
 void add_entity_to_grid(Drive* env, int grid_index, int entity_idx, int geometry_idx) {
-    if (grid_index == -1) return;
+    if (grid_index == -1 || !env->grid_cells) return;
 
     int base_index = grid_index * SLOTS_PER_CELL;
     int count = env->grid_cells[base_index];
@@ -442,10 +469,34 @@ void init_grid_map(Drive* env) {
 
     float grid_width = bottom_right_x - top_left_x;
     float grid_height = bottom_right_y - top_left_y;
-    env->grid_cols = ceil(grid_width / GRID_CELL_SIZE);
-    env->grid_rows = ceil(grid_height / GRID_CELL_SIZE);
-    int grid_cell_count = env->grid_cols * env->grid_rows;
-    env->grid_cells = (int*)calloc(grid_cell_count * SLOTS_PER_CELL, sizeof(int));
+    // Waymo scenes span a few hundred meters. A wild coordinate used to
+    // calloc a multi-terabyte grid, so anything over 10 km is skipped.
+    int cols = 0;
+    int rows = 0;
+    if (grid_width >= 0.0f && grid_height >= 0.0f &&
+            grid_width <= 10000.0f && grid_height <= 10000.0f) {
+        cols = (int)ceil(grid_width / GRID_CELL_SIZE);
+        rows = (int)ceil(grid_height / GRID_CELL_SIZE);
+        if (cols < 1) cols = 1;
+        if (rows < 1) rows = 1;
+    } else if (first_valid_point) {
+        fprintf(stderr, "drive: skip oversized grid %.0fm x %.0fm in %s\n",
+            grid_width, grid_height, env->map_name ? env->map_name : "?");
+    }
+    env->grid_cols = cols;
+    env->grid_rows = rows;
+    env->grid_cells = NULL;
+    if (cols > 0 && rows > 0) {
+        env->grid_cells = (int*)calloc(
+            (size_t)cols * (size_t)rows * SLOTS_PER_CELL, sizeof(int));
+        if (!env->grid_cells) {
+            fprintf(stderr, "drive: grid alloc failed %d x %d in %s\n",
+                cols, rows, env->map_name ? env->map_name : "?");
+            env->grid_cols = 0;
+            env->grid_rows = 0;
+            return;
+        }
+    }
 
     for (int i = 0; i < env->num_entities; i++) {
         if (env->entities[i].type >= ROAD_LANE && env->entities[i].type <= ROAD_EDGE) {
@@ -1657,8 +1708,10 @@ void close_client(Client* client) {
     free(client);
 }
 
-#define MAP_BINARY_DIR "drive_data/binaries"
+#define MAP_BINARY_DIR "data/drive/binaries"
 #define MAP_RESOURCE_DIR "resources/drive"
+// Trainer calls drive_repack between rollouts when this is set.
+#define DRIVE_RESAMPLE 1
 
 static int drive_map_exists(const char* path) {
     FILE* fp = fopen(path, "rb");
@@ -1667,7 +1720,7 @@ static int drive_map_exists(const char* path) {
     return 1;
 }
 
-// Train maps live in drive_data/binaries/. The web demo only preloads
+// Train maps live in data/drive/binaries/. The web demo only preloads
 // resources/drive/map_010.bin and map_942.bin.
 static void resolve_map_path(int map_id, char* out, size_t out_sz) {
     snprintf(out, out_sz, "%s/map_%03d.bin", MAP_BINARY_DIR, map_id);
@@ -1711,6 +1764,10 @@ void puf_init(Env* env, Dict* kwargs) {
     resolve_map_path(map_id, map_file, sizeof(map_file));
     env->map_name = strdup(map_file);
     env->max_agents = MAX_AGENTS;
+    env->num_maps = (int)dict_get(kwargs, "num_maps");
+    env->resample_frequency = 0;
+    DictItem* every = dict_find(kwargs, "resample_frequency");
+    if (every) env->resample_frequency = (int)every->value;
     init(env);
     env->num_agents = env->active_agent_count;
     if (env->num_agents > MAX_AGENTS) env->num_agents = MAX_AGENTS;
@@ -1720,118 +1777,275 @@ void puf_init(Env* env, Dict* kwargs) {
     }
 }
 
-// 4.0 binding.c: scan maps, assign distinct map_ids, pack each buffer to
-// exactly agents_per_buffer (full maps, then 1-agent leftovers).
-Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
-                 Dict* vec_kwargs, Dict* env_kwargs) {
-    int total_agents = dict_get(vec_kwargs, "total_agents");
-    int num_buffers = dict_get(vec_kwargs, "num_buffers");
-    int num_maps = dict_get(env_kwargs, "num_maps");
+// Controllable-agent counts, filled once. Resamples sample from this table
+// instead of rereading every scene. A second directory (CARLA, or another
+// Waymo split) is appended so one batch can initialize from both.
+static int* g_map_agents = NULL;
+static int g_map_agents_n = 0;
+static int g_map_valid = 0;
+static int g_primary_n = 0;
+static int g_extra_n = 0;
+static char g_map_dir[512];
+static char g_extra_dir[512];
+
+static const char* drive_map_dir(Dict* env_kwargs) {
+    DictItem* dir = dict_find(env_kwargs, "map_dir");
+    if (dir && dir->str && dir->str[0]) return dir->str;
+    return MAP_BINARY_DIR;
+}
+
+static void drive_extra_dir(Dict* env_kwargs, const char** dir_out, int* n_out) {
+    *dir_out = "";
+    *n_out = 0;
+    DictItem* n = dict_find(env_kwargs, "extra_num_maps");
+    if (!n || (int)n->value <= 0) return;
+    DictItem* dir = dict_find(env_kwargs, "extra_map_dir");
+    if (!dir || !dir->str || !dir->str[0] || strcmp(dir->str, "none") == 0) return;
+    *dir_out = dir->str;
+    *n_out = (int)n->value;
+}
+
+static void drive_map_path(char* out, size_t out_sz, int map_index) {
+    if (map_index < g_primary_n) {
+        snprintf(out, out_sz, "%s/map_%03d.bin", g_map_dir, map_index);
+    } else {
+        snprintf(out, out_sz, "%s/map_%03d.bin", g_extra_dir, map_index - g_primary_n);
+    }
+}
+
+static unsigned drive_rng_next(unsigned* rng) {
+    *rng = *rng * 1664525u + 1013904223u;
+    return *rng;
+}
+
+static int drive_count_valid(int n) {
+    int valid = 0;
+    for (int m = 0; m < n; m++) {
+        if (g_map_agents[m] > 0) valid++;
+    }
+    return valid;
+}
+
+static void drive_cache_maps(const char* dir, int num_maps, const char* extra, int extra_n) {
+    if (!extra) extra = "";
+    if (extra_n < 0 || !extra[0]) extra_n = 0;
+    int total = num_maps + extra_n;
+    if (g_map_agents && g_primary_n == num_maps && g_extra_n == extra_n
+            && strcmp(g_map_dir, dir) == 0 && strcmp(g_extra_dir, extra) == 0) {
+        return;
+    }
+    char first_map[512];
+    snprintf(first_map, sizeof(first_map), "%s/map_%03d.bin", dir, 0);
+    FILE* test_fp = fopen(first_map, "rb");
+    if (!test_fp) {
+        fprintf(stderr, "ERROR: Cannot find map files at %s/\n", dir);
+        fprintf(stderr, "Download WOMD JSON and run ocean/drive/dataset.py (see dataset.py header).\n");
+        exit(1);
+    }
+    fclose(test_fp);
+    if (extra_n > 0) {
+        snprintf(first_map, sizeof(first_map), "%s/map_%03d.bin", extra, 0);
+        test_fp = fopen(first_map, "rb");
+        if (!test_fp) {
+            fprintf(stderr, "ERROR: Cannot find map files at %s/\n", extra);
+            exit(1);
+        }
+        fclose(test_fp);
+    }
+
+    free(g_map_agents);
+    g_map_agents = (int*)calloc(total, sizeof(int));
+    g_map_agents_n = total;
+    g_primary_n = num_maps;
+    g_extra_n = extra_n;
+    snprintf(g_map_dir, sizeof(g_map_dir), "%s", dir);
+    snprintf(g_extra_dir, sizeof(g_extra_dir), "%s", extra);
+    g_map_valid = 0;
+    for (int base = 0; base < total; base += 1000) {
+        int end = base + 1000;
+        if (end > total) end = total;
+        #pragma omp parallel for schedule(dynamic, 8)
+        for (int m = base; m < end; m++) {
+            char map_file[512];
+            drive_map_path(map_file, sizeof(map_file), m);
+            g_map_agents[m] = peek_map_agent_count(map_file, MAX_AGENTS);
+        }
+    }
+    g_map_valid = drive_count_valid(total);
+    if (extra_n > 0) {
+        printf("Scanned %d maps from %s/ and %d from %s/, %d valid\n",
+            num_maps, dir, extra_n, extra, g_map_valid);
+    } else {
+        printf("Scanned %d maps from %s/, %d valid\n", num_maps, dir, g_map_valid);
+    }
+    fflush(stdout);
+    if (g_map_valid == 0) {
+        fprintf(stderr, "ERROR: No valid maps found in %s/\n", dir);
+        exit(1);
+    }
+}
+
+static void drive_load_env(Env* env, int map_index, int max_agents,
+        int human_agent_idx, float reward_vehicle_collision, float reward_offroad_collision,
+        float reward_goal_post_respawn, float reward_vehicle_collision_post_respawn,
+        int resample_frequency, int num_maps, unsigned rng_seed) {
+    char map_file[512];
+    drive_map_path(map_file, sizeof(map_file), map_index);
+    env->rng = rng_seed;
+    env->map_name = strdup(map_file);
+    env->human_agent_idx = human_agent_idx;
+    env->reward_vehicle_collision = reward_vehicle_collision;
+    env->reward_offroad_collision = reward_offroad_collision;
+    env->reward_goal_post_respawn = reward_goal_post_respawn;
+    env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
+    env->max_agents = max_agents;
+    env->resample_frequency = resample_frequency;
+    env->num_maps = num_maps;
+    init(env);
+    env->num_agents = env->active_agent_count;
+    if (env->num_agents > env->max_agents) env->num_agents = env->max_agents;
+    if (env->num_agents > MAX_AGENTS) env->num_agents = MAX_AGENTS;
+    if (env->num_agents != max_agents) {
+        fprintf(stderr, "ERROR: %s produced %d agents, wanted %d\n",
+            map_file, env->num_agents, max_agents);
+        exit(1);
+    }
+    for (int a = 0; a < env->num_agents; a++) {
+        env->agents[a].policy = 0;
+        env->agents[a].action_mask = NULL;
+    }
+}
+
+// Pack each buffer to exactly agents_per_buffer.
+// resample_frequency == 0 walks the catalog in order (stock 5.0 batch).
+// resample_frequency > 0 samples with replacement, like PufferDrive binding.shared,
+// and truncates the last scene so the buffer is exact.
+Env* drive_repack(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
+                  int total_agents, int num_buffers, Dict* env_kwargs, unsigned seed) {
+    int num_maps = (int)dict_get(env_kwargs, "num_maps");
     int agents_per_buffer = total_agents / num_buffers;
+    const char* dir = drive_map_dir(env_kwargs);
+    const char* extra = "";
+    int extra_n = 0;
+    drive_extra_dir(env_kwargs, &extra, &extra_n);
+    drive_cache_maps(dir, num_maps, extra, extra_n);
+    int catalog = g_map_agents_n;
+
+    int resample_frequency = 0;
+    DictItem* every = dict_find(env_kwargs, "resample_frequency");
+    if (every) resample_frequency = (int)every->value;
+    if (!seed) seed = 1;
 
     float reward_vehicle_collision = dict_get(env_kwargs, "reward_vehicle_collision");
     float reward_offroad_collision = dict_get(env_kwargs, "reward_offroad_collision");
     float reward_goal_post_respawn = dict_get(env_kwargs, "reward_goal_post_respawn");
     float reward_vehicle_collision_post_respawn = dict_get(env_kwargs, "reward_vehicle_collision_post_respawn");
-    int human_agent_idx = dict_get(env_kwargs, "human_agent_idx");
+    int human_agent_idx = (int)dict_get(env_kwargs, "human_agent_idx");
 
-    char first_map[512];
-    snprintf(first_map, sizeof(first_map), "%s/map_%03d.bin", MAP_BINARY_DIR, 0);
-    FILE* test_fp = fopen(first_map, "rb");
-    if (!test_fp) {
-        fprintf(stderr, "ERROR: Cannot find map files at %s/\n", MAP_BINARY_DIR);
-        fprintf(stderr, "Download WOMD JSON and run ocean/drive/dataset.py (see dataset.py header).\n");
-        exit(1);
-    }
-    fclose(test_fp);
-
-    int* agents_per_map = (int*)calloc(num_maps, sizeof(int));
-    int* valid_map_ids = (int*)calloc(num_maps, sizeof(int));
+    int* valid_map_ids = (int*)calloc(catalog, sizeof(int));
     int num_valid_maps = 0;
-    for (int m = 0; m < num_maps; m++) {
-        char map_file[512];
-        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, m);
-        agents_per_map[m] = peek_map_agent_count(map_file, MAX_AGENTS);
-        if (agents_per_map[m] > 0) {
-            valid_map_ids[num_valid_maps++] = m;
-        }
-    }
-    printf("Scanned %d maps from %s/, %d valid\n", num_maps, MAP_BINARY_DIR, num_valid_maps);
-
-    if (num_valid_maps == 0) {
-        fprintf(stderr, "ERROR: No valid maps found in %s/\n", MAP_BINARY_DIR);
-        free(agents_per_map);
-        free(valid_map_ids);
-        exit(1);
+    for (int m = 0; m < catalog; m++) {
+        if (g_map_agents[m] > 0) valid_map_ids[num_valid_maps++] = m;
     }
 
     int max_envs = agents_per_buffer * num_buffers;
     int* env_map_ids = (int*)malloc(max_envs * sizeof(int));
     int* env_max_agents = (int*)malloc(max_envs * sizeof(int));
     int total_envs = 0;
-    int cursor = 0;
+    unsigned rng = seed;
 
-    for (int b = 0; b < num_buffers; b++) {
-        buffer_env_starts[b] = total_envs;
-        int buffer_agents = 0;
-        while (buffer_agents < agents_per_buffer) {
-            int m = valid_map_ids[cursor % num_valid_maps];
-            int cap = agents_per_map[m];
-            int remaining = agents_per_buffer - buffer_agents;
-            if (cap <= remaining) {
-                env_map_ids[total_envs] = m;
-                env_max_agents[total_envs] = cap;
-                buffer_agents += cap;
-                total_envs++;
-                cursor++;
-            } else {
-                while (buffer_agents < agents_per_buffer) {
-                    int mm = valid_map_ids[cursor % num_valid_maps];
-                    env_map_ids[total_envs] = mm;
-                    env_max_agents[total_envs] = 1;
-                    buffer_agents++;
+    if (resample_frequency <= 0) {
+        int cursor = 0;
+        for (int b = 0; b < num_buffers; b++) {
+            buffer_env_starts[b] = total_envs;
+            int buffer_agents = 0;
+            while (buffer_agents < agents_per_buffer) {
+                int m = valid_map_ids[cursor % num_valid_maps];
+                int cap = g_map_agents[m];
+                int remaining = agents_per_buffer - buffer_agents;
+                if (cap <= remaining) {
+                    env_map_ids[total_envs] = m;
+                    env_max_agents[total_envs] = cap;
+                    buffer_agents += cap;
                     total_envs++;
                     cursor++;
+                } else {
+                    while (buffer_agents < agents_per_buffer) {
+                        int mm = valid_map_ids[cursor % num_valid_maps];
+                        env_map_ids[total_envs] = mm;
+                        env_max_agents[total_envs] = 1;
+                        buffer_agents++;
+                        total_envs++;
+                        cursor++;
+                    }
                 }
             }
+            buffer_env_counts[b] = total_envs - buffer_env_starts[b];
         }
-        buffer_env_counts[b] = total_envs - buffer_env_starts[b];
+        printf("total envs: %d (%d maps cycled)\n", total_envs, cursor);
+    } else {
+        for (int b = 0; b < num_buffers; b++) {
+            buffer_env_starts[b] = total_envs;
+            int buffer_agents = 0;
+            int tries = 0;
+            while (buffer_agents < agents_per_buffer) {
+                int m = (int)(drive_rng_next(&rng) % (unsigned)catalog);
+                int cap = g_map_agents[m];
+                if (cap <= 0) {
+                    if (++tries > catalog * 8) {
+                        fprintf(stderr, "ERROR: ran out of controllable agents in %s\n", dir);
+                        exit(1);
+                    }
+                    continue;
+                }
+                tries = 0;
+                int remaining = agents_per_buffer - buffer_agents;
+                int take = cap < remaining ? cap : remaining;
+                if (take > MAX_AGENTS) take = MAX_AGENTS;
+                env_map_ids[total_envs] = m;
+                env_max_agents[total_envs] = take;
+                buffer_agents += take;
+                total_envs++;
+            }
+            buffer_env_counts[b] = total_envs - buffer_env_starts[b];
+        }
     }
-
-    printf("total envs: %d (%d maps cycled)\n", total_envs, cursor);
 
     Env* envs = (Env*)calloc(total_envs, sizeof(Env));
+    #pragma omp parallel for schedule(dynamic, 4)
     for (int i = 0; i < total_envs; i++) {
-        char map_file[512];
-        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, env_map_ids[i]);
-        Env* env = &envs[i];
-        env->rng = i;
-        env->map_name = strdup(map_file);
-        env->human_agent_idx = human_agent_idx;
-        env->reward_vehicle_collision = reward_vehicle_collision;
-        env->reward_offroad_collision = reward_offroad_collision;
-        env->reward_goal_post_respawn = reward_goal_post_respawn;
-        env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
-        env->max_agents = env_max_agents[i];
-        init(env);
-        env->num_agents = env->active_agent_count;
-        if (env->num_agents > env->max_agents) env->num_agents = env->max_agents;
-        if (env->num_agents > MAX_AGENTS) env->num_agents = MAX_AGENTS;
-        for (int a = 0; a < env->num_agents; a++) {
-            env->agents[a].policy = 0;
-            env->agents[a].action_mask = NULL;
-        }
+        drive_load_env(&envs[i], env_map_ids[i], env_max_agents[i],
+            human_agent_idx, reward_vehicle_collision, reward_offroad_collision,
+            reward_goal_post_respawn, reward_vehicle_collision_post_respawn,
+            resample_frequency, catalog, seed + (unsigned)i);
     }
-
+    int packed = 0;
+    for (int i = 0; i < total_envs; i++) {
+        packed += envs[i].num_agents;
+    }
     free(env_map_ids);
     free(env_max_agents);
-    free(agents_per_map);
     free(valid_map_ids);
 
+    if (packed != total_agents) {
+        fprintf(stderr, "ERROR: packed %d agents, target %d\n", packed, total_agents);
+        exit(1);
+    }
     printf("Created %d envs, target %d agents\n", total_envs, total_agents);
-
+    fflush(stdout);
     *num_envs_out = total_envs;
     return envs;
+}
+
+Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
+                 Dict* vec_kwargs, Dict* env_kwargs) {
+    unsigned seed = 73;
+    DictItem* s = dict_find(env_kwargs, "resample_seed");
+    if (s) seed = (unsigned)s->value;
+    return drive_repack(num_envs_out, buffer_env_starts, buffer_env_counts,
+        (int)dict_get(vec_kwargs, "total_agents"),
+        (int)dict_get(vec_kwargs, "num_buffers"),
+        env_kwargs, seed);
 }
 
 void puf_log(Log* log, Dict* out) {

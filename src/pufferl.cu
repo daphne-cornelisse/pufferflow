@@ -438,6 +438,14 @@ struct VecEnv {
     pthread_t* threads;
     float* accum;
     int num_workers;
+    float hist_policy_percent;
+    Dict* env_kwargs;
+#ifdef DRIVE_RESAMPLE
+    int resample_frequency;
+    int resample_ticks;
+    unsigned resample_seed;
+    int num_maps;
+#endif
     // GPU log reduce scratch (unused on CPU)
     float* log_scratch;
 };
@@ -971,68 +979,10 @@ static Env* puf_vec_create(int, Dict*, obs_t*, float*, float*, float*) {
 }
 #endif
 
-static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
-    if (PUF_BACKEND == PUF_GPU) {
-        assert(vec->buffers == 1 && "GPU env: num_buffers must be 1");
-        vec->envs = puf_vec_create(vec->total_agents, ek,
-            p->env.obs.data, p->env.actions.data,
-            p->env.rewards.data, p->env.terminals.data);
-        cudaMalloc((void**)&vec->log_scratch, sizeof(Log));
-        cudaMemset(vec->log_scratch, 0, sizeof(Log));
-        vec->policy_layout[0] = 0;
-        vec->policy_layout[1] = vec->agents_per_buf;
-        return;
-    }
-    int total_agents = vec->total_agents;
+static void env_bind_agents(VecEnv* vec) {
     int num_buffers = vec->buffers;
     int apb = vec->agents_per_buf;
-    vec->num_workers = dict_get(vk, "num_threads") / num_buffers;
-    if (vec->num_workers < 1) {
-        vec->num_workers = 1;
-    }
-    vec->env_starts = (int*)calloc(1, num_buffers * sizeof(int));
-    vec->env_counts = (int*)calloc(1, num_buffers * sizeof(int));
-    int num_envs = 0;
-#ifdef MY_VEC_INIT
-    vec->envs = my_vec_init(&num_envs, vec->env_starts,
-        vec->env_counts, vk, ek);
-#else
-    Env* envs = (Env*)calloc(total_agents, sizeof(Env));
-    int agents_created = 0;
-    while (agents_created < total_agents) {
-        envs[num_envs].rng = num_envs;
-        puf_init(&envs[num_envs], ek);
-        agents_created += envs[num_envs].num_agents;
-        num_envs++;
-    }
-    envs = (Env*)realloc(envs, num_envs * sizeof(Env));
-    int buf = 0, buf_agents = 0;
-    for (int i = 0; i < num_envs; i++) {
-        buf_agents += envs[i].num_agents;
-        vec->env_counts[buf]++;
-        if (buf_agents >= apb && buf < num_buffers - 1) {
-            buf++;
-            vec->env_starts[buf] = i + 1;
-            buf_agents = 0;
-        }
-    }
-    vec->envs = envs;
-#endif
-    vec->size = num_envs;
-
-    size_t obs_bytes = total_agents * OBS_SIZE * sizeof(obs_t);
-    size_t mask_bytes = total_agents * vec->mask_size * sizeof(unsigned char);
-    cudaHostAlloc((void**)&vec->observations, obs_bytes, cudaHostAllocPortable);
-    cudaHostAlloc((void**)&vec->actions, total_agents * NUM_ATNS * sizeof(float),
-        cudaHostAllocPortable);
-    cudaHostAlloc((void**)&vec->rewards, total_agents * sizeof(float),
-        cudaHostAllocPortable);
-    cudaHostAlloc((void**)&vec->terminals, total_agents * sizeof(float),
-        cudaHostAllocPortable);
-    cudaHostAlloc((void**)&vec->action_mask, mask_bytes, cudaHostAllocPortable);
-    memset(vec->action_mask, 1, mask_bytes);
-
-    float frozen_pct = dict_get(vk, "hist_policy_percent");
+    float frozen_pct = vec->hist_policy_percent;
     for (int buf = 0; buf < num_buffers; buf++) {
         int buf_start = buf * apb;
         int env_start = vec->env_starts[buf];
@@ -1090,6 +1040,86 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
     }
 }
 
+static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
+    if (PUF_BACKEND == PUF_GPU) {
+        assert(vec->buffers == 1 && "GPU env: num_buffers must be 1");
+        vec->envs = puf_vec_create(vec->total_agents, ek,
+            p->env.obs.data, p->env.actions.data,
+            p->env.rewards.data, p->env.terminals.data);
+        cudaMalloc((void**)&vec->log_scratch, sizeof(Log));
+        cudaMemset(vec->log_scratch, 0, sizeof(Log));
+        vec->policy_layout[0] = 0;
+        vec->policy_layout[1] = vec->agents_per_buf;
+        return;
+    }
+    int total_agents = vec->total_agents;
+    int num_buffers = vec->buffers;
+    vec->num_workers = dict_get(vk, "num_threads") / num_buffers;
+    if (vec->num_workers < 1) {
+        vec->num_workers = 1;
+    }
+    vec->env_starts = (int*)calloc(1, num_buffers * sizeof(int));
+    vec->env_counts = (int*)calloc(1, num_buffers * sizeof(int));
+    int num_envs = 0;
+#ifdef MY_VEC_INIT
+    vec->envs = my_vec_init(&num_envs, vec->env_starts,
+        vec->env_counts, vk, ek);
+#else
+    Env* envs = (Env*)calloc(total_agents, sizeof(Env));
+    int apb = vec->agents_per_buf;
+    int agents_created = 0;
+    while (agents_created < total_agents) {
+        envs[num_envs].rng = num_envs;
+        puf_init(&envs[num_envs], ek);
+        agents_created += envs[num_envs].num_agents;
+        num_envs++;
+    }
+    envs = (Env*)realloc(envs, num_envs * sizeof(Env));
+    int buf = 0, buf_agents = 0;
+    for (int i = 0; i < num_envs; i++) {
+        buf_agents += envs[i].num_agents;
+        vec->env_counts[buf]++;
+        if (buf_agents >= apb && buf < num_buffers - 1) {
+            buf++;
+            vec->env_starts[buf] = i + 1;
+            buf_agents = 0;
+        }
+    }
+    vec->envs = envs;
+#endif
+    vec->size = num_envs;
+    vec->env_kwargs = ek;
+    vec->hist_policy_percent = dict_get(vk, "hist_policy_percent");
+#ifdef DRIVE_RESAMPLE
+    vec->resample_frequency = vec->envs[0].resample_frequency;
+    vec->num_maps = vec->envs[0].num_maps;
+    {
+        DictItem* seed_item = dict_find(ek, "resample_seed");
+        vec->resample_seed = seed_item ? (unsigned)seed_item->value : 73u;
+        if (!vec->resample_seed) vec->resample_seed = 1;
+    }
+    // PufferDrive skips resampling when the catalog fits in one batch.
+    if (vec->resample_frequency > 0 && vec->num_maps > vec->total_agents / 2) {
+        fprintf(stderr, "maps resample every %d steps across %d maps\n",
+            vec->resample_frequency, vec->num_maps);
+    }
+#endif
+
+    size_t obs_bytes = total_agents * OBS_SIZE * sizeof(obs_t);
+    size_t mask_bytes = total_agents * vec->mask_size * sizeof(unsigned char);
+    cudaHostAlloc((void**)&vec->observations, obs_bytes, cudaHostAllocPortable);
+    cudaHostAlloc((void**)&vec->actions, total_agents * NUM_ATNS * sizeof(float),
+        cudaHostAllocPortable);
+    cudaHostAlloc((void**)&vec->rewards, total_agents * sizeof(float),
+        cudaHostAllocPortable);
+    cudaHostAlloc((void**)&vec->terminals, total_agents * sizeof(float),
+        cudaHostAllocPortable);
+    cudaHostAlloc((void**)&vec->action_mask, mask_bytes, cudaHostAllocPortable);
+    memset(vec->action_mask, 1, mask_bytes);
+
+    env_bind_agents(vec);
+}
+
 static void cpu_upload(PuffeRL* p, int start, int n, cudaStream_t stream) {
     VecEnv* v = p->vec;
     EnvBuf* e = &p->env;
@@ -1128,9 +1158,6 @@ static void* vec_thread_main(void* arg) {
     cudaSetDevice(pufferl->hypers.gpu_id);
     int apb = vec->agents_per_buf;
     int agent_start = buf * apb;
-    int env_start = vec->env_starts[buf];
-    int env_count = vec->env_counts[buf];
-    Env* envs = vec->envs;
     cudaStream_t stream = pufferl->streams[buf];
     cublas_init_stream(stream);
     cudaEvent_t ev[NUM_EV];
@@ -1156,6 +1183,10 @@ static void* vec_thread_main(void* arg) {
             }
             return NULL;
         }
+        // Reread after a map resample, which replaces vec->envs between rollouts.
+        int env_start = vec->env_starts[buf];
+        int env_count = vec->env_counts[buf];
+        Env* envs = vec->envs;
         int h2d_pending = 0;
         for (int t = 0; t < horizon; t++) {
             cudaEventRecord(ev[MODEL_START], stream);
@@ -1296,6 +1327,40 @@ static void rollout_start(PuffeRL* p) {
     }
 }
 
+#ifdef DRIVE_RESAMPLE
+// Between rollouts, workers are BUF_WAITING. Rebuild the scene window the way
+// PufferDrive's resample_maps does: new seed, same agent budget, fresh episodes.
+static void drive_resample_maps(PuffeRL* p) {
+    VecEnv* vec = p->vec;
+    if (PUF_BACKEND == PUF_GPU) return;
+    if (vec->resample_frequency <= 0) return;
+    if (vec->num_maps <= vec->total_agents / 2) return;
+    vec->resample_ticks += p->hypers.horizon;
+    if (vec->resample_ticks < vec->resample_frequency) return;
+    vec->resample_ticks -= vec->resample_frequency;
+    vec->resample_seed += 1;
+    if (!vec->resample_seed) vec->resample_seed = 1;
+
+    for (int i = 0; i < vec->size; i++) {
+        free(vec->envs[i].map_name);
+        vec->envs[i].map_name = NULL;
+        puf_close(&vec->envs[i]);
+    }
+    free(vec->envs);
+    vec->envs = NULL;
+
+    dict_set(vec->env_kwargs, "resample_seed", (double)vec->resample_seed);
+    int num_envs = 0;
+    vec->envs = drive_repack(&num_envs, vec->env_starts, vec->env_counts,
+        vec->total_agents, vec->buffers, vec->env_kwargs, vec->resample_seed);
+    vec->size = num_envs;
+    env_bind_agents(vec);
+    memset(vec->terminals, 0, (size_t)vec->total_agents * sizeof(float));
+    memset(vec->rewards, 0, (size_t)vec->total_agents * sizeof(float));
+    env_restart(p);
+}
+#endif
+
 void rollout_finish(PuffeRL* p, double t0) {
     if (PUF_BACKEND == PUF_GPU) {
         cudaStreamSynchronize(p->streams[0]);
@@ -1340,6 +1405,9 @@ void rollout_finish(PuffeRL* p, double t0) {
     p->profile.accum[PROF_MODEL] += eval_prof[PROF_MODEL] / p->vec->buffers;
     p->profile.accum[PROF_ENV] += eval_prof[PROF_ENV] / p->vec->buffers;
     p->profile.accum[PROF_COPY] += eval_prof[PROF_COPY] / p->vec->buffers;
+#ifdef DRIVE_RESAMPLE
+    drive_resample_maps(p);
+#endif
 }
 
 static void env_close(VecEnv* vec) {
@@ -2008,6 +2076,15 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
             .shape = {pol->params_alloc.total_elems},
         };
     }
+#ifdef PUFFER_DRIVE
+    {
+        long network_params = (long)numel(pufferl->policies[0].param.shape);
+        fprintf(stderr, "network params=%ld\n", network_params);
+        fflush(stderr);
+        assert(network_params == grads->total_elems
+            && "drive encoder grad layout does not match params");
+    }
+#endif
     if (hypers.async) {
         alloc_create(&pufferl->weight_alloc);
     }

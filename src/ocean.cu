@@ -51,6 +51,9 @@ __device__ static const float OSRS_ITEM_OBS_TABLE_DEV
 #ifdef PUFFER_CRAFTAX
 #include "../ocean/craftax/craftax.cu"
 #endif
+#ifdef PUFFER_DRIVE
+#include "../ocean/drive/drive_encoder.cu"
+#endif
 
 // Override encoder vtable when this env has a custom net. No-op otherwise.
 static void create_custom_encoder(Encoder* enc) {
@@ -78,6 +81,8 @@ static void create_custom_encoder(Encoder* enc) {
     create_osrs_entity_encoder<&OSRS_INFERNO_ENTITY_DESCRIPTOR>(enc);
 #elif defined(PUFFER_OSRS_ZULRAH) || defined(PUFFER_OSRS_PVP)
     create_osrs_entity_encoder<&OSRS_EQUIPMENT_ENTITY_DESCRIPTOR>(enc);
+#elif defined(PUFFER_DRIVE)
+    create_drive_encoder(enc);
 #else
     (void)enc;
 #endif

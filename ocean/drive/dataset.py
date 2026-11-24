@@ -1,17 +1,21 @@
-"""Convert Waymo Open Motion Dataset (WOMD) JSON maps to binary format for PufferLib drive env.
+"""Convert Waymo or CARLA scenario JSON into binaries for the PufferLib drive env.
+
+Both sources use the same object/road schema. Object logs are written as
+TRAJECTORY_LENGTH steps (91, about 9 s), which is the episode the simulator
+runs. Longer logs are clipped to that window. Shorter logs are padded.
 
 Step 0: Download the preprocessed JSON scenarios from HuggingFace e.g.,
   https://huggingface.co/datasets/daphne-cornelisse/pufferdrive_womd_train_1000
 
   uv pip install huggingface_hub
-  python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='daphne-cornelisse/pufferdrive_womd_train_1000', repo_type='dataset', local_dir='drive_data')"
+  python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='daphne-cornelisse/pufferdrive_womd_train_1000', repo_type='dataset', local_dir='data/womd_train_1000')"
 
 Step 1: Unzip to get folder with .json files
-    mkdir -p drive_data/training
-    tar xzf drive_data/pufferdrive_womd_train_1000.tar.gz --strip-components=1 -C drive_data/training/
+    mkdir -p data/womd_train_1000/json
+    tar xzf data/womd_train_1000/pufferdrive_womd_train_1000.tar.gz --strip-components=1 -C data/womd_train_1000/json/
 
 Step 2: Process to map binaries
-  python ocean/drive/dataset.py --data_folder drive_data/training --output_dir drive_data/binaries
+  python ocean/drive/dataset.py --data_folder data/womd_train_1000/json --output_dir data/drive/binaries
 """
 
 import json
@@ -80,9 +84,24 @@ def simplify_polyline(geometry, polyline_reduction_threshold, max_segment_length
     return [geometry[i] for i in range(num_points) if not skip[i]]
 
 
+def _as_int(value, default=0):
+    """struct.pack('i') rejects strings. Bool is a subclass of int."""
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return int(value)
+    return default
+
+
 def save_map_binary(map_data, output_file, unique_map_id):
-    """Save map data in a binary format readable by C."""
-    with open(output_file, "wb") as f:
+    """Save map data in a binary format readable by C.
+
+    Writes a temp file and replaces the destination, so a failed map does
+    not leave a short binary that the loader would treat as a scene.
+    """
+    output_file = Path(output_file)
+    tmp_file = output_file.with_suffix(output_file.suffix + ".tmp")
+    with open(tmp_file, "wb") as f:
         num_objects = len(map_data.get("objects", []))
         num_roads = len(map_data.get("roads", []))
         f.write(struct.pack("i", num_objects))
@@ -91,12 +110,15 @@ def save_map_binary(map_data, output_file, unique_map_id):
         # Write objects
         for obj in map_data.get("objects", []):
             obj_type = obj.get("type", 1)
-            if obj_type == "vehicle":
+            # Truck uses the vehicle dynamics and the vehicle observation slot.
+            if obj_type == "vehicle" or obj_type == "truck":
                 obj_type = 1
             elif obj_type == "pedestrian":
                 obj_type = 2
             elif obj_type == "cyclist":
                 obj_type = 3
+            elif not isinstance(obj_type, int):
+                obj_type = 1
             f.write(struct.pack("i", obj_type))
             f.write(struct.pack("i", TRAJECTORY_LENGTH))
 
@@ -149,7 +171,7 @@ def save_map_binary(map_data, output_file, unique_map_id):
             f.write(struct.pack("f", float(goal_pos.get("x", 0.0))))
             f.write(struct.pack("f", float(goal_pos.get("y", 0.0))))
             f.write(struct.pack("f", float(goal_pos.get("z", 0.0))))
-            f.write(struct.pack("i", obj.get("mark_as_expert", 0)))
+            f.write(struct.pack("i", _as_int(obj.get("mark_as_expert", 0))))
 
         # Write roads
         for road in map_data.get("roads", []):
@@ -158,6 +180,8 @@ def save_map_binary(map_data, output_file, unique_map_id):
             road_type_word = road.get("type", 0)
             if road_type_word == "lane":
                 road_type = 2
+            elif road_type_word == "road_line":
+                road_type = 6
             elif road_type_word == "road_edge":
                 road_type = 15
 
@@ -194,7 +218,8 @@ def save_map_binary(map_data, output_file, unique_map_id):
             f.write(struct.pack("f", float(goal_pos.get("x", 0.0))))
             f.write(struct.pack("f", float(goal_pos.get("y", 0.0))))
             f.write(struct.pack("f", float(goal_pos.get("z", 0.0))))
-            f.write(struct.pack("i", road.get("mark_as_expert", 0)))
+            f.write(struct.pack("i", _as_int(road.get("mark_as_expert", 0))))
+    tmp_file.replace(output_file)
 
 
 def _process_single_map(args):
@@ -206,6 +231,7 @@ def _process_single_map(args):
         save_map_binary(map_data, str(binary_path), i)
         return (i, map_path.name, True, None)
     except Exception as e:
+        Path(str(binary_path) + ".tmp").unlink(missing_ok=True)
         return (i, map_path.name, False, str(e))
 
 
